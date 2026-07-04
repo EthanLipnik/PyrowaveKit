@@ -1763,17 +1763,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
             }
         }
 
-        return buckets.flatMap { bucket in
-            bucket.sorted {
-                if $0.planeIndex != $1.planeIndex {
-                    return $0.planeIndex < $1.planeIndex
-                }
-                if $0.blockIndex != $1.blockIndex {
-                    return $0.blockIndex < $1.blockIndex
-                }
-                return $0.quantLevel < $1.quantLevel
-            }
-        }
+        return buckets.flatMap { $0 }
     }
 
     private func makeRateControlBlocks(_ plane: EncodedPlane, layout: PyrowaveBlockLayout) throws -> [PyrowaveRateControlBlock] {

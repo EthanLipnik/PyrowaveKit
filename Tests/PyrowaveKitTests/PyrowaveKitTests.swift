@@ -883,6 +883,8 @@ import Metal
         _ = try backend.makeFunction(named: "pyrowave_apply_sparse_coefficients")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_tile_stats")
         _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs")
+        _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs_smallblocks")
+        _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs_finalize")
         _ = try backend.makeFunction(named: "pyrowave_encode_sparse_packets")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_indices")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_savings")

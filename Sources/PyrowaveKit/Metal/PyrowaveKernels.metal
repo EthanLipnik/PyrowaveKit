@@ -531,6 +531,93 @@ kernel void pyrowave_packet_byte_costs(
     }
 }
 
+kernel void pyrowave_packet_byte_costs_smallblocks(
+    device const short *coefficients [[buffer(0)]],
+    device const PacketByteCostDescriptor *descriptors [[buffer(1)]],
+    device atomic_uint *byteCostPartials [[buffer(2)]],
+    device atomic_uint *signCounts [[buffer(3)]],
+    constant PacketByteCostConstants &constants [[buffer(4)]],
+    uint workIndex [[thread_position_in_grid]]
+) {
+    uint descriptorIndex = workIndex >> 4u;
+    if (descriptorIndex >= constants.descriptorCount) {
+        return;
+    }
+
+    uint smallBlock = workIndex & 15u;
+    PacketByteCostDescriptor descriptor = descriptors[descriptorIndex];
+    uint smallOriginX = (smallBlock % 4u) * 8u;
+    uint smallOriginY = (smallBlock / 4u) * 8u;
+    if (smallOriginX >= descriptor.validWidth || smallOriginY >= descriptor.validHeight) {
+        return;
+    }
+
+    uint outputOffset = descriptorIndex * 15u;
+    for (uint quantLevel = 0u; quantLevel < 15u; ++quantLevel) {
+        uint bitWidths[8];
+        uint maxBitWidth = 0u;
+        uint signCount = 0u;
+
+        for (uint subblock = 0u; subblock < 8u; ++subblock) {
+            uint maxMagnitude = 0u;
+            for (uint pixel = 0u; pixel < 8u; ++pixel) {
+                uint2 coord = pyrowave_coordinate_in_8x8(subblock, pixel);
+                uint x = smallOriginX + coord.x;
+                uint y = smallOriginY + coord.y;
+                uint magnitude = 0u;
+                if (x < descriptor.validWidth && y < descriptor.validHeight) {
+                    uint index = (descriptor.originY + y) * descriptor.stride + descriptor.originX + x;
+                    int raw = int(coefficients[index]);
+                    magnitude = (raw < 0 ? uint(-raw) : uint(raw)) >> quantLevel;
+                }
+                maxMagnitude = max(maxMagnitude, magnitude);
+                if (magnitude != 0u) {
+                    signCount += 1u;
+                }
+            }
+            uint width = pyrowave_significant_bit_count(maxMagnitude);
+            bitWidths[subblock] = width;
+            maxBitWidth = max(maxBitWidth, width);
+        }
+
+        if (maxBitWidth == 0u) {
+            continue;
+        }
+
+        uint basePlanes = maxBitWidth > 3u ? maxBitWidth - 3u : 0u;
+        uint magnitudePayloadBytes = 0u;
+        for (uint subblock = 0u; subblock < 8u; ++subblock) {
+            magnitudePayloadBytes += max(bitWidths[subblock], basePlanes);
+        }
+
+        uint candidateOffset = outputOffset + quantLevel;
+        atomic_fetch_add_explicit(&byteCostPartials[candidateOffset], 3u + magnitudePayloadBytes, memory_order_relaxed);
+        atomic_fetch_add_explicit(&signCounts[candidateOffset], signCount, memory_order_relaxed);
+    }
+}
+
+kernel void pyrowave_packet_byte_costs_finalize(
+    device uint *byteCosts [[buffer(0)]],
+    device const uint *signCounts [[buffer(1)]],
+    constant PacketByteCostConstants &constants [[buffer(2)]],
+    uint candidateIndex [[thread_position_in_grid]]
+) {
+    uint candidateCount = constants.descriptorCount * 15u;
+    if (candidateIndex >= candidateCount) {
+        return;
+    }
+
+    uint partialBytes = byteCosts[candidateIndex];
+    if (partialBytes == 0u) {
+        byteCosts[candidateIndex] = 0u;
+        return;
+    }
+
+    uint signPayloadBytes = (signCounts[candidateIndex] + 7u) / 8u;
+    uint unpaddedSize = 8u + partialBytes + signPayloadBytes;
+    byteCosts[candidateIndex] = ((unpaddedSize + 3u) / 4u) * 4u;
+}
+
 static inline void pyrowave_write_u16_le(device uchar *output, uint offset, uint value) {
     output[offset + 0u] = uchar(value & 0xffu);
     output[offset + 1u] = uchar((value >> 8u) & 0xffu);

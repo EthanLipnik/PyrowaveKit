@@ -15,6 +15,7 @@ private enum ReusableBufferPurpose: Hashable {
     case rateStats
     case packetCostDescriptor
     case packetCostOutput
+    case packetCostSignCount
 }
 
 private struct ReusableBufferKey: Hashable {
@@ -37,6 +38,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     private let sparseApplyPipeline: MTLComputePipelineState
     private let rateControlStatsPipeline: MTLComputePipelineState
     private let packetByteCostsPipeline: MTLComputePipelineState
+    private let packetByteCostsSmallblocksPipeline: MTLComputePipelineState
+    private let packetByteCostsFinalizePipeline: MTLComputePipelineState
     private let sparsePacketEncodePipeline: MTLComputePipelineState
     private let rateControlBucketPipeline: MTLComputePipelineState
     private let rateControlTileStatsBucketPipeline: MTLComputePipelineState
@@ -85,6 +88,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         sparseApplyPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_apply_sparse_coefficients", library: library))
         rateControlStatsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_tile_stats", library: library))
         packetByteCostsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_packet_byte_costs", library: library))
+        packetByteCostsSmallblocksPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_packet_byte_costs_smallblocks", library: library))
+        packetByteCostsFinalizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_packet_byte_costs_finalize", library: library))
         sparsePacketEncodePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_encode_sparse_packets", library: library))
         rateControlBucketPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_bucket_indices", library: library))
         rateControlTileStatsBucketPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_tile_stats_bucket_indices", library: library))
@@ -1085,6 +1090,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             coefficientBuffer: MTLBuffer,
             descriptorBuffer: MTLBuffer,
             byteCostBuffer: MTLBuffer,
+            signCountBuffer: MTLBuffer,
             descriptorCount: Int
         )]()
         work.reserveCapacity(planes.count)
@@ -1103,11 +1109,13 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             let byteCostByteLength = plane.descriptors.count * PyrowaveBlockStats.candidateCount * MemoryLayout<UInt32>.stride
             let descriptorBuffer = try reusableSharedBuffer(bytes: plane.descriptors, purpose: .packetCostDescriptor, planeIndex: planeIndex)
             let byteCostBuffer = try reusableSharedBuffer(byteLength: byteCostByteLength, purpose: .packetCostOutput, planeIndex: planeIndex)
+            let signCountBuffer = try reusableSharedBuffer(byteLength: byteCostByteLength, purpose: .packetCostSignCount, planeIndex: planeIndex)
             work.append((
                 planeIndex: planeIndex,
                 coefficientBuffer: plane.coefficientBuffer,
                 descriptorBuffer: descriptorBuffer,
                 byteCostBuffer: byteCostBuffer,
+                signCountBuffer: signCountBuffer,
                 descriptorCount: plane.descriptors.count
             ))
         }
@@ -1116,26 +1124,58 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             return emptyResults
         }
 
-        guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw PyrowaveError.processFailed("failed to create Metal packet byte-cost command encoder")
         }
 
-        encoder.setComputePipelineState(packetByteCostsPipeline)
-        let width = min(packetByteCostsPipeline.maxTotalThreadsPerThreadgroup, 256)
+        guard let fillEncoder = commandBuffer.makeBlitCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal packet byte-cost fill encoder")
+        }
+        for item in work {
+            let byteLength = item.descriptorCount * PyrowaveBlockStats.candidateCount * MemoryLayout<UInt32>.stride
+            fillEncoder.fill(buffer: item.byteCostBuffer, range: 0..<byteLength, value: 0)
+            fillEncoder.fill(buffer: item.signCountBuffer, range: 0..<byteLength, value: 0)
+        }
+        fillEncoder.endEncoding()
+
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal packet byte-cost command encoder")
+        }
+        encoder.setComputePipelineState(packetByteCostsSmallblocksPipeline)
+        let width = min(packetByteCostsSmallblocksPipeline.maxTotalThreadsPerThreadgroup, 256)
         let threadsPerThreadgroup = MTLSize(width: width, height: 1, depth: 1)
         for item in work {
             var constants = PacketByteCostConstants(descriptorCount: UInt32(item.descriptorCount))
             encoder.setBuffer(item.coefficientBuffer, offset: 0, index: 0)
             encoder.setBuffer(item.descriptorBuffer, offset: 0, index: 1)
             encoder.setBuffer(item.byteCostBuffer, offset: 0, index: 2)
-            encoder.setBytes(&constants, length: MemoryLayout<PacketByteCostConstants>.stride, index: 3)
+            encoder.setBuffer(item.signCountBuffer, offset: 0, index: 3)
+            encoder.setBytes(&constants, length: MemoryLayout<PacketByteCostConstants>.stride, index: 4)
             encoder.dispatchThreads(
-                MTLSize(width: item.descriptorCount, height: 1, depth: 1),
+                MTLSize(width: item.descriptorCount * 16, height: 1, depth: 1),
                 threadsPerThreadgroup: threadsPerThreadgroup
             )
         }
         encoder.endEncoding()
+
+        guard let finalizeEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal packet byte-cost finalize encoder")
+        }
+        finalizeEncoder.setComputePipelineState(packetByteCostsFinalizePipeline)
+        let finalizeWidth = min(packetByteCostsFinalizePipeline.maxTotalThreadsPerThreadgroup, 256)
+        let finalizeThreadsPerThreadgroup = MTLSize(width: finalizeWidth, height: 1, depth: 1)
+        for item in work {
+            var constants = PacketByteCostConstants(descriptorCount: UInt32(item.descriptorCount))
+            finalizeEncoder.setBuffer(item.byteCostBuffer, offset: 0, index: 0)
+            finalizeEncoder.setBuffer(item.signCountBuffer, offset: 0, index: 1)
+            finalizeEncoder.setBytes(&constants, length: MemoryLayout<PacketByteCostConstants>.stride, index: 2)
+            finalizeEncoder.dispatchThreads(
+                MTLSize(width: item.descriptorCount * PyrowaveBlockStats.candidateCount, height: 1, depth: 1),
+                threadsPerThreadgroup: finalizeThreadsPerThreadgroup
+            )
+        }
+        finalizeEncoder.endEncoding()
+
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
