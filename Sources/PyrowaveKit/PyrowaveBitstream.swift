@@ -266,6 +266,7 @@ struct PyrowaveCoefficientBlockCodec {
 
     struct DecodedBlock {
         var blockIndex: Int
+        var sequence: UInt8
         var quantCode: UInt8
         var qScaleCodes: [UInt8]
         var coefficients: [DecodedCoefficient]
@@ -404,7 +405,7 @@ struct PyrowaveCoefficientBlockCodec {
             throw PyrowaveError.invalidBitstream("coefficient decoder received extended packet")
         }
         guard header.ballot != 0 else {
-            return DecodedBlock(blockIndex: header.blockIndex, quantCode: header.quantCode, qScaleCodes: [], coefficients: [])
+            return DecodedBlock(blockIndex: header.blockIndex, sequence: header.sequence, quantCode: header.quantCode, qScaleCodes: [], coefficients: [])
         }
 
         let payloadEnd = blockStart + Int(header.payloadWords) * 4
@@ -491,7 +492,7 @@ struct PyrowaveCoefficientBlockCodec {
         let entries = coefficients.enumerated().compactMap { index, value -> DecodedCoefficient? in
             value == 0 ? nil : DecodedCoefficient(offset: UInt16(index), value: value, qScaleCode: coefficientQScales[index])
         }
-        return DecodedBlock(blockIndex: header.blockIndex, quantCode: header.quantCode, qScaleCodes: qScaleCodes, coefficients: entries)
+        return DecodedBlock(blockIndex: header.blockIndex, sequence: header.sequence, quantCode: header.quantCode, qScaleCodes: qScaleCodes, coefficients: entries)
     }
 
     private static func coordinateIn8x8(subblock: Int, pixel: Int) -> (x: Int, y: Int) {

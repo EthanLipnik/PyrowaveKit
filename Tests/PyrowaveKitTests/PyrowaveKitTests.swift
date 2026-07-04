@@ -141,18 +141,57 @@ import Testing
     #expect(metrics.weightedPSNR > 20.0)
 }
 
-@Test func codecUsesHardCutoverV3StreamOnly() throws {
+@Test func codecUsesPyrowaveSequenceHeaderStreamOnly() throws {
     let frame = try TestFrames.synthetic420(width: 64, height: 64)
     let codec = PyrowaveCodec(useMetalAcceleration: false)
     var encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)).data
 
-    #expect(encoded[0..<4].elementsEqual([0x50, 0x57, 0x4b, 0x53]))
-    #expect(encoded[4] == 3)
-    #expect(encoded[5] == 0)
+    var reader = BinaryReader(encoded)
+    let sequence = try PyrowaveSequenceHeader(reader: &reader)
+    #expect(sequence.width == frame.width)
+    #expect(sequence.height == frame.height)
+    #expect(sequence.chroma == .yuv420)
+    #expect(sequence.sequence == 0)
+    #expect(sequence.totalBlocks > 0)
 
-    encoded[4] = 2
-    #expect(throws: PyrowaveError.invalidBitstream("unsupported version 2")) {
+    encoded[3] &= 0x7f
+    #expect(throws: PyrowaveError.invalidBitstream("sequence header missing extended bit")) {
         _ = try codec.decode(EncodedFrame(data: encoded))
+    }
+}
+
+@Test func codecPacketsUseGlobalPyrowaveBlockOrder() throws {
+    let frame = try TestFrames.synthetic420(width: 160, height: 96)
+    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+        frame,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
+    )
+
+    var reader = BinaryReader(encoded.data)
+    let sequence = try PyrowaveSequenceHeader(reader: &reader)
+    let layout = try PyrowaveBlockLayout(width: sequence.width, height: sequence.height, chroma: sequence.chroma)
+    var blockIndices = [Int]()
+
+    while reader.offset < encoded.data.count {
+        let block = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
+        blockIndices.append(block.blockIndex)
+        #expect(block.sequence == sequence.sequence)
+        #expect(block.blockIndex >= 0)
+        #expect(block.blockIndex < layout.descriptors.count)
+    }
+
+    #expect(blockIndices.count == sequence.totalBlocks)
+    #expect(blockIndices == blockIndices.sorted())
+    #expect(blockIndices.contains { index in
+        layout.descriptors[index].component == 1
+    })
+}
+
+@Test func codecRequiresSpecDecompositionLevelCount() throws {
+    let frame = try TestFrames.synthetic420(width: 64, height: 64)
+    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try codec.encode(frame, configuration: CodecConfiguration(decompositionLevels: 4))
     }
 }
 

@@ -27,8 +27,10 @@ enum Wavelet {
     }
 
     static func padPlane(_ plane: Plane8) -> (samples: [Float], width: Int, height: Int) {
-        let paddedWidth = alignedDimension(plane.width)
-        let paddedHeight = alignedDimension(plane.height)
+        padPlane(plane, paddedWidth: alignedDimension(plane.width), paddedHeight: alignedDimension(plane.height))
+    }
+
+    static func padPlane(_ plane: Plane8, paddedWidth: Int, paddedHeight: Int) -> (samples: [Float], width: Int, height: Int) {
         var samples = Array(repeating: Float(0), count: paddedWidth * paddedHeight)
 
         for y in 0..<paddedHeight {

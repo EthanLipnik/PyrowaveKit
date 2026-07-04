@@ -1,7 +1,6 @@
 import Foundation
 
 public final class PyrowaveCodec: Sendable {
-    private static let magic: [UInt8] = [0x50, 0x57, 0x4b, 0x53] // PWKS
     private static let sparseBlockSize = 32
 
     private let metalBackend: MetalPyrowaveBackend?
@@ -15,52 +14,45 @@ public final class PyrowaveCodec: Sendable {
     }
 
     public func encode(_ frame: YUVFrame, configuration: CodecConfiguration = CodecConfiguration()) throws -> EncodedFrame {
-        guard configuration.decompositionLevels > 0, configuration.quantizationStep > 0,
+        guard configuration.decompositionLevels == PyrowaveBitstream.decompositionLevels,
+              configuration.quantizationStep > 0,
               configuration.maximumEncodedBytes == nil || configuration.maximumEncodedBytes! > 0 else {
             throw PyrowaveError.invalidDimensions
         }
 
+        let layout = try PyrowaveBlockLayout(width: frame.width, height: frame.height, chroma: frame.chroma)
         let encodedPlanes = [
-            try encodePlane(frame.y, component: 0, chroma: frame.chroma, configuration: configuration),
-            try encodePlane(frame.cb, component: 1, chroma: frame.chroma, configuration: configuration),
-            try encodePlane(frame.cr, component: 2, chroma: frame.chroma, configuration: configuration)
+            try encodePlane(frame.y, component: 0, frameWidth: frame.width, frameHeight: frame.height, chroma: frame.chroma, configuration: configuration),
+            try encodePlane(frame.cb, component: 1, frameWidth: frame.width, frameHeight: frame.height, chroma: frame.chroma, configuration: configuration),
+            try encodePlane(frame.cr, component: 2, frameWidth: frame.width, frameHeight: frame.height, chroma: frame.chroma, configuration: configuration)
         ]
 
         let rateControlPlan = try selectSparseRateControlPlan(
             planes: encodedPlanes,
+            layout: layout,
             configuration: configuration
         )
-        let planePayloads = try encodedPlanes.enumerated().map { index, plane in
-            try makePlanePayload(
+        let planeBlocks = try encodedPlanes.enumerated().flatMap { index, plane in
+            try sparseBlocks(
                 plane,
+                layout: layout,
                 sparseThresholds: rateControlPlan.thresholdsByPlane?[index],
                 defaultThreshold: rateControlPlan.defaultThreshold
             )
         }
+        let sortedBlocks = planeBlocks.sorted { $0.blockIndex < $1.blockIndex }
 
         var writer = BinaryWriter()
-        writer.append(bytes: Self.magic)
-        writer.append(UInt16(3))
-        writer.append(UInt16(0))
-        writer.append(UInt32(frame.width))
-        writer.append(UInt32(frame.height))
-        writer.append(frame.chroma.rawValue)
-        writer.append(UInt8(encodedPlanes.count))
-        writer.append(UInt16(configuration.decompositionLevels))
-        writer.append(configuration.quantizationStep)
-        writer.append(UInt16(Self.sparseBlockSize))
-        writer.append(UInt16(clamping: rateControlPlan.streamThresholdHint))
-
-        for (plane, payload) in zip(encodedPlanes, planePayloads) {
-            writer.append(UInt32(plane.visibleWidth))
-            writer.append(UInt32(plane.visibleHeight))
-            writer.append(UInt32(plane.paddedWidth))
-            writer.append(UInt32(plane.paddedHeight))
-            writer.append(UInt16(plane.levels))
-            writer.append(UInt16(0))
-            writer.append(UInt32(payload.coefficientCount))
-            writer.append(UInt32(payload.blockCount))
-            writer.append(data: payload.data)
+        let sequence = try PyrowaveSequenceHeader(
+            width: frame.width,
+            height: frame.height,
+            sequence: 0,
+            totalBlocks: sortedBlocks.count,
+            chroma: frame.chroma
+        )
+        sequence.write(to: &writer)
+        for block in sortedBlocks {
+            writer.append(data: block.data)
         }
 
         if let maximumEncodedBytes = configuration.maximumEncodedBytes, writer.data.count > maximumEncodedBytes {
@@ -72,64 +64,51 @@ public final class PyrowaveCodec: Sendable {
 
     public func decode(_ frame: EncodedFrame) throws -> YUVFrame {
         var reader = BinaryReader(frame.data)
-        let magic = try (0..<4).map { _ in try reader.readUInt8() }
-        guard magic == Self.magic else {
-            throw PyrowaveError.invalidBitstream("bad magic")
+        let sequence = try PyrowaveSequenceHeader(reader: &reader)
+        let layout = try PyrowaveBlockLayout(width: sequence.width, height: sequence.height, chroma: sequence.chroma)
+        var decodedPlanes = try (0..<PyrowaveBitstream.componentCount).map { component in
+            try makeDecodedPlane(component: component, width: sequence.width, height: sequence.height, chroma: sequence.chroma, layout: layout)
+        }
+        var seenBlocks = Set<Int>()
+
+        while reader.offset < frame.data.count {
+            let block = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
+            guard block.sequence == sequence.sequence else {
+                throw PyrowaveError.invalidBitstream("coefficient packet sequence mismatch")
+            }
+            guard block.blockIndex >= 0, block.blockIndex < layout.descriptors.count, seenBlocks.insert(block.blockIndex).inserted else {
+                throw PyrowaveError.invalidBitstream("bad sparse block index")
+            }
+            guard let target = decodedPlanes.indices.first(where: { decodedPlanes[$0].descriptorsByBlockIndex[block.blockIndex] != nil }),
+                  let descriptor = decodedPlanes[target].descriptorsByBlockIndex[block.blockIndex] else {
+                throw PyrowaveError.invalidBitstream("sparse block index has no plane mapping")
+            }
+            try applySparseBlock(block, descriptor: descriptor, decodedPlane: &decodedPlanes[target])
         }
 
-        let version = try reader.readUInt16()
-        guard version == 3 else {
-            throw PyrowaveError.invalidBitstream("unsupported version \(version)")
+        guard seenBlocks.count == sequence.totalBlocks else {
+            throw PyrowaveError.invalidBitstream("expected \(sequence.totalBlocks) blocks, decoded \(seenBlocks.count)")
         }
-        _ = try reader.readUInt16()
-
-        let width = Int(try reader.readUInt32())
-        let height = Int(try reader.readUInt32())
-        guard let chroma = ChromaSubsampling(rawValue: try reader.readUInt8()) else {
-            throw PyrowaveError.invalidBitstream("bad chroma mode")
-        }
-        let planeCount = Int(try reader.readUInt8())
-        guard planeCount == 3 else {
-            throw PyrowaveError.invalidBitstream("expected three planes")
-        }
-        _ = try reader.readUInt16()
-        let quantizationStep = try reader.readFloat()
-        guard quantizationStep > 0 else {
-            throw PyrowaveError.invalidBitstream("bad quantization step")
-        }
-        let blockSize = Int(try reader.readUInt16())
-        guard blockSize == Self.sparseBlockSize else {
-            throw PyrowaveError.invalidBitstream("unsupported sparse block size \(blockSize)")
-        }
-        _ = try reader.readUInt16()
-
-        let y = try decodePlane(reader: &reader, quantizationStep: quantizationStep)
-        let cb = try decodePlane(reader: &reader, quantizationStep: quantizationStep)
-        let cr = try decodePlane(reader: &reader, quantizationStep: quantizationStep)
 
         guard reader.offset == frame.data.count else {
             throw PyrowaveError.invalidBitstream("trailing bytes")
         }
 
-        return try YUVFrame(width: width, height: height, chroma: chroma, y: y, cb: cb, cr: cr)
+        let y = try finishDecodedPlane(decodedPlanes[0])
+        let cb = try finishDecodedPlane(decodedPlanes[1])
+        let cr = try finishDecodedPlane(decodedPlanes[2])
+
+        return try YUVFrame(width: sequence.width, height: sequence.height, chroma: sequence.chroma, y: y, cb: cb, cr: cr)
     }
 
     private struct EncodedPlane {
         var component: Int
-        var visibleWidth: Int
-        var visibleHeight: Int
         var paddedWidth: Int
         var paddedHeight: Int
         var levels: Int
         var quantCode: UInt8
         var qScaleCode: UInt8
         var coefficients: [Int16]
-    }
-
-    private struct PlanePayload {
-        var coefficientCount: Int
-        var blockCount: Int
-        var data: Data
     }
 
     private struct SparseBlock {
@@ -140,13 +119,6 @@ public final class PyrowaveCodec: Sendable {
     private struct SparseRateControlPlan {
         var defaultThreshold: Int
         var thresholdsByPlane: [[Int]]?
-
-        var streamThresholdHint: Int {
-            if let thresholdsByPlane {
-                return thresholdsByPlane.flatMap { $0 }.max() ?? defaultThreshold
-            }
-            return defaultThreshold
-        }
     }
 
     private struct PlaneBlockDescriptor {
@@ -159,11 +131,35 @@ public final class PyrowaveCodec: Sendable {
         var validHeight: Int
     }
 
-    private func encodePlane(_ plane: Plane8, component: Int, chroma: ChromaSubsampling, configuration: CodecConfiguration) throws -> EncodedPlane {
-        var padded = Wavelet.padPlane(plane)
-        let requestedLevels = component == 0 || chroma == .yuv444 ?
-            configuration.decompositionLevels :
-            max(1, configuration.decompositionLevels - 1)
+    private struct DecodedPlane {
+        var visibleWidth: Int
+        var visibleHeight: Int
+        var paddedWidth: Int
+        var paddedHeight: Int
+        var levels: Int
+        var samples: [Float]
+        var descriptorsByBlockIndex: [Int: PlaneBlockDescriptor]
+    }
+
+    private struct PlaneGeometry {
+        var visibleWidth: Int
+        var visibleHeight: Int
+        var paddedWidth: Int
+        var paddedHeight: Int
+        var requestedLevels: Int
+    }
+
+    private func encodePlane(
+        _ plane: Plane8,
+        component: Int,
+        frameWidth: Int,
+        frameHeight: Int,
+        chroma: ChromaSubsampling,
+        configuration: CodecConfiguration
+    ) throws -> EncodedPlane {
+        let geometry = planeGeometry(component: component, frameWidth: frameWidth, frameHeight: frameHeight, chroma: chroma, requestedLevels: configuration.decompositionLevels)
+        var padded = Wavelet.padPlane(plane, paddedWidth: geometry.paddedWidth, paddedHeight: geometry.paddedHeight)
+        let requestedLevels = geometry.requestedLevels
         let levels = Wavelet.usableLevels(width: padded.width, height: padded.height, requested: requestedLevels)
         padded.samples = try forwardWavelet(padded.samples, width: padded.width, height: padded.height, levels: levels)
 
@@ -172,8 +168,6 @@ public final class PyrowaveCodec: Sendable {
 
         return EncodedPlane(
             component: component,
-            visibleWidth: plane.width,
-            visibleHeight: plane.height,
             paddedWidth: padded.width,
             paddedHeight: padded.height,
             levels: levels,
@@ -183,37 +177,17 @@ public final class PyrowaveCodec: Sendable {
         )
     }
 
-    private func decodePlane(reader: inout BinaryReader, quantizationStep: Float) throws -> Plane8 {
-        let visibleWidth = Int(try reader.readUInt32())
-        let visibleHeight = Int(try reader.readUInt32())
-        let paddedWidth = Int(try reader.readUInt32())
-        let paddedHeight = Int(try reader.readUInt32())
-        let levels = Int(try reader.readUInt16())
-        _ = try reader.readUInt16()
-        let count = Int(try reader.readUInt32())
-        let blockCount = Int(try reader.readUInt32())
-
-        guard visibleWidth > 0, visibleHeight > 0,
-              paddedWidth >= visibleWidth, paddedHeight >= visibleHeight,
-              count == paddedWidth * paddedHeight else {
-            throw PyrowaveError.invalidBitstream("bad plane dimensions")
-        }
-
-        let samples = try readSparseSamples(reader: &reader, count: count, width: paddedWidth, height: paddedHeight, levels: levels, blockCount: blockCount)
-        let reconstructed = try inverseWavelet(samples, width: paddedWidth, height: paddedHeight, levels: levels)
-        return try Wavelet.cropPlane(reconstructed, paddedWidth: paddedWidth, width: visibleWidth, height: visibleHeight)
-    }
-
     private func selectSparseRateControlPlan(
         planes: [EncodedPlane],
+        layout: PyrowaveBlockLayout,
         configuration: CodecConfiguration
     ) throws -> SparseRateControlPlan {
         guard let maximumEncodedBytes = configuration.maximumEncodedBytes else {
             return SparseRateControlPlan(defaultThreshold: 0, thresholdsByPlane: nil)
         }
 
-        let fixedHeaderBytes = frameHeaderSize + planes.count * planeHeaderSize
-        let rateBlocksByPlane = try planes.map { try makeRateControlBlocks($0) }
+        let fixedHeaderBytes = frameHeaderSize
+        let rateBlocksByPlane = try planes.map { try makeRateControlBlocks($0, layout: layout) }
         if let thresholdsByPlane = PyrowaveRateController.selectThresholds(
             blocksByPlane: rateBlocksByPlane,
             fixedHeaderBytes: fixedHeaderBytes,
@@ -226,7 +200,7 @@ public final class PyrowaveCodec: Sendable {
         var high = Int(Int16.max)
         while low < high {
             let mid = (low + high) / 2
-            let size = try estimateFrameSize(planes: planes, sparseThreshold: mid)
+            let size = try estimateFrameSize(planes: planes, layout: layout, sparseThreshold: mid)
             if size <= maximumEncodedBytes {
                 high = mid
             } else {
@@ -238,51 +212,34 @@ public final class PyrowaveCodec: Sendable {
     }
 
     private var frameHeaderSize: Int {
-        4 + 2 + 2 + 4 + 4 + 1 + 1 + 2 + 4 + 2 + 2
+        8
     }
 
-    private var planeHeaderSize: Int {
-        4 + 4 + 4 + 4 + 2 + 1 + 1 + 4 + 4
-    }
-
-    private func estimateFrameSize(planes: [EncodedPlane], sparseThreshold: Int) throws -> Int {
+    private func estimateFrameSize(planes: [EncodedPlane], layout: PyrowaveBlockLayout, sparseThreshold: Int) throws -> Int {
         var size = frameHeaderSize
         for plane in planes {
-            let payload = try makePlanePayload(plane, defaultThreshold: sparseThreshold)
-            size += planeHeaderSize + payload.data.count
+            let blocks = try sparseBlocks(plane, layout: layout, defaultThreshold: sparseThreshold)
+            size += blocks.reduce(0) { $0 + $1.data.count }
         }
         return size
     }
 
-    private func makePlanePayload(
+    private func sparseBlocks(
         _ plane: EncodedPlane,
+        layout: PyrowaveBlockLayout,
         sparseThresholds: [Int]? = nil,
         defaultThreshold: Int
-    ) throws -> PlanePayload {
-        let blocks = try sparseBlocks(plane, thresholds: sparseThresholds, defaultThreshold: defaultThreshold)
-        var writer = BinaryWriter()
-        for block in blocks {
-            writer.append(data: block.data)
-        }
-
-        return PlanePayload(
-            coefficientCount: plane.coefficients.count,
-            blockCount: blocks.count,
-            data: writer.data
-        )
-    }
-
-    private func sparseBlocks(_ plane: EncodedPlane, thresholds: [Int]?, defaultThreshold: Int) throws -> [SparseBlock] {
-        let descriptors = planeBlockDescriptors(width: plane.paddedWidth, height: plane.paddedHeight, levels: plane.levels)
-        if let thresholds, thresholds.count != descriptors.count {
-            throw PyrowaveError.processFailed("sparse threshold count \(thresholds.count) does not match block count \(descriptors.count)")
+    ) throws -> [SparseBlock] {
+        let descriptors = planeBlockDescriptors(plane: plane, layout: layout)
+        if let sparseThresholds, sparseThresholds.count != descriptors.count {
+            throw PyrowaveError.processFailed("sparse threshold count \(sparseThresholds.count) does not match block count \(descriptors.count)")
         }
 
         var blocks = [SparseBlock]()
         blocks.reserveCapacity(descriptors.count)
 
         for (index, descriptor) in descriptors.enumerated() {
-            let threshold = thresholds?[index] ?? defaultThreshold
+            let threshold = sparseThresholds?[index] ?? defaultThreshold
             if let data = try PyrowaveCoefficientBlockCodec.encodeBlock(
                 blockIndex: descriptor.blockIndex,
                 coefficients: plane.coefficients,
@@ -302,8 +259,8 @@ public final class PyrowaveCodec: Sendable {
         return blocks
     }
 
-    private func makeRateControlBlocks(_ plane: EncodedPlane) throws -> [PyrowaveRateControlBlock] {
-        let descriptors = planeBlockDescriptors(width: plane.paddedWidth, height: plane.paddedHeight, levels: plane.levels)
+    private func makeRateControlBlocks(_ plane: EncodedPlane, layout: PyrowaveBlockLayout) throws -> [PyrowaveRateControlBlock] {
+        let descriptors = planeBlockDescriptors(plane: plane, layout: layout)
         return try descriptors.map { descriptor in
             try PyrowaveRateController.makeBlock(
                 blockIndex: descriptor.blockIndex,
@@ -319,86 +276,103 @@ public final class PyrowaveCodec: Sendable {
         }
     }
 
-    private func readSparseSamples(
-        reader: inout BinaryReader,
-        count: Int,
-        width: Int,
-        height: Int,
-        levels: Int,
-        blockCount: Int
-    ) throws -> [Float] {
-        guard blockCount >= 0 else {
-            throw PyrowaveError.invalidBitstream("negative sparse block count")
-        }
-
-        let blockSize = Self.sparseBlockSize
-        let descriptors = planeBlockDescriptors(width: width, height: height, levels: levels)
-        var samples = Array(repeating: Float(0), count: count)
-        var seenBlocks = Set<Int>()
-
-        for _ in 0..<blockCount {
-            let block = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
-            let blockIndex = block.blockIndex
-
-            guard blockIndex >= 0, blockIndex < descriptors.count, seenBlocks.insert(blockIndex).inserted else {
-                throw PyrowaveError.invalidBitstream("bad sparse block index")
-            }
-
-            let descriptor = descriptors[blockIndex]
-            for entry in block.coefficients {
-                let localOffset = Int(entry.offset)
-                let localX = localOffset % blockSize
-                let localY = localOffset / blockSize
-                let x = descriptor.originX + localX
-                let y = descriptor.originY + localY
-                guard localOffset < blockSize * blockSize,
-                      localX < descriptor.validWidth,
-                      localY < descriptor.validHeight,
-                      x < width,
-                      y < height else {
-                    throw PyrowaveError.invalidBitstream("sparse coefficient out of range")
-                }
-                samples[y * width + x] = PyrowaveQuantization.dequantize(
-                    coefficient: entry.value,
-                    quantCode: block.quantCode,
-                    qScaleCode: entry.qScaleCode
-                )
-            }
-        }
-
-        return samples
+    private func makeDecodedPlane(component: Int, width: Int, height: Int, chroma: ChromaSubsampling, layout: PyrowaveBlockLayout) throws -> DecodedPlane {
+        let geometry = planeGeometry(component: component, frameWidth: width, frameHeight: height, chroma: chroma, requestedLevels: PyrowaveBitstream.decompositionLevels)
+        let levels = Wavelet.usableLevels(width: geometry.paddedWidth, height: geometry.paddedHeight, requested: geometry.requestedLevels)
+        let scratchPlane = EncodedPlane(
+            component: component,
+            paddedWidth: geometry.paddedWidth,
+            paddedHeight: geometry.paddedHeight,
+            levels: levels,
+            quantCode: 0,
+            qScaleCode: PyrowaveQuantization.identityQScaleCode,
+            coefficients: []
+        )
+        let descriptors = planeBlockDescriptors(plane: scratchPlane, layout: layout)
+        return DecodedPlane(
+            visibleWidth: geometry.visibleWidth,
+            visibleHeight: geometry.visibleHeight,
+            paddedWidth: geometry.paddedWidth,
+            paddedHeight: geometry.paddedHeight,
+            levels: levels,
+            samples: Array(repeating: 0, count: geometry.paddedWidth * geometry.paddedHeight),
+            descriptorsByBlockIndex: Dictionary(uniqueKeysWithValues: descriptors.map { ($0.blockIndex, $0) })
+        )
     }
 
-    private func planeBlockDescriptors(width: Int, height: Int, levels: Int) -> [PlaneBlockDescriptor] {
-        var descriptors = [PlaneBlockDescriptor]()
+    private func applySparseBlock(
+        _ block: PyrowaveCoefficientBlockCodec.DecodedBlock,
+        descriptor: PlaneBlockDescriptor,
+        decodedPlane: inout DecodedPlane
+    ) throws {
         let blockSize = Self.sparseBlockSize
-
-        for level in stride(from: levels - 1, through: 0, by: -1) {
-            let subbandWidth = width >> (level + 1)
-            let subbandHeight = height >> (level + 1)
-            let blockColumns = (subbandWidth + blockSize - 1) / blockSize
-            let blockRows = (subbandHeight + blockSize - 1) / blockSize
-            let firstBand = level == levels - 1 ? 0 : 1
-
-            for band in firstBand..<PyrowaveBitstream.bandCount {
-                let origin = planeBandOrigin(level: level, finalLevel: levels - 1, band: band, subbandWidth: subbandWidth, subbandHeight: subbandHeight)
-                for blockY in 0..<blockRows {
-                    for blockX in 0..<blockColumns {
-                        descriptors.append(PlaneBlockDescriptor(
-                            blockIndex: descriptors.count,
-                            level: level,
-                            band: band,
-                            originX: origin.x + blockX * blockSize,
-                            originY: origin.y + blockY * blockSize,
-                            validWidth: min(blockSize, subbandWidth - blockX * blockSize),
-                            validHeight: min(blockSize, subbandHeight - blockY * blockSize)
-                        ))
-                    }
-                }
+        for entry in block.coefficients {
+            let localOffset = Int(entry.offset)
+            let localX = localOffset % blockSize
+            let localY = localOffset / blockSize
+            let x = descriptor.originX + localX
+            let y = descriptor.originY + localY
+            guard localOffset < blockSize * blockSize,
+                  localX < descriptor.validWidth,
+                  localY < descriptor.validHeight,
+                  x < decodedPlane.paddedWidth,
+                  y < decodedPlane.paddedHeight else {
+                throw PyrowaveError.invalidBitstream("sparse coefficient out of range")
             }
+            decodedPlane.samples[y * decodedPlane.paddedWidth + x] = PyrowaveQuantization.dequantize(
+                coefficient: entry.value,
+                quantCode: block.quantCode,
+                qScaleCode: entry.qScaleCode
+            )
         }
+    }
 
-        return descriptors
+    private func finishDecodedPlane(_ plane: DecodedPlane) throws -> Plane8 {
+        let reconstructed = try inverseWavelet(plane.samples, width: plane.paddedWidth, height: plane.paddedHeight, levels: plane.levels)
+        return try Wavelet.cropPlane(reconstructed, paddedWidth: plane.paddedWidth, width: plane.visibleWidth, height: plane.visibleHeight)
+    }
+
+    private func planeBlockDescriptors(plane: EncodedPlane, layout: PyrowaveBlockLayout) -> [PlaneBlockDescriptor] {
+        layout.descriptors.compactMap { global in
+            guard global.component == plane.component else {
+                return nil
+            }
+
+            let localLevel = plane.component != 0 && layout.chroma == .yuv420 ? global.level - 1 : global.level
+            guard localLevel >= 0, localLevel < plane.levels else {
+                return nil
+            }
+
+            let subbandWidth = plane.paddedWidth >> (localLevel + 1)
+            let subbandHeight = plane.paddedHeight >> (localLevel + 1)
+            let origin = planeBandOrigin(level: localLevel, finalLevel: plane.levels - 1, band: global.band, subbandWidth: subbandWidth, subbandHeight: subbandHeight)
+            let x = global.blockX * Self.sparseBlockSize
+            let y = global.blockY * Self.sparseBlockSize
+            return PlaneBlockDescriptor(
+                blockIndex: global.blockIndex,
+                level: localLevel,
+                band: global.band,
+                originX: origin.x + x,
+                originY: origin.y + y,
+                validWidth: min(Self.sparseBlockSize, subbandWidth - x),
+                validHeight: min(Self.sparseBlockSize, subbandHeight - y)
+            )
+        }
+    }
+
+    private func planeGeometry(component: Int, frameWidth: Int, frameHeight: Int, chroma: ChromaSubsampling, requestedLevels: Int) -> PlaneGeometry {
+        let alignedWidth = Wavelet.alignedDimension(frameWidth)
+        let alignedHeight = Wavelet.alignedDimension(frameHeight)
+        let isSubsampledChroma = component != 0 && chroma == .yuv420
+        let divisor = isSubsampledChroma ? 2 : 1
+        let planeRequestedLevels = isSubsampledChroma ? max(1, requestedLevels - 1) : requestedLevels
+        return PlaneGeometry(
+            visibleWidth: frameWidth / divisor,
+            visibleHeight: frameHeight / divisor,
+            paddedWidth: alignedWidth / divisor,
+            paddedHeight: alignedHeight / divisor,
+            requestedLevels: planeRequestedLevels
+        )
     }
 
     private func planeBandOrigin(level: Int, finalLevel: Int, band: Int, subbandWidth: Int, subbandHeight: Int) -> (x: Int, y: Int) {
