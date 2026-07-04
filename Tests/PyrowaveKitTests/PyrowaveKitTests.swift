@@ -1032,6 +1032,75 @@ import Metal
     #expect(dequantized == cpu.map { Float($0) * step })
 }
 
+@Test func metalPlaneQuantizationBatchMatchesSinglePlaneResultsWhenDeviceExists() throws {
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let width = 32
+    let height = 32
+    let sampleCount = width * height
+    let quantCode = try PyrowaveQuantization.encodeBlockScale(1.0 / 1024.0)
+    let baseScale = 1.0 / PyrowaveQuantization.decodeBlockScale(quantCode)
+    let descriptors = [
+        MetalPlaneQuantizationDescriptor(
+            originX: 0,
+            originY: 0,
+            validWidth: UInt32(width),
+            validHeight: UInt32(height),
+            stride: UInt32(width),
+            quantCode: UInt32(quantCode),
+            baseScale: baseScale
+        ),
+        MetalPlaneQuantizationDescriptor(
+            originX: 8,
+            originY: 8,
+            validWidth: 16,
+            validHeight: 16,
+            stride: UInt32(width),
+            quantCode: UInt32(quantCode),
+            baseScale: baseScale * 0.75
+        )
+    ]
+    let planes = (0..<3).map { planeIndex in
+        (0..<sampleCount).map { index in
+            Float((index * (17 + planeIndex * 5) + planeIndex * 29) % 1021) / 1024.0 - 0.5
+        }
+    }
+    let buffers = try planes.map { samples -> MTLBuffer in
+        try #require(backend.device.makeBuffer(
+            bytes: samples,
+            length: samples.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+    }
+    let singles = try buffers.map {
+        try backend.quantizePlaneBufferResult(
+            $0,
+            sampleCount: sampleCount,
+            stride: width,
+            descriptors: descriptors
+        )
+    }
+    let batched = try backend.quantizePlaneBufferResults(buffers.map {
+        (samples: $0, sampleCount: sampleCount, stride: width, descriptors: descriptors)
+    })
+
+    #expect(batched.count == singles.count)
+    for index in singles.indices {
+        #expect(batched[index].coefficientCount == singles[index].coefficientCount)
+        #expect(batched[index].qScaleCodesByDescriptor == singles[index].qScaleCodesByDescriptor)
+        let singlePointer = singles[index].coefficientBuffer.contents().bindMemory(to: Int16.self, capacity: sampleCount)
+        let batchPointer = batched[index].coefficientBuffer.contents().bindMemory(to: Int16.self, capacity: sampleCount)
+        let singleCoefficients = Array(UnsafeBufferPointer(start: singlePointer, count: sampleCount))
+        let batchCoefficients = Array(UnsafeBufferPointer(start: batchPointer, count: sampleCount))
+        #expect(batchCoefficients == singleCoefficients)
+    }
+}
+
 @Test func metalSparseApplyMatchesCPUReferenceWhenDeviceExists() throws {
     let backend: MetalPyrowaveBackend
     do {

@@ -826,23 +826,27 @@ public final class PyrowaveCodec: @unchecked Sendable {
             )
         })
 
-        return try inputs.indices.map { index in
-            let descriptors = planeBlockDescriptors(
+        let descriptorsByPlane = inputs.indices.map { index in
+            planeBlockDescriptors(
                 component: inputs[index].component,
                 paddedWidth: geometries[index].paddedWidth,
                 paddedHeight: geometries[index].paddedHeight,
                 levels: levels[index],
                 layout: layout
             )
-            let sampleCount = geometries[index].paddedWidth * geometries[index].paddedHeight
-            let quantized = try quantizeResidentBuffer(
-                transformed[index],
-                sampleCount: sampleCount,
+        }
+        let quantizedPlanes = try quantizeResidentBuffers(inputs.indices.map { index in
+            (
+                samples: transformed[index],
+                sampleCount: geometries[index].paddedWidth * geometries[index].paddedHeight,
                 stride: geometries[index].paddedWidth,
-                descriptors: descriptors,
-                component: inputs[index].component,
-                configuration: configuration
+                descriptors: descriptorsByPlane[index],
+                component: inputs[index].component
             )
+        }, configuration: configuration)
+
+        return inputs.indices.map { index in
+            let quantized = quantizedPlanes[index]
             return EncodedPlane(
                 component: inputs[index].component,
                 paddedWidth: geometries[index].paddedWidth,
@@ -1842,6 +1846,42 @@ public final class PyrowaveCodec: @unchecked Sendable {
             configuration: configuration,
             backend: metalBackend
         )
+    }
+
+    private func quantizeResidentBuffers(
+        _ planes: [(samples: MTLBuffer, sampleCount: Int, stride: Int, descriptors: [PlaneBlockDescriptor], component: Int)],
+        configuration: CodecConfiguration
+    ) throws -> [(coefficientBuffer: MTLBuffer, coefficientCount: Int, quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]])] {
+        var descriptorInputs = [(metalDescriptors: [MetalPlaneQuantizationDescriptor], quantCodes: [Int: UInt8])]()
+        descriptorInputs.reserveCapacity(planes.count)
+        for plane in planes {
+            descriptorInputs.append(try makeQuantizationDescriptors(
+                stride: plane.stride,
+                descriptors: plane.descriptors,
+                component: plane.component,
+                configuration: configuration
+            ))
+        }
+
+        let results = try metalBackend.quantizePlaneBufferResults(planes.indices.map { index in
+            (
+                samples: planes[index].samples,
+                sampleCount: planes[index].sampleCount,
+                stride: planes[index].stride,
+                descriptors: descriptorInputs[index].metalDescriptors
+            )
+        })
+        guard results.count == planes.count else {
+            throw PyrowaveError.processFailed("Metal batch quantization returned \(results.count) planes for \(planes.count) inputs")
+        }
+
+        return try planes.indices.map { index in
+            try finishQuantizationBufferResult(
+                results[index],
+                descriptors: planes[index].descriptors,
+                quantCodes: descriptorInputs[index].quantCodes
+            )
+        }
     }
 
     private func quantizeWithMetal(
