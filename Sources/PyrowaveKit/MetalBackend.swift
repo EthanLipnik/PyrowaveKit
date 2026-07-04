@@ -21,6 +21,7 @@ private enum ReusableBufferPurpose: Hashable {
     case sparsePacketDescriptor
     case sparsePacketQScale
     case sparsePacketSize
+    case dwtPrimary
     case dwtScratch
     case idwtScratch
 }
@@ -299,9 +300,11 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             }
             try validateWaveletShape(width: plane.paddedWidth, height: plane.paddedHeight, levels: plane.levels)
 
-            guard let output = device.makeBuffer(length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
-                throw PyrowaveError.processFailed("failed to allocate Metal texture padding/DWT buffers")
-            }
+            let output = try reusablePrivateBuffer(
+                byteLength: sampleCount * MemoryLayout<Float>.stride,
+                purpose: .dwtPrimary,
+                planeIndex: planeIndex
+            )
             let scratch = try reusablePrivateBuffer(
                 byteLength: sampleCount * MemoryLayout<Float>.stride,
                 purpose: .dwtScratch,
