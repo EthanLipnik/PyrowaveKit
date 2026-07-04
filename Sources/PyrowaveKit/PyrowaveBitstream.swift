@@ -600,6 +600,13 @@ struct PyrowaveCoefficientBlockCodec {
             }
         }
 
+        let paddingStart = signStart + signByteCount
+        if paddingStart < payloadEnd {
+            guard reader.data[paddingStart..<payloadEnd].allSatisfy({ $0 == 0 }) else {
+                throw PyrowaveError.invalidBitstream("non-zero coefficient packet padding")
+            }
+        }
+
         try reader.seek(to: payloadEnd)
         let entries = coefficients.enumerated().compactMap { index, value -> DecodedCoefficient? in
             value == 0 ? nil : DecodedCoefficient(offset: UInt16(index), value: value, qScaleCode: coefficientQScales[index])

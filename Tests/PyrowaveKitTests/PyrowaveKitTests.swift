@@ -562,6 +562,31 @@ import Testing
     #expect(decoded.coefficients.contains { $0.offset == 16 && $0.qScaleCode == 8 })
 }
 
+@Test func pyrowaveCoefficientBlockRejectsNonZeroWordPadding() throws {
+    let stride = 32
+    var coefficients = Array(repeating: Int16(0), count: stride * stride)
+    coefficients[0] = 1
+
+    var payload = try #require(try PyrowaveCoefficientBlockCodec.encodeBlock(
+        blockIndex: 5,
+        coefficients: coefficients,
+        stride: stride,
+        originX: 0,
+        originY: 0,
+        validWidth: 32,
+        validHeight: 32,
+        threshold: 0
+    ))
+
+    #expect(payload.count == 16)
+    payload[payload.count - 1] = 0xff
+
+    var reader = BinaryReader(payload)
+    #expect(throws: PyrowaveError.invalidBitstream("non-zero coefficient packet padding")) {
+        _ = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
+    }
+}
+
 @Test func pyrowaveCoefficientBlockQuantLevelDropsBitplanesAndAdjustsScale() throws {
     let stride = 32
     var coefficients = Array(repeating: Int16(0), count: stride * stride)
