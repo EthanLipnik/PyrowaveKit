@@ -56,6 +56,7 @@ import Metal
     let benchmarkSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/BenchmarkSupport.swift"), encoding: .utf8)
     let coreVideoSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/CoreVideoSupport.swift"), encoding: .utf8)
     let metalTextureSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/MetalTextureSupport.swift"), encoding: .utf8)
+    let metalBackendSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/MetalBackend.swift"), encoding: .utf8)
     let streamSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/PyrowaveStreamFile.swift"), encoding: .utf8)
 
     #expect(!typesSource.contains("public struct Plane8"))
@@ -75,6 +76,11 @@ import Metal
     #expect(!metalTextureSource.contains("public init(texture: MTLTexture)"))
     #expect(!metalTextureSource.contains("public func makeMetalTexture"))
     #expect(!metalTextureSource.contains("public func makeMetalTextures"))
+    #expect(!metalBackendSource.contains("public final class MetalPyrowaveBackend"))
+    #expect(!metalBackendSource.contains("public func quantize(_ samples: [Float]"))
+    #expect(!metalBackendSource.contains("public func dequantize(_ coefficients: [Int16]"))
+    #expect(!metalBackendSource.contains("public func forwardWavelet(_ samples: [Float]"))
+    #expect(!metalBackendSource.contains("public func inverseWavelet(_ coefficients: [Float]"))
     #expect(!streamSource.contains("public init(frame: YUVFrame"))
 }
 

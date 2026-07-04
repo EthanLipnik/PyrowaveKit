@@ -1,10 +1,10 @@
 import Foundation
 import Metal
 
-public final class MetalPyrowaveBackend: @unchecked Sendable {
-    public let device: MTLDevice
-    public let commandQueue: MTLCommandQueue
-    public let library: MTLLibrary
+final class MetalPyrowaveBackend: @unchecked Sendable {
+    let device: MTLDevice
+    let commandQueue: MTLCommandQueue
+    let library: MTLLibrary
     private let padPlanePipeline: MTLComputePipelineState
     private let padTexturePlanePipeline: MTLComputePipelineState
     private let cropPlanePipeline: MTLComputePipelineState
@@ -29,7 +29,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     private let idwtLiftRowsPipeline: MTLComputePipelineState
     private let idwtLiftColumnsPipeline: MTLComputePipelineState
 
-    public init(device: MTLDevice? = MTLCreateSystemDefaultDevice()) throws {
+    init(device: MTLDevice? = MTLCreateSystemDefaultDevice()) throws {
         guard let device else {
             throw PyrowaveError.externalToolUnavailable("Metal device")
         }
@@ -73,7 +73,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         idwtLiftColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_idwt_lift_columns", library: library))
     }
 
-    public func makeFunction(named name: String) throws -> MTLFunction {
+    func makeFunction(named name: String) throws -> MTLFunction {
         try Self.makeFunction(named: name, library: library)
     }
 
@@ -409,7 +409,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         }
     }
 
-    public func quantize(_ samples: [Float], quantizationStep: Float) throws -> [Int16] {
+    func quantize(_ samples: [Float], quantizationStep: Float) throws -> [Int16] {
         guard !samples.isEmpty else { return [] }
         guard quantizationStep > 0 else { throw PyrowaveError.invalidDimensions }
 
@@ -432,7 +432,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         return Array(UnsafeBufferPointer(start: pointer, count: samples.count))
     }
 
-    public func dequantize(_ coefficients: [Int16], quantizationStep: Float) throws -> [Float] {
+    func dequantize(_ coefficients: [Int16], quantizationStep: Float) throws -> [Float] {
         guard !coefficients.isEmpty else { return [] }
         guard quantizationStep > 0 else { throw PyrowaveError.invalidDimensions }
 
@@ -998,7 +998,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         return Array(UnsafeBufferPointer(start: pointer, count: cumulativeSavings.count)).map(Int.init)
     }
 
-    public func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
+    func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
         try validateWaveletInput(samples, width: width, height: height, levels: levels)
         guard !samples.isEmpty else { return [] }
 
@@ -1083,7 +1083,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         return primary
     }
 
-    public func inverseWavelet(_ coefficients: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
+    func inverseWavelet(_ coefficients: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
         try validateWaveletInput(coefficients, width: width, height: height, levels: levels)
         guard !coefficients.isEmpty else { return [] }
 
