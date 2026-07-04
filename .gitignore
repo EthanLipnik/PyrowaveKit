@@ -1,9 +1,5 @@
-/cmake-build-*
-*.iml
-/.idea
-/Granite
-/build-steamrt
-/steamrt-output
 /.build
 /.pyrowave-results
 *.xcodeproj
+*.xcworkspace
+.swiftpm
