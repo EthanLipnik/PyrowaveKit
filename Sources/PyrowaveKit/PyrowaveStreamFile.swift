@@ -54,20 +54,21 @@ public struct PyrowaveStreamHeader: Codable, Equatable, Sendable {
         switch formatCode {
         case 0:
             decodedChroma = .yuv420
-            decodedBitDepth = 8
         case 1:
             decodedChroma = .yuv444
-            decodedBitDepth = 8
         case 2:
             decodedChroma = .yuv420
-            decodedBitDepth = 16
         case 3:
             decodedChroma = .yuv444
-            decodedBitDepth = 16
         default:
             throw PyrowaveError.unsupportedFormat("Pyrowave stream format code \(formatCode)")
         }
 
+        decodedBitDepth = Int(words[3])
+        guard [8, 10, 12, 14, 16].contains(decodedBitDepth),
+              (formatCode < 2) == (decodedBitDepth == 8) else {
+            throw PyrowaveError.invalidBitstream("bad stream bit depth")
+        }
         guard let range = YCbCrRange(rawValue: UInt8(clamping: words[4])),
               let siting = ChromaSiting(rawValue: UInt8(clamping: words[7])) else {
             throw PyrowaveError.invalidBitstream("bad stream video metadata")
@@ -89,7 +90,7 @@ public struct PyrowaveStreamHeader: Codable, Equatable, Sendable {
             UInt32(width),
             UInt32(height),
             UInt32(formatCode),
-            UInt32(chroma.rawValue),
+            UInt32(bitDepth),
             UInt32(videoSignal.yCbCrRange.rawValue),
             UInt32(frameRateNumerator),
             UInt32(frameRateDenominator),

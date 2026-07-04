@@ -400,6 +400,7 @@ import Testing
     #expect(reader.header.chroma == .yuv420)
     #expect(reader.header.frameRateNumerator == 120)
     #expect(reader.header.frameRateDenominator == 1)
+    #expect(reader.header.bitDepth == 8)
 
     let first = try #require(try reader.readFrame())
     let second = try #require(try reader.readFrame())
@@ -410,6 +411,27 @@ import Testing
     let expectedSecond = try codec.decode(encoded[1])
     #expect(decodedFirst == expectedFirst)
     #expect(decodedSecond == expectedSecond)
+}
+
+@Test func pyrowaveStreamFilePreservesExactHighBitDepth() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("high-depth.pwks")
+    let frame = try TestFrames.synthetic420(width: 96, height: 64)
+    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+        frame,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
+    )
+
+    var writer = try PyrowaveStreamWriter(
+        url: url,
+        header: PyrowaveStreamHeader(frame: frame, bitDepth: 10)
+    )
+    try writer.writeFrame(encoded)
+
+    var reader = try PyrowaveStreamReader(url: url)
+    #expect(reader.header.bitDepth == 10)
+    #expect(try reader.readFrame() == encoded)
 }
 
 @Test func pyrowaveStreamFileRejectsMissingMagic() throws {
@@ -457,7 +479,7 @@ import Testing
         UInt32(header.width),
         UInt32(header.height),
         UInt32(0),
-        UInt32(header.chroma.rawValue),
+        UInt32(header.bitDepth),
         UInt32(header.videoSignal.yCbCrRange.rawValue),
         UInt32(header.frameRateNumerator),
         UInt32(header.frameRateDenominator),
