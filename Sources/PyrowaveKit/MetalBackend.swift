@@ -765,6 +765,19 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     func rateControlTileStatsBatch(
         _ planes: [(coefficientBuffer: MTLBuffer, coefficientCount: Int, descriptors: [MetalRateControlStatsDescriptor])]
     ) throws -> [[MetalRateControlTileStats]] {
+        let flatResults = try rateControlTileStatsFlatBatch(planes)
+        return flatResults.map { result in
+            result.numPlanes.indices.map { index in
+                let start = index * PyrowaveBlockStats.candidateCount
+                let end = start + PyrowaveBlockStats.candidateCount
+                return MetalRateControlTileStats(numPlanes: result.numPlanes[index], stats: Array(result.stats[start..<end]))
+            }
+        }
+    }
+
+    func rateControlTileStatsFlatBatch(
+        _ planes: [(coefficientBuffer: MTLBuffer, coefficientCount: Int, descriptors: [MetalRateControlStatsDescriptor])]
+    ) throws -> [MetalRateControlTileStatsFlat] {
         guard !planes.isEmpty else {
             return []
         }
@@ -778,7 +791,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             descriptorCount: Int
         )]()
         work.reserveCapacity(planes.count)
-        var emptyResults = Array(repeating: [MetalRateControlTileStats](), count: planes.count)
+        var emptyResults = Array(repeating: MetalRateControlTileStatsFlat(numPlanes: [], stats: []), count: planes.count)
 
         for (planeIndex, plane) in planes.enumerated() {
             guard plane.coefficientCount > 0,
@@ -843,14 +856,10 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             let statsCount = item.descriptorCount * PyrowaveBlockStats.candidateCount
             let numPlanesPointer = item.numPlanesBuffer.contents().bindMemory(to: UInt32.self, capacity: item.descriptorCount)
             let statsPointer = item.statsBuffer.contents().bindMemory(to: MetalRateControlQuantStats.self, capacity: statsCount)
-            let metalNumPlanes = Array(UnsafeBufferPointer(start: numPlanesPointer, count: item.descriptorCount))
-            let metalStats = Array(UnsafeBufferPointer(start: statsPointer, count: statsCount))
-
-            emptyResults[item.planeIndex] = metalNumPlanes.indices.map { index in
-                let start = index * PyrowaveBlockStats.candidateCount
-                let end = start + PyrowaveBlockStats.candidateCount
-                return MetalRateControlTileStats(numPlanes: metalNumPlanes[index], stats: Array(metalStats[start..<end]))
-            }
+            emptyResults[item.planeIndex] = MetalRateControlTileStatsFlat(
+                numPlanes: Array(UnsafeBufferPointer(start: numPlanesPointer, count: item.descriptorCount)),
+                stats: Array(UnsafeBufferPointer(start: statsPointer, count: statsCount))
+            )
         }
         return emptyResults
     }
@@ -2008,6 +2017,11 @@ struct MetalRateControlStatsDescriptor {
 struct MetalRateControlQuantStats {
     var squareError: Float
     var encodeCostBits: UInt32
+}
+
+struct MetalRateControlTileStatsFlat {
+    var numPlanes: [UInt32]
+    var stats: [MetalRateControlQuantStats]
 }
 
 struct MetalRateControlTileStats {

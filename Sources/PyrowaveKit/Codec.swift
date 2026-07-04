@@ -802,6 +802,11 @@ public final class PyrowaveCodec: @unchecked Sendable {
         var cumulativeSavings: [Int]
     }
 
+    private struct SparseRateControlInputs {
+        var distortionsByPlane: [[[Float]]]
+        var packetByteCostsByPlane: [[[Int]]]
+    }
+
     private struct PlaneBlockDescriptor {
         var blockIndex: Int
         var globalLevel: Int
@@ -1084,15 +1089,18 @@ public final class PyrowaveCodec: @unchecked Sendable {
         }
 
         let fixedHeaderBytes = frameHeaderSize
-        let rateBlocksByPlane = try makeRateControlBlocks(
+        let rateControlInputs = try makeSparseRateControlInputs(
             planes,
             layout: layout,
             packetByteCostsByPlane: packetByteCostsByPlane
         )
-        let selectedPacketByteCostsByPlane = rateBlocksByPlane.map { $0.map(\.packetByteCosts) }
-        let metalBucketData = try metalRateControlBucketData(blocksByPlane: rateBlocksByPlane)
-        if let thresholdsByPlane = PyrowaveRateController.selectThresholds(
-            blocksByPlane: rateBlocksByPlane,
+        let selectedPacketByteCostsByPlane = rateControlInputs.packetByteCostsByPlane
+        let metalBucketData = try metalRateControlBucketData(
+            distortionsByPlane: rateControlInputs.distortionsByPlane,
+            packetByteCostsByPlane: selectedPacketByteCostsByPlane
+        )
+        if let thresholdsByPlane = selectThresholds(
+            packetByteCostsByPlane: selectedPacketByteCostsByPlane,
             fixedHeaderBytes: fixedHeaderBytes,
             maximumEncodedBytes: maximumEncodedBytes,
             bucketIndicesByPlane: metalBucketData.indicesByPlane,
@@ -1109,9 +1117,9 @@ public final class PyrowaveCodec: @unchecked Sendable {
         var high = PyrowaveBlockStats.candidateCount - 1
         while low < high {
             let mid = (low + high) / 2
-            let thresholds = rateBlocksByPlane.map { Array(repeating: mid, count: $0.count) }
-            let size = PyrowaveRateController.estimateFrameBytes(
-                blocksByPlane: rateBlocksByPlane,
+            let thresholds = selectedPacketByteCostsByPlane.map { Array(repeating: mid, count: $0.count) }
+            let size = estimateFrameBytes(
+                packetByteCostsByPlane: selectedPacketByteCostsByPlane,
                 thresholdsByPlane: thresholds,
                 fixedHeaderBytes: fixedHeaderBytes
             )
@@ -1129,74 +1137,65 @@ public final class PyrowaveCodec: @unchecked Sendable {
         )
     }
 
-    private func metalRateControlBucketData(blocksByPlane: [[PyrowaveRateControlBlock]]) throws -> MetalRateControlBucketData {
-        let distortionsByPlane = blocksByPlane.map { blocks in
-            blocks.map { block in
-                (0..<PyrowaveBlockStats.candidateCount).map { block.distortion(quantLevel: $0) }
-            }
-        }
-        let packetByteCostsByPlane = blocksByPlane.map { blocks in
-            blocks.map(\.packetByteCosts)
-        }
-        let totalBlockCount = blocksByPlane.reduce(0) { $0 + $1.count }
+    private func metalRateControlBucketData(
+        distortionsByPlane: [[[Float]]],
+        packetByteCostsByPlane: [[[Int]]]
+    ) throws -> MetalRateControlBucketData {
+        let totalBlockCount = packetByteCostsByPlane.reduce(0) { $0 + $1.count }
         if totalBlockCount < fusedRateControlBucketBlockThreshold {
             return try separateMetalRateControlBucketData(
-                blocksByPlane: blocksByPlane,
                 distortionsByPlane: distortionsByPlane,
                 packetByteCostsByPlane: packetByteCostsByPlane
             )
         }
 
         return try fusedMetalRateControlBucketData(
-            blocksByPlane: blocksByPlane,
             distortionsByPlane: distortionsByPlane,
             packetByteCostsByPlane: packetByteCostsByPlane
         )
     }
 
     private func fusedMetalRateControlBucketData(
-        blocksByPlane: [[PyrowaveRateControlBlock]],
         distortionsByPlane: [[[Float]]],
         packetByteCostsByPlane: [[[Int]]]
     ) throws -> MetalRateControlBucketData {
-        let bucketData = try metalBackend.rateControlBucketDataBatch(blocksByPlane.indices.map { index in
+        let bucketData = try metalBackend.rateControlBucketDataBatch(packetByteCostsByPlane.indices.map { index in
             (
                 distortions: distortionsByPlane[index],
                 packetByteCosts: packetByteCostsByPlane[index]
             )
         })
         let bucketsByPlane = bucketData.bucketIndicesByPlane
-        guard bucketsByPlane.count == blocksByPlane.count else {
-            throw PyrowaveError.processFailed("Metal rate-control bucket batch returned \(bucketsByPlane.count) planes for \(blocksByPlane.count) inputs")
+        guard bucketsByPlane.count == packetByteCostsByPlane.count else {
+            throw PyrowaveError.processFailed("Metal rate-control bucket batch returned \(bucketsByPlane.count) planes for \(packetByteCostsByPlane.count) inputs")
         }
-        for planeIndex in blocksByPlane.indices {
-            guard bucketsByPlane[planeIndex].count == blocksByPlane[planeIndex].count else {
-                throw PyrowaveError.processFailed("Metal rate-control bucket pass returned \(bucketsByPlane[planeIndex].count) blocks for \(blocksByPlane[planeIndex].count) inputs")
+        for planeIndex in packetByteCostsByPlane.indices {
+            guard bucketsByPlane[planeIndex].count == packetByteCostsByPlane[planeIndex].count else {
+                throw PyrowaveError.processFailed("Metal rate-control bucket pass returned \(bucketsByPlane[planeIndex].count) blocks for \(packetByteCostsByPlane[planeIndex].count) inputs")
             }
         }
         return MetalRateControlBucketData(indicesByPlane: bucketsByPlane, cumulativeSavings: bucketData.cumulativeSavings)
     }
 
     private func separateMetalRateControlBucketData(
-        blocksByPlane: [[PyrowaveRateControlBlock]],
         distortionsByPlane: [[[Float]]],
         packetByteCostsByPlane: [[[Int]]]
     ) throws -> MetalRateControlBucketData {
-        let bucketsByPlane = try metalBackend.rateControlBucketIndicesBatch(blocksByPlane.indices.map { index in
+        let bucketsByPlane = try metalBackend.rateControlBucketIndicesBatch(packetByteCostsByPlane.indices.map { index in
             (
                 distortions: distortionsByPlane[index],
                 packetByteCosts: packetByteCostsByPlane[index]
             )
         })
-        guard bucketsByPlane.count == blocksByPlane.count else {
-            throw PyrowaveError.processFailed("Metal rate-control bucket batch returned \(bucketsByPlane.count) planes for \(blocksByPlane.count) inputs")
+        guard bucketsByPlane.count == packetByteCostsByPlane.count else {
+            throw PyrowaveError.processFailed("Metal rate-control bucket batch returned \(bucketsByPlane.count) planes for \(packetByteCostsByPlane.count) inputs")
         }
 
         var flatBuckets = [[Int]]()
         var flatPacketByteCosts = [[Int]]()
-        for planeIndex in blocksByPlane.indices {
-            guard bucketsByPlane[planeIndex].count == blocksByPlane[planeIndex].count else {
-                throw PyrowaveError.processFailed("Metal rate-control bucket pass returned \(bucketsByPlane[planeIndex].count) blocks for \(blocksByPlane[planeIndex].count) inputs")
+        for planeIndex in packetByteCostsByPlane.indices {
+            guard bucketsByPlane[planeIndex].count == packetByteCostsByPlane[planeIndex].count else {
+                throw PyrowaveError.processFailed("Metal rate-control bucket pass returned \(bucketsByPlane[planeIndex].count) blocks for \(packetByteCostsByPlane[planeIndex].count) inputs")
             }
             flatBuckets.append(contentsOf: bucketsByPlane[planeIndex])
             flatPacketByteCosts.append(contentsOf: packetByteCostsByPlane[planeIndex])
@@ -1462,6 +1461,230 @@ public final class PyrowaveCodec: @unchecked Sendable {
             }
         }
         return costsByPlane
+    }
+
+    private func makeSparseRateControlInputs(
+        _ planes: [EncodedPlane],
+        layout: PyrowaveBlockLayout,
+        packetByteCostsByPlane: [[[Int]]]? = nil
+    ) throws -> SparseRateControlInputs {
+        if let packetByteCostsByPlane, packetByteCostsByPlane.count != planes.count {
+            throw PyrowaveError.processFailed("packet byte-cost plane count \(packetByteCostsByPlane.count) does not match plane count \(planes.count)")
+        }
+        guard planes.allSatisfy({ $0.coefficientBuffer != nil }) else {
+            let blocksByPlane = try makeRateControlBlocks(planes, layout: layout, packetByteCostsByPlane: packetByteCostsByPlane)
+            return SparseRateControlInputs(
+                distortionsByPlane: blocksByPlane.map { blocks in
+                    blocks.map { block in
+                        (0..<PyrowaveBlockStats.candidateCount).map { block.distortion(quantLevel: $0) }
+                    }
+                },
+                packetByteCostsByPlane: blocksByPlane.map { $0.map(\.packetByteCosts) }
+            )
+        }
+
+        let descriptorsByPlane = planes.map { planeBlockDescriptors(plane: $0, layout: layout) }
+        var statsDescriptorsByPlane = [[MetalRateControlStatsDescriptor]]()
+        statsDescriptorsByPlane.reserveCapacity(planes.count)
+
+        for (planeIndex, plane) in planes.enumerated() {
+            var statsDescriptors = [MetalRateControlStatsDescriptor]()
+            statsDescriptors.reserveCapacity(descriptorsByPlane[planeIndex].count * 16)
+            for (descriptorIndex, descriptor) in descriptorsByPlane[planeIndex].enumerated() {
+                let quantCode = try quantCode(for: descriptor, descriptorIndex: descriptorIndex, plane: plane)
+                let qScaleCodes = try qScaleCodes(for: descriptor, descriptorIndex: descriptorIndex, plane: plane)
+                let rdoDistortionScale = PyrowaveQuantization.rdoDistortionScale(
+                    level: descriptor.globalLevel,
+                    component: plane.component,
+                    band: descriptor.band,
+                    chroma: layout.chroma
+                )
+                for tileY in 0..<4 {
+                    for tileX in 0..<4 {
+                        let tileIndex = tileY * 4 + tileX
+                        statsDescriptors.append(MetalRateControlStatsDescriptor(
+                            originX: UInt32(descriptor.originX + tileX * PyrowaveBitstream.smallBlockSize),
+                            originY: UInt32(descriptor.originY + tileY * PyrowaveBitstream.smallBlockSize),
+                            validWidth: UInt32(max(0, min(PyrowaveBitstream.smallBlockSize, descriptor.validWidth - tileX * PyrowaveBitstream.smallBlockSize))),
+                            validHeight: UInt32(max(0, min(PyrowaveBitstream.smallBlockSize, descriptor.validHeight - tileY * PyrowaveBitstream.smallBlockSize))),
+                            stride: UInt32(plane.paddedWidth),
+                            quantCode: UInt32(quantCode),
+                            qScaleCode: UInt32(qScaleCodes[tileIndex]),
+                            distortionScale: rdoDistortionScale
+                        ))
+                    }
+                }
+            }
+            statsDescriptorsByPlane.append(statsDescriptors)
+        }
+
+        let tileStatsByPlane = try metalBackend.rateControlTileStatsFlatBatch(planes.indices.map { index in
+            (
+                coefficientBuffer: planes[index].coefficientBuffer!,
+                coefficientCount: planes[index].coefficientCount,
+                descriptors: statsDescriptorsByPlane[index]
+            )
+        })
+
+        let selectedPacketByteCostsByPlane: [[[Int]]]
+        if let packetByteCostsByPlane {
+            selectedPacketByteCostsByPlane = packetByteCostsByPlane
+        } else {
+            selectedPacketByteCostsByPlane = try metalSparsePacketByteCosts(
+                planes: planes,
+                descriptorsByPlane: descriptorsByPlane
+            )
+        }
+
+        let distortionsByPlane = try planes.indices.map { planeIndex -> [[Float]] in
+            let descriptors = descriptorsByPlane[planeIndex]
+            let tileStats = tileStatsByPlane[planeIndex]
+            let expectedTileCount = descriptors.count * 16
+            guard tileStats.numPlanes.count == expectedTileCount else {
+                throw PyrowaveError.processFailed("Metal rate-control returned \(tileStats.numPlanes.count) tile stats for \(expectedTileCount) descriptors")
+            }
+            guard tileStats.stats.count == expectedTileCount * PyrowaveBlockStats.candidateCount else {
+                throw PyrowaveError.processFailed("Metal rate-control returned \(tileStats.stats.count) quant stats for \(expectedTileCount) tiles")
+            }
+            guard selectedPacketByteCostsByPlane[planeIndex].count == descriptors.count else {
+                throw PyrowaveError.processFailed("Metal packet byte-cost returned \(selectedPacketByteCostsByPlane[planeIndex].count) block costs for \(descriptors.count) descriptors")
+            }
+
+            return descriptors.indices.map { descriptorIndex in
+                let firstTile = descriptorIndex * 16
+                var distortions = Array(repeating: Float(0), count: PyrowaveBlockStats.candidateCount)
+                for tileOffset in 0..<16 {
+                    let tileIndex = firstTile + tileOffset
+                    let statsStart = tileIndex * PyrowaveBlockStats.candidateCount
+                    for candidate in 0..<PyrowaveBlockStats.candidateCount {
+                        let stat = tileStats.stats[statsStart + candidate]
+                        distortions[candidate] += PyrowaveQuantStats(
+                            squareError: stat.squareError,
+                            encodeCostBits: Int(stat.encodeCostBits)
+                        ).squareError
+                    }
+                }
+                return distortions
+            }
+        }
+
+        return SparseRateControlInputs(
+            distortionsByPlane: distortionsByPlane,
+            packetByteCostsByPlane: selectedPacketByteCostsByPlane
+        )
+    }
+
+    private func selectThresholds(
+        packetByteCostsByPlane: [[[Int]]],
+        fixedHeaderBytes: Int,
+        maximumEncodedBytes: Int,
+        bucketIndicesByPlane: [[[Int]]],
+        cumulativeBucketSavings: [Int]
+    ) -> [[Int]]? {
+        var thresholds = packetByteCostsByPlane.map { Array(repeating: 0, count: $0.count) }
+        var currentBytes = estimateFrameBytes(
+            packetByteCostsByPlane: packetByteCostsByPlane,
+            thresholdsByPlane: thresholds,
+            fixedHeaderBytes: fixedHeaderBytes
+        )
+        var requiredSavings = currentBytes - maximumEncodedBytes
+        guard requiredSavings > 0 else {
+            return thresholds
+        }
+        if (cumulativeBucketSavings.last ?? 0) < requiredSavings {
+            return nil
+        }
+
+        let operations = makeRateControlOperations(
+            packetByteCostsByPlane: packetByteCostsByPlane,
+            bucketIndicesByPlane: bucketIndicesByPlane
+        )
+        guard !operations.isEmpty else {
+            return nil
+        }
+
+        for operation in operations where requiredSavings > 0 {
+            let currentLevel = thresholds[operation.planeIndex][operation.blockIndex]
+            guard operation.quantLevel > currentLevel else {
+                continue
+            }
+
+            let blockCosts = packetByteCostsByPlane[operation.planeIndex][operation.blockIndex]
+            let actualSaving = blockCosts[currentLevel] - blockCosts[operation.quantLevel]
+            guard actualSaving > 0 else {
+                continue
+            }
+
+            thresholds[operation.planeIndex][operation.blockIndex] = operation.quantLevel
+            currentBytes -= actualSaving
+            requiredSavings -= actualSaving
+        }
+
+        return currentBytes <= maximumEncodedBytes ? thresholds : nil
+    }
+
+    private func estimateFrameBytes(
+        packetByteCostsByPlane: [[[Int]]],
+        thresholdsByPlane: [[Int]],
+        fixedHeaderBytes: Int
+    ) -> Int {
+        var byteCount = fixedHeaderBytes
+        for (planeCosts, thresholds) in zip(packetByteCostsByPlane, thresholdsByPlane) {
+            for (blockCosts, threshold) in zip(planeCosts, thresholds) {
+                byteCount += blockCosts[min(max(threshold, 0), PyrowaveBlockStats.candidateCount - 1)]
+            }
+        }
+        return byteCount
+    }
+
+    private func makeRateControlOperations(
+        packetByteCostsByPlane: [[[Int]]],
+        bucketIndicesByPlane: [[[Int]]]
+    ) -> [PyrowaveRateController.RDOperation] {
+        var buckets = Array(repeating: [PyrowaveRateController.RDOperation](), count: 128)
+
+        for (planeIndex, planeCosts) in packetByteCostsByPlane.enumerated() {
+            for (blockIndex, blockCosts) in planeCosts.enumerated() {
+                guard planeIndex < bucketIndicesByPlane.count,
+                      blockIndex < bucketIndicesByPlane[planeIndex].count,
+                      bucketIndicesByPlane[planeIndex][blockIndex].count == PyrowaveBlockStats.candidateCount,
+                      blockCosts.count == PyrowaveBlockStats.candidateCount else {
+                    continue
+                }
+
+                let bucketIndices = bucketIndicesByPlane[planeIndex][blockIndex]
+                for quantLevel in 1..<PyrowaveBlockStats.candidateCount {
+                    let saving = blockCosts[quantLevel - 1] - blockCosts[quantLevel]
+                    guard saving > 0 else {
+                        continue
+                    }
+
+                    let bucket = bucketIndices[quantLevel]
+                    guard bucket >= 0, bucket < buckets.count else {
+                        continue
+                    }
+                    buckets[bucket].append(PyrowaveRateController.RDOperation(
+                        bucket: bucket,
+                        planeIndex: planeIndex,
+                        blockIndex: blockIndex,
+                        quantLevel: quantLevel,
+                        saving: saving
+                    ))
+                }
+            }
+        }
+
+        return buckets.flatMap { bucket in
+            bucket.sorted {
+                if $0.planeIndex != $1.planeIndex {
+                    return $0.planeIndex < $1.planeIndex
+                }
+                if $0.blockIndex != $1.blockIndex {
+                    return $0.blockIndex < $1.blockIndex
+                }
+                return $0.quantLevel < $1.quantLevel
+            }
+        }
     }
 
     private func makeRateControlBlocks(_ plane: EncodedPlane, layout: PyrowaveBlockLayout) throws -> [PyrowaveRateControlBlock] {
