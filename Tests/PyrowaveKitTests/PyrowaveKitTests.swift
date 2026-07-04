@@ -5,6 +5,18 @@ import Testing
 import CoreVideo
 import Metal
 
+private extension String {
+    func requiredSlice(from start: String, to end: String) throws -> String {
+        guard let startRange = range(of: start) else {
+            throw PyrowaveError.processFailed("missing source slice start: \(start)")
+        }
+        guard let endRange = self[startRange.upperBound...].range(of: end) else {
+            throw PyrowaveError.processFailed("missing source slice end: \(end)")
+        }
+        return String(self[startRange.lowerBound..<endRange.lowerBound])
+    }
+}
+
 @Test func hardCutoverSourceTreeContainsOnlySwiftAndMetalSources() throws {
     let packageRoot = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()
@@ -84,6 +96,539 @@ import Metal
     #expect(!streamSource.contains("public init(frame: YUVFrame"))
 }
 
+@Test func coreVideoCodecEntryPointsStayOnMetalTexturePath() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let source = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/CoreVideoSupport.swift"), encoding: .utf8)
+
+    let gpuEncodeBody = try source.requiredSlice(
+        from: "public func encodeGPUFrame(\n        _ cvPixelBuffer: CVPixelBuffer",
+        to: "    public func encode(\n        _ cvPixelBuffer: CVPixelBuffer"
+    )
+    #expect(gpuEncodeBody.contains("let textures = try makeNV12MetalTexturesAndSignal("))
+    #expect(gpuEncodeBody.contains("return try encodeGPUFrame("))
+    #expect(!gpuEncodeBody.contains("exportGPUFrame"))
+    #expect(!gpuEncodeBody.contains("YUVFrame("))
+    #expect(!gpuEncodeBody.contains("CVPixelBufferLockBaseAddress"))
+
+    let exportEncodeBody = try source.requiredSlice(
+        from: "public func encode(\n        _ cvPixelBuffer: CVPixelBuffer",
+        to: "    private func makeMetalTexture("
+    )
+    #expect(exportEncodeBody.contains("try exportGPUFrame(try encodeGPUFrame("))
+    #expect(exportEncodeBody.contains("private func makeNV12MetalTexturesAndSignal("))
+    #expect(!exportEncodeBody.contains("YUVFrame("))
+    #expect(!exportEncodeBody.contains("nv12Planes"))
+    #expect(!exportEncodeBody.contains("CVPixelBufferLockBaseAddress"))
+
+    let exportDecodeBody = try source.requiredSlice(
+        from: "public func decodeToCVPixelBuffer(",
+        to: "    public func decodeGPUFrameToCVPixelBuffer("
+    )
+    #expect(exportDecodeBody.contains("try decodeGPUFrameToCVPixelBuffer(try importGPUFrame(frame), pixelFormat: pixelFormat)"))
+    #expect(!exportDecodeBody.contains("BinaryReader"))
+    #expect(!exportDecodeBody.contains("decodeToNV12Textures("))
+    #expect(!exportDecodeBody.contains("YUVFrame("))
+    #expect(!exportDecodeBody.contains("copy(to:"))
+
+    let gpuDecodeAllocatingBody = try source.requiredSlice(
+        from: "public func decodeGPUFrameToCVPixelBuffer(",
+        to: "    public func decodeGPUFrame(\n        _ frame: PyrowaveGPUFrame"
+    )
+    #expect(gpuDecodeAllocatingBody.contains("CVPixelBufferCreate("))
+    #expect(gpuDecodeAllocatingBody.contains("try decodeGPUFrame(frame, to: pixelBuffer)"))
+    #expect(!gpuDecodeAllocatingBody.contains("importGPUFrame"))
+    #expect(!gpuDecodeAllocatingBody.contains("YUVFrame("))
+    #expect(!gpuDecodeAllocatingBody.contains("CVPixelBufferLockBaseAddress"))
+
+    let gpuDecodeReusableBody = try source.requiredSlice(
+        from: "public func decodeGPUFrame(\n        _ frame: PyrowaveGPUFrame",
+        to: "    }\n}"
+    )
+    #expect(gpuDecodeReusableBody.contains("makeMetalTexture("))
+    #expect(gpuDecodeReusableBody.contains("try decodeGPUFrameToNV12Textures("))
+    #expect(!gpuDecodeReusableBody.contains("importGPUFrame"))
+    #expect(!gpuDecodeReusableBody.contains("decodeToNV12Textures("))
+    #expect(!gpuDecodeReusableBody.contains("YUVFrame("))
+    #expect(!gpuDecodeReusableBody.contains("CVPixelBufferLockBaseAddress"))
+}
+
+@Test func nv12TextureEncodedFrameAPIExportsGPUFrame() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let source = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Codec.swift"), encoding: .utf8)
+    let body = try source.requiredSlice(
+        from: "public func encode(\n        yTexture: MTLTexture,\n        cbCrTexture: MTLTexture",
+        to: "    public func encodeGPUFrame("
+    )
+    #expect(body.contains("try exportGPUFrame(try encodeGPUFrame("))
+    #expect(!body.contains("encodeFrame("))
+    #expect(!body.contains("encodeTexturePlanes("))
+}
+
+@Test func pyrowaveBenchmarkTimedScopeExcludesArtifactsMetricsAndCPUFrames() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let source = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/BenchmarkSupport.swift"), encoding: .utf8)
+    let timedScope = try source.requiredSlice(
+        from: "let encodeSources = try inputPixelBuffers.map",
+        to: "        let metric: FrameMetrics?"
+    )
+
+    #expect(timedScope.contains("codec.encodeGPUFrame("))
+    #expect(timedScope.contains("codec.decodeGPUFrameToNV12Textures("))
+    #expect(timedScope.contains("reusesPacketBuffers: true"))
+    #expect(timedScope.contains("let timedDecodeTarget = try makeDecodeTarget("))
+    #expect(timedScope.contains("yTexture: timedDecodeTarget.yTexture"))
+    #expect(!timedScope.contains("makeDecodeTargets("))
+    let encodeEnd = try #require(timedScope.range(of: "encodeSeconds += stopwatch.lapSeconds()")?.lowerBound)
+    let decodeStart = try #require(timedScope.range(of: "codec.decodeGPUFrameToNV12Textures(")?.lowerBound)
+    let decodeEnd = try #require(timedScope.range(of: "decodeSeconds += stopwatch.lapSeconds()")?.lowerBound)
+    let byteInspection = try #require(timedScope.range(of: "encodedByteCountForInspection()")?.lowerBound)
+    #expect(encodeEnd < decodeStart)
+    #expect(decodeEnd < byteInspection)
+    #expect(!timedScope.contains("codec.encode(pixelBuffer"))
+    #expect(!timedScope.contains("decodeToNV12Textures("))
+    #expect(!timedScope.contains("gpuFrames.append"))
+    #expect(!timedScope.contains("encodedFrames.append"))
+    #expect(!timedScope.contains("YUVFrame("))
+    #expect(!timedScope.contains("YUV4MPEGWriter"))
+    #expect(!timedScope.contains("PyrowaveStreamWriter"))
+    #expect(!timedScope.contains("Metrics.compare"))
+    #expect(!timedScope.contains("JSONEncoder"))
+    #expect(!timedScope.contains("exportGPUFrame"))
+    #expect(!timedScope.contains("importGPUFrame"))
+    #expect(!timedScope.contains("writeFrame"))
+    #expect(!timedScope.contains("decodeToCVPixelBuffer"))
+    #expect(!timedScope.contains("makeCVPixelBuffer"))
+}
+
+@Test func pyrowaveBenchmarkReviewArtifactsExportGPUFramesOutsideTimedPath() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let source = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/BenchmarkSupport.swift"), encoding: .utf8)
+    let artifactScope = try source.requiredSlice(
+        from: "if writesArtifactsAndMetrics {",
+        to: "        } else {"
+    )
+    #expect(artifactScope.contains("artifactCodec.encodeGPUFrame("))
+    #expect(artifactScope.contains("artifactCodec.exportGPUFrame("))
+    #expect(artifactScope.contains("artifactCodec.decodeGPUFrameToNV12Textures("))
+    #expect(artifactScope.contains("makeDecodeTargets("))
+    #expect(artifactScope.contains("PyrowaveStreamWriter"))
+    #expect(!artifactScope.contains("artifactCodec.encode($0"))
+}
+
+@Test func gpuFrameEncodeDoesNotUsePyrowaveByteCaps() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let codecSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Codec.swift"), encoding: .utf8)
+    let gpuEncodeBody = try codecSource.requiredSlice(
+        from: "public func encodeGPUFrame(",
+        to: "    public func decodeGPUFrameToNV12Textures("
+    )
+    #expect(!gpuEncodeBody.contains("maximumEncodedBytes"))
+    #expect(!gpuEncodeBody.contains("metalSparsePacketByteCosts("))
+    #expect(!gpuEncodeBody.contains("selectSparseRateControlPlan("))
+    #expect(gpuEncodeBody.contains("packetByteCostsByPlane: nil"))
+}
+
+@Test func pyrowaveSourcesDoNotContainByteCapSelectors() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let sourceRoot = packageRoot.appendingPathComponent("Sources/PyrowaveKit")
+    let sourceFiles = [
+        "BenchmarkSupport.swift",
+        "Codec.swift",
+        "MetalBackend.swift",
+        "PyrowaveRateControl.swift",
+        "Metal/PyrowaveKernels.metal"
+    ]
+    let sources = try sourceFiles.map {
+        try String(contentsOf: sourceRoot.appendingPathComponent($0), encoding: .utf8)
+    }.joined(separator: "\n")
+
+    #expect(!sources.contains("maximumEncodedBytes"))
+    #expect(!sources.contains("pyrowaveFrameBudgetBytes"))
+    #expect(!sources.contains("max-pyrowave-bytes"))
+    #expect(!sources.contains("match-hevc-frame-budget"))
+    #expect(!sources.contains("selectSparseRateControlPlan("))
+    #expect(!sources.contains("rateControlUniformQuantLevel("))
+    #expect(!sources.contains("pyrowave_rate_control_select_uniform_quant_level"))
+}
+
+@Test func gpuFrameEncodeKeepsQScaleMetadataResidentForPacketEmission() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let codecSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Codec.swift"), encoding: .utf8)
+    let gpuEncodeBody = try codecSource.requiredSlice(
+        from: "public func encodeGPUFrame(",
+        to: "    public func decodeGPUFrameToNV12Textures("
+    )
+    #expect(gpuEncodeBody.contains("readsQScaleCodes: false"))
+
+    let gpuFramePlaneBody = try codecSource.requiredSlice(
+        from: "private func makeGPUFramePlanes(",
+        to: "    private func sparseBlocksWithMetal("
+    )
+    #expect(gpuFramePlaneBody.contains("usesResidentQScaleBuffers"))
+    #expect(gpuFramePlaneBody.contains("encodeSparsePacketBuffersBatchResidentQScales"))
+    #expect(gpuFramePlaneBody.contains("if !usesResidentQScaleBuffers"))
+
+    let metalSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/MetalBackend.swift"), encoding: .utf8)
+    let residentPacketBody = try metalSource.requiredSlice(
+        from: "func encodeSparsePacketBuffersBatchResidentQScales(",
+        to: "    private func emptySparsePacketOutputBuffer()"
+    )
+    #expect(residentPacketBody.contains("qScaleBuffer: MTLBuffer"))
+    #expect(!residentPacketBody.contains("flatQScaleCodes"))
+}
+
+@Test func gpuFrameQuantizationSkipsInterstageWaitWhenQScaleReadbackIsDisabled() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let metalSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/MetalBackend.swift"), encoding: .utf8)
+    let quantizeBody = try metalSource.requiredSlice(
+        from: "func quantizePlaneBufferResults(",
+        to: "    func applySparseCoefficients("
+    )
+    let commit = try #require(quantizeBody.range(of: "commandBuffer.commit()")?.lowerBound)
+    let readbackBranch = try #require(quantizeBody.range(of: "if readsQScaleCodes")?.lowerBound)
+    let wait = try #require(quantizeBody.range(of: "commandBuffer.waitUntilCompleted()")?.lowerBound)
+    #expect(commit < readbackBranch)
+    #expect(readbackBranch < wait)
+}
+
+@Test func gpuFrameEncodeSkipsIntermediateDWTWaitBeforeResidentQuantization() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let codecSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Codec.swift"), encoding: .utf8)
+    let gpuEncodeBody = try codecSource.requiredSlice(
+        from: "public func encodeGPUFrame(",
+        to: "    public func decodeGPUFrameToNV12Textures("
+    )
+    #expect(gpuEncodeBody.contains("readsQScaleCodes: false"))
+    #expect(gpuEncodeBody.contains("waitsForDWTCompletion: false"))
+
+    let metalSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/MetalBackend.swift"), encoding: .utf8)
+    let padDWTBody = try metalSource.requiredSlice(
+        from: "func padTexturePlaneBuffersAndForwardWaveletBuffers(",
+        to: "    func cropPlane("
+    )
+    #expect(padDWTBody.contains("waitsForCompletion: Bool = true"))
+    #expect(padDWTBody.contains("if waitsForCompletion"))
+    #expect(padDWTBody.contains("commandBuffer.commit()"))
+}
+
+@Test func residentQuantizationUsesCachedDescriptorBuffers() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let codecSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Codec.swift"), encoding: .utf8)
+    let residentQuantizeBody = try codecSource.requiredSlice(
+        from: "private func quantizeResidentBuffers(",
+        to: "    private func quantizeWithMetal("
+    )
+    #expect(residentQuantizeBody.contains("quantizePlaneBufferResultsResidentDescriptors"))
+    #expect(residentQuantizeBody.contains("descriptorBuffer: descriptorInputs[index].descriptorBuffer"))
+
+    let descriptorCacheBody = try codecSource.requiredSlice(
+        from: "private func makeQuantizationDescriptors(",
+        to: "    private func quantizationDescriptorCacheKey("
+    )
+    #expect(descriptorCacheBody.contains("makeStaticSharedBuffer"))
+    #expect(descriptorCacheBody.contains("cached.descriptorBuffer"))
+}
+
+@Test func sparsePacketEncodeDescriptorDoesNotCarryFrameSequence() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let metalBackendSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/MetalBackend.swift"), encoding: .utf8)
+    let swiftDescriptor = try metalBackendSource.requiredSlice(
+        from: "struct MetalSparsePacketEncodeDescriptor {",
+        to: "private struct PadPlaneConstants {"
+    )
+    #expect(!swiftDescriptor.contains("sequence"))
+
+    let kernelSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Metal/PyrowaveKernels.metal"), encoding: .utf8)
+    let metalDescriptor = try kernelSource.requiredSlice(
+        from: "struct SparsePacketEncodeDescriptor {",
+        to: "struct SparsePacketEncodeConstants {"
+    )
+    let metalConstants = try kernelSource.requiredSlice(
+        from: "struct SparsePacketEncodeConstants {",
+        to: "struct RateControlBucketConstants {"
+    )
+    #expect(!metalDescriptor.contains("sequence"))
+    #expect(metalConstants.contains("uint sequence"))
+    #expect(kernelSource.contains("constants.sequence & 7u"))
+}
+
+@Test func gpuFrameEncodeUsesCachedSparsePacketDescriptorBuffers() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let codecSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Codec.swift"), encoding: .utf8)
+    let gpuFramePlaneBody = try codecSource.requiredSlice(
+        from: "private func makeGPUFramePlanes(",
+        to: "    private func cachedSparsePacketEncodeDescriptors("
+    )
+    #expect(gpuFramePlaneBody.contains("usesCachedPacketDescriptors"))
+    #expect(gpuFramePlaneBody.contains("cachedSparsePacketEncodeDescriptors("))
+    #expect(gpuFramePlaneBody.contains("packetDescriptorCountsByPlane"))
+    #expect(gpuFramePlaneBody.contains("descriptorCount: packetDescriptorCountsByPlane[index]"))
+    #expect(gpuFramePlaneBody.contains("descriptors: packetDescriptorBuffersByPlane[index] == nil ? packetDescriptorsByPlane[index] : nil"))
+    #expect(gpuFramePlaneBody.contains("descriptorBuffer: packetDescriptorBuffersByPlane[index]"))
+    #expect(gpuFramePlaneBody.contains("outputStorageMode: .private"))
+
+    let exportBody = try codecSource.requiredSlice(
+        from: "public func exportGPUFrame(",
+        to: "    public func importGPUFrame("
+    )
+    #expect(exportBody.contains("sharedReadbackBuffer("))
+
+    let cacheEntry = try codecSource.requiredSlice(
+        from: "private struct SparsePacketEncodeDescriptorCacheEntry {",
+        to: "    private struct DecodedPlaneTemplateCacheKey"
+    )
+    #expect(cacheEntry.contains("packetDescriptorCount: Int"))
+    #expect(!cacheEntry.contains("packetDescriptors: [MetalSparsePacketEncodeDescriptor]"))
+
+    let cacheBody = try codecSource.requiredSlice(
+        from: "private func cachedSparsePacketEncodeDescriptors(",
+        to: "    private func sparsePacketEncodeDescriptorCacheKey("
+    )
+    #expect(cacheBody.contains("makeStaticSharedBuffer(bytes: packetDescriptors)"))
+    #expect(cacheBody.contains("packetDescriptorCount: packetDescriptors.count"))
+    #expect(cacheBody.contains("sparsePacketEncodeDescriptorCache[key]"))
+
+    let metalSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/MetalBackend.swift"), encoding: .utf8)
+    let residentPacketBody = try metalSource.requiredSlice(
+        from: "func encodeSparsePacketBuffersBatchResidentQScales(",
+        to: "    private func emptySparsePacketOutputBuffer()"
+    )
+    #expect(residentPacketBody.contains("descriptorBuffer: MTLBuffer?"))
+    #expect(residentPacketBody.contains("cachedDescriptorBuffer"))
+    #expect(residentPacketBody.contains("outputStorageMode: MTLStorageMode"))
+    #expect(residentPacketBody.contains("reusesOutputBuffers: Bool = false"))
+    #expect(residentPacketBody.contains("purpose: .sparsePacketOutput"))
+    #expect(residentPacketBody.contains(".storageModePrivate"))
+
+    let readbackBody = try metalSource.requiredSlice(
+        from: "func sharedReadbackBuffer(",
+        to: "    private func emptySparsePacketOutputBuffer()"
+    )
+    #expect(readbackBody.contains("makeBlitCommandEncoder()"))
+    #expect(readbackBody.contains("blitEncoder.copy"))
+}
+
+@Test func retainedGPUFramesDoNotShareSparsePacketPayloadOrSizeBuffers() throws {
+    do {
+        let backend = try MetalPyrowaveBackend()
+        let codec = try PyrowaveCodec()
+        let first = try TestFrames.synthetic420(width: 64, height: 64, frameIndex: 0)
+        let second = try TestFrames.synthetic420(width: 64, height: 64, frameIndex: 1)
+        let firstTextures = try first.makeMetalTextures(device: backend.device)
+        let secondTextures = try second.makeMetalTextures(device: backend.device)
+        let firstCbCrTexture = try makeNV12ChromaTexture(cb: first.cb, cr: first.cr, device: backend.device)
+        let secondCbCrTexture = try makeNV12ChromaTexture(cb: second.cb, cr: second.cr, device: backend.device)
+        let firstFrame = try codec.encodeGPUFrame(
+            yTexture: firstTextures.y,
+            cbCrTexture: firstCbCrTexture,
+            videoSignal: first.videoSignal
+        )
+        let secondFrame = try codec.encodeGPUFrame(
+            yTexture: secondTextures.y,
+            cbCrTexture: secondCbCrTexture,
+            videoSignal: second.videoSignal
+        )
+        let planeCount = min(firstFrame.planes.count, secondFrame.planes.count)
+        #expect(planeCount > 0)
+        for index in 0..<planeCount {
+            #expect(firstFrame.planes[index].encoded.outputBuffer !== secondFrame.planes[index].encoded.outputBuffer)
+            #expect(firstFrame.planes[index].encoded.sizeBuffer !== secondFrame.planes[index].encoded.sizeBuffer)
+        }
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+}
+
+@Test func gpuFrameDecodeUsesResidentSparsePacketDecodeDescriptorBuffers() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let codecSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Codec.swift"), encoding: .utf8)
+    let gpuFramePlane = try codecSource.requiredSlice(
+        from: "struct PyrowaveGPUFramePlane {",
+        to: "public final class PyrowaveCodec"
+    )
+    #expect(gpuFramePlane.contains("decodeDescriptorCount: Int"))
+    #expect(gpuFramePlane.contains("decodeDescriptorBuffer: MTLBuffer"))
+    #expect(!gpuFramePlane.contains("decodeDescriptors: [MetalSparsePacketDecodeDescriptor]"))
+
+    let gpuDecodeBody = try codecSource.requiredSlice(
+        from: "public func decodeGPUFrameToNV12Textures(",
+        to: "    public func exportGPUFrame("
+    )
+    #expect(gpuDecodeBody.contains("descriptorCount: $0.decodeDescriptorCount"))
+    #expect(gpuDecodeBody.contains("descriptorBuffer: $0.decodeDescriptorBuffer"))
+    #expect(!gpuDecodeBody.contains("decodeDescriptors"))
+
+    let gpuFramePlaneBody = try codecSource.requiredSlice(
+        from: "private func makeGPUFramePlanes(",
+        to: "    private func cachedSparsePacketEncodeDescriptors("
+    )
+    #expect(gpuFramePlaneBody.contains("decodeDescriptorCountsByPlane"))
+    #expect(gpuFramePlaneBody.contains("makeStaticSharedBuffer(bytes: decodeDescriptors)"))
+    #expect(gpuFramePlaneBody.contains("cached.decodeDescriptorBuffer"))
+    #expect(!gpuFramePlaneBody.contains("decodeDescriptorsByPlane"))
+
+    let metalSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/MetalBackend.swift"), encoding: .utf8)
+    let gpuDecodeBackend = try metalSource.requiredSlice(
+        from: "func decodeSparsePacketBuffersInverseAndCropToNV12Textures(",
+        to: "    func quantize("
+    )
+    #expect(gpuDecodeBackend.contains("descriptorCount: Int"))
+    #expect(gpuDecodeBackend.contains("descriptorBuffer: MTLBuffer"))
+    #expect(gpuDecodeBackend.contains("outputStorageMode: .private"))
+    #expect(!gpuDecodeBackend.contains("descriptors: [MetalSparsePacketDecodeDescriptor]"))
+
+    let sparseOutputKey = try metalSource.requiredSlice(
+        from: "private struct SparseCoefficientOutputKey",
+        to: "private enum ReusableBufferPurpose"
+    )
+    #expect(sparseOutputKey.contains("storageModeRawValue"))
+
+    let sparseOutputBody = try metalSource.requiredSlice(
+        from: "private func sparseCoefficientOutput(",
+        to: "    private func reusableSharedBuffer<T>"
+    )
+    #expect(sparseOutputBody.contains("storageMode: MTLStorageMode"))
+    #expect(sparseOutputBody.contains(".storageModePrivate"))
+}
+
+@Test func gpuFrameKeepsSelectedQuantLevelsResidentForInspection() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let codecSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Codec.swift"), encoding: .utf8)
+    let gpuFramePlane = try codecSource.requiredSlice(
+        from: "struct PyrowaveGPUFramePlane {",
+        to: "public final class PyrowaveCodec"
+    )
+    #expect(gpuFramePlane.contains("selectedQuantLevelCount: Int"))
+    #expect(gpuFramePlane.contains("selectedQuantLevelBuffer: MTLBuffer"))
+    #expect(!gpuFramePlane.contains("selectedQuantLevels: [Int]"))
+
+    let inspectionAccessor = try codecSource.requiredSlice(
+        from: "public var selectedQuantLevelsByPlane: [[Int]] {",
+        to: "    public func encodedByteCountForInspection()"
+    )
+    #expect(inspectionAccessor.contains("selectedQuantLevelBuffer.contents()"))
+    #expect(inspectionAccessor.contains("bindMemory(to: UInt32.self"))
+
+    let gpuFramePlaneBody = try codecSource.requiredSlice(
+        from: "private func makeGPUFramePlanes(",
+        to: "    private func cachedSparsePacketEncodeDescriptors("
+    )
+    #expect(gpuFramePlaneBody.contains("selectedQuantLevelBuffersByPlane"))
+    #expect(gpuFramePlaneBody.contains("makeStaticSharedBuffer(bytes: selectedQuantLevels)"))
+    #expect(gpuFramePlaneBody.contains("cached.selectedQuantLevelBuffer"))
+
+    let cacheEntry = try codecSource.requiredSlice(
+        from: "private struct SparsePacketEncodeDescriptorCacheEntry {",
+        to: "    private struct DecodedPlaneTemplateCacheKey"
+    )
+    #expect(cacheEntry.contains("selectedQuantLevelCount: Int"))
+    #expect(cacheEntry.contains("selectedQuantLevelBuffer: MTLBuffer"))
+    #expect(!cacheEntry.contains("selectedQuantLevels: [Int]"))
+}
+
+@Test func gpuFrameKeepsBlockIndicesResidentForExportInspection() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let codecSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Codec.swift"), encoding: .utf8)
+    let gpuFramePlane = try codecSource.requiredSlice(
+        from: "struct PyrowaveGPUFramePlane {",
+        to: "public final class PyrowaveCodec"
+    )
+    #expect(gpuFramePlane.contains("blockIndexCount: Int"))
+    #expect(gpuFramePlane.contains("blockIndexBuffer: MTLBuffer"))
+    #expect(gpuFramePlane.contains("blockIndicesForInspection()"))
+    #expect(!gpuFramePlane.contains("blockIndices: [Int]"))
+
+    let exportBody = try codecSource.requiredSlice(
+        from: "public func exportGPUFrame(",
+        to: "    public func importGPUFrame("
+    )
+    #expect(exportBody.contains("blockIndicesForInspection()"))
+    #expect(exportBody.contains("plane.encoded.descriptorCount == plane.blockIndexCount"))
+
+    let gpuFramePlaneBody = try codecSource.requiredSlice(
+        from: "private func makeGPUFramePlanes(",
+        to: "    private func cachedSparsePacketEncodeDescriptors("
+    )
+    #expect(gpuFramePlaneBody.contains("blockIndexBuffersByPlane"))
+    #expect(gpuFramePlaneBody.contains("makeStaticSharedBuffer(bytes: blockIndices)"))
+    #expect(gpuFramePlaneBody.contains("cached.blockIndexBuffer"))
+
+    let cacheEntry = try codecSource.requiredSlice(
+        from: "private struct SparsePacketEncodeDescriptorCacheEntry {",
+        to: "    private struct DecodedPlaneTemplateCacheKey"
+    )
+    #expect(cacheEntry.contains("blockIndexCount: Int"))
+    #expect(cacheEntry.contains("blockIndexBuffer: MTLBuffer"))
+    #expect(!cacheEntry.contains("blockIndices: [Int]"))
+}
+
+@Test func residentQuantizedCoefficientBuffersAreReusableBuffers() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let source = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/MetalBackend.swift"), encoding: .utf8)
+    let backendBody = try source.requiredSlice(
+        from: "func quantizePlaneBufferResults(",
+        to: "    func applySparseCoefficients("
+    )
+    #expect(backendBody.contains("reusesOutputBuffers: Bool = false"))
+    #expect(backendBody.contains("if reusesOutputBuffers"))
+    #expect(backendBody.contains("purpose: .quantizedCoefficient"))
+
+    let codecSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Codec.swift"), encoding: .utf8)
+    let residentBody = try codecSource.requiredSlice(
+        from: "private func quantizeResidentBuffers(",
+        to: "    private func quantizeWithMetal("
+    )
+    #expect(residentBody.contains("reusesOutputBuffers: true"))
+}
+
 @Test func yuvFrameImportsCoreVideoNV12PixelBuffer() throws {
     var pixelBuffer: CVPixelBuffer?
     let attributes = [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary
@@ -144,6 +689,19 @@ import Metal
     let source = try TestFrames.synthetic420(width: 64, height: 64)
     let sourcePixelBuffer = try source.makeCVPixelBuffer()
     let codec = try PyrowaveCodec()
+
+    let gpuFrame = try codec.encodeGPUFrame(
+        sourcePixelBuffer,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0)
+    )
+    let gpuDecodedPixelBuffer = try codec.decodeGPUFrameToCVPixelBuffer(gpuFrame)
+    try codec.decodeGPUFrame(gpuFrame, to: gpuDecodedPixelBuffer)
+    let gpuDecoded = try YUVFrame(cvPixelBuffer: gpuDecodedPixelBuffer)
+    #expect(CVPixelBufferGetPixelFormatType(gpuDecodedPixelBuffer) == YUVFrame.cvPixelFormat(for: source.videoSignal))
+    #expect(gpuDecoded.width == source.width)
+    #expect(gpuDecoded.height == source.height)
+    #expect(gpuDecoded.chroma == .yuv420)
+    #expect(try Metrics.compare(source, gpuDecoded).weightedPSNR > 44.0)
 
     let encoded = try codec.encode(
         sourcePixelBuffer,
@@ -462,40 +1020,18 @@ import Metal
     }
 }
 
-@Test func hevcEquivalentBudgetUsesMirageStyleSixtyHertzQualityReference() throws {
-    #expect(try HEVCComparison.qualityReferenceFrameRate(numerator: 60, denominator: 1).numerator == 60)
-    #expect(try HEVCComparison.qualityReferenceFrameRate(numerator: 60, denominator: 1).denominator == 1)
-    #expect(try HEVCComparison.qualityReferenceFrameRate(numerator: 120, denominator: 1).numerator == 60)
-    #expect(try HEVCComparison.qualityReferenceFrameRate(numerator: 120, denominator: 1).denominator == 1)
-    #expect(try HEVCComparison.qualityReferenceFrameRate(numerator: 30000, denominator: 1001).numerator == 30000)
-    #expect(try HEVCComparison.qualityReferenceFrameRate(numerator: 30000, denominator: 1001).denominator == 1001)
-
-    let sixty = try HEVCComparison.matchedFrameByteBudget(
-        bitrate: 8_000,
-        frameRateNumerator: 60,
-        frameRateDenominator: 1
+@Test func hevcComparisonUsesEightyPercentQualityCap() throws {
+    #expect(HEVCComparison.defaultQuality == 0.8)
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let source = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/HEVCComparison.swift"), encoding: .utf8)
+    let writerBody = try source.requiredSlice(
+        from: "private static func writeHEVCMovie(",
+        to: "        let outputSettings:"
     )
-    let oneTwenty = try HEVCComparison.matchedFrameByteBudget(
-        bitrate: 8_000,
-        frameRateNumerator: 120,
-        frameRateDenominator: 1
-    )
-    let thirty = try HEVCComparison.matchedFrameByteBudget(
-        bitrate: 8_000,
-        frameRateNumerator: 30,
-        frameRateDenominator: 1
-    )
-
-    #expect(oneTwenty == sixty)
-    #expect(thirty == sixty * 2)
-    #expect(sixty == 17)
-    #expect(throws: PyrowaveError.invalidDimensions) {
-        _ = try HEVCComparison.matchedFrameByteBudget(
-            bitrate: 0,
-            frameRateNumerator: 60,
-            frameRateDenominator: 1
-        )
-    }
+    #expect(writerBody.contains("AVVideoQualityKey: quality"))
 }
 
 @Test func hevcComparisonRejectsInvalidInputsBeforeEncoding() throws {
@@ -571,23 +1107,24 @@ import Metal
     #expect(arguments.width == 6144)
     #expect(arguments.height == 3456)
     #expect(arguments.bitrate == 80_000_000)
+    #expect(arguments.hevcQuality == 0.8)
     #expect(arguments.quantizationStep == 1.0 / 1024.0)
     #expect(arguments.outputDirectory.path.hasSuffix(".pyrowave-results"))
-    #expect(arguments.maximumPyrowaveBytes == nil)
-    #expect(arguments.matchHEVCFrameBudget)
     #expect(arguments.requiredPyrowaveEncodeSpeedup == nil)
     #expect(arguments.requiredPyrowaveDecodeSpeedup == nil)
+    #expect(!arguments.pyrowaveOnly)
     #expect(!arguments.shouldShowHelp)
 }
 
-@Test func benchmarkArgumentsParsePresetsAndBudgetModes() throws {
+@Test func benchmarkArgumentsParsePresetsAndQualityModes() throws {
     let custom = try PyrowaveBenchmarkArguments([
         "--preset", "4k",
         "--frames", "12",
         "--output-dir", ".pyrowave-results/custom",
         "--bitrate", "40000000",
+        "--hevc-quality", "0.75",
         "--quantization-step", "0.002",
-        "--max-pyrowave-bytes", "123456",
+        "--pyrowave-only",
         "--require-pyrowave-encode-speedup", "1.25",
         "--require-pyrowave-decode-speedup", "1.5"
     ])
@@ -596,21 +1133,18 @@ import Metal
     #expect(custom.frames == 12)
     #expect(custom.outputDirectory.path.hasSuffix(".pyrowave-results/custom"))
     #expect(custom.bitrate == 40_000_000)
+    #expect(custom.hevcQuality == 0.75)
     #expect(abs(custom.quantizationStep - 0.002) < 0.000001)
-    #expect(custom.maximumPyrowaveBytes == 123_456)
-    #expect(!custom.matchHEVCFrameBudget)
     #expect(custom.requiredPyrowaveEncodeSpeedup == 1.25)
     #expect(custom.requiredPyrowaveDecodeSpeedup == 1.5)
+    #expect(custom.pyrowaveOnly)
 
     let size = try PyrowaveBenchmarkArguments([
         "--size", "1920x1080",
-        "--unbounded-pyrowave",
         "--require-pyrowave-faster-than-hevc"
     ])
     #expect(size.width == 1920)
     #expect(size.height == 1080)
-    #expect(size.maximumPyrowaveBytes == nil)
-    #expect(!size.matchHEVCFrameBudget)
     #expect(size.requiredPyrowaveEncodeSpeedup == 1)
     #expect(size.requiredPyrowaveDecodeSpeedup == 1)
 }
@@ -621,6 +1155,12 @@ import Metal
     }
     #expect(throws: PyrowaveError.invalidDimensions) {
         _ = try PyrowaveBenchmarkArguments(["--size", "bad"])
+    }
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try PyrowaveBenchmarkArguments(["--hevc-quality", "0.81"])
+    }
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try PyrowaveBenchmarkArguments(["--hevc-quality", "-0.1"])
     }
     #expect(throws: PyrowaveError.unsupportedFormat("unknown preset 8k")) {
         _ = try PyrowaveBenchmarkArguments(["--preset", "8k"])
@@ -635,6 +1175,13 @@ import Metal
     let help = try PyrowaveBenchmarkArguments(["--help"])
     #expect(help.shouldShowHelp)
     #expect(PyrowaveBenchmarkArguments.usage.contains("--preset 6k|4k|1080p|720p"))
+    #expect(PyrowaveBenchmarkArguments.usage.contains("--pyrowave-only"))
+    #expect(PyrowaveBenchmarkArguments.usage.contains("--hevc-quality Q<=0.8"))
+    #expect(!PyrowaveBenchmarkArguments.usage.contains("--max-pyrowave-bytes"))
+    #expect(!PyrowaveBenchmarkArguments.usage.contains("--match-hevc-frame-budget"))
+    #expect(!PyrowaveBenchmarkArguments.usage.contains("--unbounded-pyrowave"))
+    #expect(!PyrowaveBenchmarkArguments.usage.contains("pyrowave-frame-budget"))
+    #expect(PyrowaveBenchmarkArguments.usage.contains("--pyrowave-only"))
     #expect(PyrowaveBenchmarkArguments.usage.contains("--require-pyrowave-faster-than-hevc"))
 }
 
@@ -691,7 +1238,7 @@ import Metal
         frameRateNumerator: 60,
         frameRateDenominator: 1,
         bitrate: PyrowaveBenchmarkArguments.defaultBitrate,
-        pyrowaveFrameBudgetBytes: 166_667,
+        hevcQuality: PyrowaveBenchmarkArguments.defaultHEVCQuality,
         pyrowave: pyrowave,
         hevc: hevc,
         comparison: CodecBenchmarkComparison(pyrowave: pyrowave, hevc: hevc)
@@ -703,10 +1250,19 @@ import Metal
     #expect(report.artifacts.hevcMovie == PyrowaveBenchmarkArtifactNames.hevcMovie)
     #expect(report.artifacts.hevcDecodedY4M == PyrowaveBenchmarkArtifactNames.hevcDecodedY4M)
     #expect(PyrowaveBenchmarkArtifactNames.report == "benchmark-report.json")
+    #expect(report.hevcQuality == 0.8)
     #expect(PyrowaveBenchmarkRunner.timedBenchmarkScopeNote.contains("artifact writes"))
+    #expect(HEVCComparison.avKitTimingNote.contains("AVVideoQualityKey 0.8"))
     #expect(HEVCComparison.avKitTimingNote.contains("planar conversion"))
+    #expect(report.comparison.pyrowaveBytesPerFrame == 4)
+    #expect(report.comparison.hevcBytesPerFrame == 80.0 / 60.0)
+    #expect(report.comparison.pyrowaveToHEVCBytesPerFrameRatio == 3)
 
     let encoded = try JSONEncoder().encode(report)
+    let json = try #require(String(data: encoded, encoding: .utf8))
+    #expect(json.contains("\"pyrowaveBytesPerFrame\""))
+    #expect(json.contains("\"hevcBytesPerFrame\""))
+    #expect(json.contains("\"pyrowaveToHEVCBytesPerFrameRatio\""))
     let decoded = try JSONDecoder().decode(PyrowaveBenchmarkReport.self, from: encoded)
     #expect(decoded == report)
 }
@@ -738,7 +1294,7 @@ import Metal
         frameRateNumerator: 60,
         frameRateDenominator: 1,
         bitrate: 20_000_000,
-        pyrowaveFrameBudgetBytes: 41_667,
+        hevcQuality: PyrowaveBenchmarkArguments.defaultHEVCQuality,
         pyrowave: pyrowave,
         hevc: hevc,
         comparison: CodecBenchmarkComparison(pyrowave: pyrowave, hevc: hevc)
@@ -764,7 +1320,7 @@ import Metal
         frameRateNumerator: 60,
         frameRateDenominator: 1,
         bitrate: 20_000_000,
-        pyrowaveFrameBudgetBytes: nil,
+        hevcQuality: PyrowaveBenchmarkArguments.defaultHEVCQuality,
         pyrowave: CodecBenchmarkResult(codec: "pyrowave", frameCount: 0, encodedBytes: 0, encodeSeconds: 0, decodeSeconds: 0, metrics: nil, note: nil),
         hevc: CodecBenchmarkResult(codec: "hevc", frameCount: 0, encodedBytes: 0, encodeSeconds: 0, decodeSeconds: 0, metrics: nil, note: nil),
         comparison: CodecBenchmarkComparison(
@@ -801,7 +1357,9 @@ import Metal
     #expect(result.frameCount == frames.count)
     #expect(result.encodedBytes > 0)
     #expect(result.metrics?.weightedPSNR ?? 0 > 40)
-    #expect(result.note == PyrowaveBenchmarkRunner.pyrowaveImplementationNote)
+    #expect(result.note?.contains(PyrowaveBenchmarkRunner.pyrowaveImplementationNote) == true)
+    #expect(result.note?.contains("PyrowaveGPUFrame") == true)
+    #expect(result.note?.contains("compatibility stream export") == true)
 
     let streamURL = directory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.pyrowaveStream)
     var streamReader = try PyrowaveStreamReader(url: streamURL)
@@ -820,6 +1378,35 @@ import Metal
     #expect(try decodedReader.readFrame() != nil)
     #expect(try decodedReader.readFrame() != nil)
     #expect(try decodedReader.readFrame() == nil)
+}
+
+@Test func pyrowaveBenchmarkRunnerCanSkipArtifactsAndMetricsForProfiling() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let frames = [
+        try TestFrames.synthetic420(width: 96, height: 64, frameIndex: 0),
+        try TestFrames.synthetic420(width: 96, height: 64, frameIndex: 1)
+    ]
+    let loaded = try PyrowaveBenchmarkFrames(
+        frames: frames,
+        frameRateNumerator: 60,
+        frameRateDenominator: 1,
+        bitDepth: 8
+    )
+
+    let result = try PyrowaveBenchmarkRunner.runPyrowave(
+        loaded: loaded,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0),
+        outputDirectory: directory,
+        writesArtifactsAndMetrics: false
+    )
+
+    #expect(result.codec == PyrowaveBenchmarkRunner.pyrowaveCodecName)
+    #expect(result.frameCount == frames.count)
+    #expect(result.encodedBytes > 0)
+    #expect(result.metrics == nil)
+    #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.pyrowaveStream).path))
+    #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.pyrowaveDecodedY4M).path))
 }
 
 @Test func codecBenchmarkComparisonReportsHEVCDeltas() throws {
@@ -854,6 +1441,9 @@ import Metal
 
     let comparison = CodecBenchmarkComparison(pyrowave: pyrowave, hevc: hevc)
     #expect(comparison.pyrowaveToHEVCByteRatio == 3)
+    #expect(comparison.pyrowaveBytesPerFrame == 4)
+    #expect(abs(comparison.hevcBytesPerFrame - 1.3333333333) < 0.0001)
+    #expect(comparison.pyrowaveToHEVCBytesPerFrameRatio == 3)
     #expect(comparison.pyrowaveEncodeSpeedupOverHEVC == 8)
     #expect(comparison.pyrowaveDecodeSpeedupOverHEVC == 5)
     #expect(comparison.weightedPSNRDelta == 4)
@@ -864,6 +1454,9 @@ import Metal
         hevc: CodecBenchmarkResult(codec: "hevc", frameCount: 0, encodedBytes: 0, encodeSeconds: 0, decodeSeconds: 0, metrics: nil, note: nil)
     )
     #expect(unavailable.pyrowaveToHEVCByteRatio == nil)
+    #expect(unavailable.pyrowaveBytesPerFrame == 0)
+    #expect(unavailable.hevcBytesPerFrame == 0)
+    #expect(unavailable.pyrowaveToHEVCBytesPerFrameRatio == nil)
     #expect(unavailable.pyrowaveEncodeSpeedupOverHEVC == nil)
     #expect(unavailable.pyrowaveDecodeSpeedupOverHEVC == nil)
     #expect(unavailable.weightedPSNRDelta == nil)
@@ -881,14 +1474,20 @@ import Metal
         _ = try backend.makeFunction(named: "pyrowave_dequantize")
         _ = try backend.makeFunction(named: "pyrowave_quantize_plane_tiles")
         _ = try backend.makeFunction(named: "pyrowave_apply_sparse_coefficients")
+        _ = try backend.makeFunction(named: "pyrowave_decode_sparse_packets")
+        _ = try backend.makeFunction(named: "pyrowave_decode_sparse_packets_threadgroup")
+        _ = try backend.makeFunction(named: "pyrowave_dwt_tiled_level0")
+        _ = try backend.makeFunction(named: "pyrowave_idwt_tiled_level0")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_tile_stats")
         _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs")
         _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs_smallblocks")
         _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs_finalize")
+        _ = try backend.makeFunction(named: "pyrowave_encode_sparse_packets_serial")
         _ = try backend.makeFunction(named: "pyrowave_encode_sparse_packets")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_indices")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_savings")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_savings_prefix")
+        _ = try backend.makeFunction(named: "pyrowave_rate_control_select_quant_levels")
     } catch PyrowaveError.externalToolUnavailable {
         return
     }
@@ -919,6 +1518,99 @@ import Metal
     } catch PyrowaveError.externalToolUnavailable {
         return
     }
+}
+
+private func makeNV12ChromaTexture(
+    cb: Plane8,
+    cr: Plane8,
+    device: MTLDevice,
+    usage: MTLTextureUsage = [.shaderRead, .shaderWrite]
+) throws -> MTLTexture {
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rg8Unorm,
+        width: cb.width,
+        height: cb.height,
+        mipmapped: false
+    )
+    descriptor.usage = usage
+    descriptor.storageMode = .shared
+    let texture = try #require(device.makeTexture(descriptor: descriptor))
+    var cbCr = Array(repeating: UInt8(0), count: cb.data.count * 2)
+    for index in cb.data.indices {
+        cbCr[index * 2] = cb.data[index]
+        cbCr[index * 2 + 1] = cr.data[index]
+    }
+    cbCr.withUnsafeBytes { bytes in
+        texture.replace(
+            region: MTLRegionMake2D(0, 0, cb.width, cb.height),
+            mipmapLevel: 0,
+            withBytes: bytes.baseAddress!,
+            bytesPerRow: cb.width * 2
+        )
+    }
+    return texture
+}
+
+private func makeTexture(
+    device: MTLDevice,
+    pixelFormat: MTLPixelFormat,
+    width: Int,
+    height: Int,
+    usage: MTLTextureUsage = [.shaderRead, .shaderWrite]
+) throws -> MTLTexture {
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: pixelFormat,
+        width: width,
+        height: height,
+        mipmapped: false
+    )
+    descriptor.usage = usage
+    descriptor.storageMode = .shared
+    return try #require(device.makeTexture(descriptor: descriptor))
+}
+
+private func makeYUVFrame(
+    yTexture: MTLTexture,
+    cbCrTexture: MTLTexture,
+    videoSignal: VideoSignalMetadata
+) throws -> YUVFrame {
+    let yByteCount = yTexture.width * yTexture.height
+    var y = Array(repeating: UInt8(0), count: yByteCount)
+    y.withUnsafeMutableBytes { bytes in
+        yTexture.getBytes(
+            bytes.baseAddress!,
+            bytesPerRow: yTexture.width,
+            from: MTLRegionMake2D(0, 0, yTexture.width, yTexture.height),
+            mipmapLevel: 0
+        )
+    }
+
+    let chromaSampleCount = cbCrTexture.width * cbCrTexture.height
+    var cbCr = Array(repeating: UInt8(0), count: chromaSampleCount * 2)
+    cbCr.withUnsafeMutableBytes { bytes in
+        cbCrTexture.getBytes(
+            bytes.baseAddress!,
+            bytesPerRow: cbCrTexture.width * 2,
+            from: MTLRegionMake2D(0, 0, cbCrTexture.width, cbCrTexture.height),
+            mipmapLevel: 0
+        )
+    }
+    var cb = Array(repeating: UInt8(0), count: chromaSampleCount)
+    var cr = Array(repeating: UInt8(0), count: chromaSampleCount)
+    for index in 0..<chromaSampleCount {
+        cb[index] = cbCr[index * 2]
+        cr[index] = cbCr[index * 2 + 1]
+    }
+
+    return try YUVFrame(
+        width: yTexture.width,
+        height: yTexture.height,
+        chroma: .yuv420,
+        y: Plane8(width: yTexture.width, height: yTexture.height, data: y),
+        cb: Plane8(width: cbCrTexture.width, height: cbCrTexture.height, data: cb),
+        cr: Plane8(width: cbCrTexture.width, height: cbCrTexture.height, data: cr),
+        videoSignal: videoSignal
+    )
 }
 
 @Test func codecEncodesAndDecodesMetalTexturesWhenDeviceExists() throws {
@@ -964,33 +1656,126 @@ import Metal
     }
 }
 
+@Test func codecEncodesAndDecodesGPUFrameWithoutEncodedDataWhenDeviceExists() throws {
+    do {
+        let backend = try MetalPyrowaveBackend()
+        let source = try TestFrames.synthetic420(width: 64, height: 64)
+        let sourceTextures = try source.makeMetalTextures(device: backend.device)
+        let sourceCbCrTexture = try makeNV12ChromaTexture(
+            cb: source.cb,
+            cr: source.cr,
+            device: backend.device
+        )
+        let decodedYTexture = try makeTexture(
+            device: backend.device,
+            pixelFormat: .r8Unorm,
+            width: source.width,
+            height: source.height
+        )
+        let decodedCbCrTexture = try makeTexture(
+            device: backend.device,
+            pixelFormat: .rg8Unorm,
+            width: source.cb.width,
+            height: source.cb.height
+        )
+
+        let codec = try PyrowaveCodec()
+        let gpuFrame = try codec.encodeGPUFrame(
+            yTexture: sourceTextures.y,
+            cbCrTexture: sourceCbCrTexture,
+            configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0),
+            videoSignal: source.videoSignal
+        )
+        #expect(gpuFrame.width == source.width)
+        #expect(gpuFrame.height == source.height)
+        #expect(gpuFrame.chroma == .yuv420)
+        #expect(gpuFrame.estimatedPacketCapacityBytes > 0)
+        #expect(gpuFrame.encodedByteCountForInspection() > 0)
+        #expect(gpuFrame.selectedQuantLevelsByPlane.count == 3)
+        #expect(gpuFrame.selectedQuantLevelsByPlane.flatMap { $0 }.allSatisfy { $0 == 0 })
+        #expect(!gpuFrame.selectedQuantLevelsByPlane.flatMap { $0 }.isEmpty)
+
+        try codec.decodeGPUFrameToNV12Textures(
+            gpuFrame,
+            yTexture: decodedYTexture,
+            cbCrTexture: decodedCbCrTexture
+        )
+        let decoded = try makeYUVFrame(
+            yTexture: decodedYTexture,
+            cbCrTexture: decodedCbCrTexture,
+            videoSignal: source.videoSignal
+        )
+        #expect(try Metrics.compare(source, decoded).weightedPSNR > 44.0)
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+}
+
+@Test func codecExportsAndImportsGPUFrameOnlyAsSecondaryBoundaryAPI() throws {
+    do {
+        let backend = try MetalPyrowaveBackend()
+        let source = try TestFrames.synthetic420(width: 64, height: 64)
+        let sourceTextures = try source.makeMetalTextures(device: backend.device)
+        let sourceCbCrTexture = try makeNV12ChromaTexture(
+            cb: source.cb,
+            cr: source.cr,
+            device: backend.device
+        )
+        let decodedYTexture = try makeTexture(
+            device: backend.device,
+            pixelFormat: .r8Unorm,
+            width: source.width,
+            height: source.height
+        )
+        let decodedCbCrTexture = try makeTexture(
+            device: backend.device,
+            pixelFormat: .rg8Unorm,
+            width: source.cb.width,
+            height: source.cb.height
+        )
+
+        let codec = try PyrowaveCodec()
+        let gpuFrame = try codec.encodeGPUFrame(
+            yTexture: sourceTextures.y,
+            cbCrTexture: sourceCbCrTexture,
+            configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0),
+            videoSignal: source.videoSignal
+        )
+        let exported = try codec.exportGPUFrame(gpuFrame)
+        #expect(exported.data.count > gpuFrame.encodedByteCountForInspection())
+
+        let decodedExport = try codec.decode(exported)
+        #expect(try Metrics.compare(source, decodedExport).weightedPSNR > 44.0)
+
+        let imported = try codec.importGPUFrame(exported)
+        #expect(imported.selectedQuantLevelsByPlane.count == gpuFrame.selectedQuantLevelsByPlane.count)
+        #expect(!imported.selectedQuantLevelsByPlane.flatMap { $0 }.isEmpty)
+        #expect(imported.selectedQuantLevelsByPlane.flatMap { $0 }.allSatisfy { $0 == 0 })
+        let reexported = try codec.exportGPUFrame(imported)
+        #expect(reexported == exported)
+
+        try codec.decodeGPUFrameToNV12Textures(
+            imported,
+            yTexture: decodedYTexture,
+            cbCrTexture: decodedCbCrTexture
+        )
+        let decodedImport = try makeYUVFrame(
+            yTexture: decodedYTexture,
+            cbCrTexture: decodedCbCrTexture,
+            videoSignal: source.videoSignal
+        )
+        #expect(try Metrics.compare(source, decodedImport).weightedPSNR > 44.0)
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+}
+
 @Test func codecEncodesNV12MetalChromaTextureLikeSeparatePlanes() throws {
     do {
         let backend = try MetalPyrowaveBackend()
         let source = try TestFrames.synthetic420(width: 64, height: 64)
         let sourceTextures = try source.makeMetalTextures(device: backend.device)
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rg8Unorm,
-            width: source.cb.width,
-            height: source.cb.height,
-            mipmapped: false
-        )
-        descriptor.usage = [.shaderRead]
-        descriptor.storageMode = .shared
-        let cbCrTexture = try #require(backend.device.makeTexture(descriptor: descriptor))
-        var cbCr = Array(repeating: UInt8(0), count: source.cb.data.count * 2)
-        for index in source.cb.data.indices {
-            cbCr[index * 2] = source.cb.data[index]
-            cbCr[index * 2 + 1] = source.cr.data[index]
-        }
-        cbCr.withUnsafeBytes { bytes in
-            cbCrTexture.replace(
-                region: MTLRegionMake2D(0, 0, source.cb.width, source.cb.height),
-                mipmapLevel: 0,
-                withBytes: bytes.baseAddress!,
-                bytesPerRow: source.cb.width * 2
-            )
-        }
+        let cbCrTexture = try makeNV12ChromaTexture(cb: source.cb, cr: source.cr, device: backend.device, usage: [.shaderRead])
 
         let configuration = CodecConfiguration(quantizationStep: 1.0 / 2048.0)
         let separate = try PyrowaveCodec().encode(
@@ -1481,7 +2266,6 @@ import Metal
             stride: UInt32(stride),
             blockIndex: 37,
             quantLevel: 2,
-            sequence: 5,
             quantCode: UInt32(quantCode)
         ),
         MetalSparsePacketEncodeDescriptor(
@@ -1492,7 +2276,6 @@ import Metal
             stride: UInt32(stride),
             blockIndex: 38,
             quantLevel: 0,
-            sequence: 5,
             quantCode: UInt32(quantCode)
         )
     ]
@@ -1500,7 +2283,8 @@ import Metal
     let metal = try backend.encodeSparsePackets(
         coefficients: coefficients,
         descriptors: descriptors,
-        qScaleCodes: [qScaleCodes, qScaleCodes]
+        qScaleCodes: [qScaleCodes, qScaleCodes],
+        sequence: 5
     )
     let cpu = try PyrowaveCoefficientBlockCodec.encodeBlock(
         blockIndex: 37,
@@ -1633,6 +2417,33 @@ import Metal
     for index in 1..<metalSavings.count {
         #expect(metalSavings[index] >= metalSavings[index - 1])
     }
+    let requiredSavings = metalSavings.first { $0 > 0 } ?? 0
+    let metalQuantLevels = try backend.rateControlSelectedQuantLevels(
+        bucketIndices: metal,
+        packetByteCosts: packetByteCosts,
+        cumulativeSavings: metalSavings,
+        requiredSavings: requiredSavings
+    )
+    var remainingSavings = requiredSavings
+    var expectedQuantLevels = Array(repeating: 0, count: packetByteCosts.count)
+    for bucket in 0..<128 where remainingSavings > 0 {
+        for blockIndex in packetByteCosts.indices where remainingSavings > 0 {
+            for quantLevel in 1..<PyrowaveBlockStats.candidateCount where remainingSavings > 0 {
+                let currentLevel = expectedQuantLevels[blockIndex]
+                let transitionSaving = packetByteCosts[blockIndex][quantLevel - 1] - packetByteCosts[blockIndex][quantLevel]
+                if quantLevel > currentLevel,
+                   transitionSaving > 0,
+                   metal[blockIndex][quantLevel] == bucket {
+                    let actualSaving = packetByteCosts[blockIndex][currentLevel] - packetByteCosts[blockIndex][quantLevel]
+                    if actualSaving > 0 {
+                        expectedQuantLevels[blockIndex] = quantLevel
+                        remainingSavings = max(0, remainingSavings - actualSaving)
+                    }
+                }
+            }
+        }
+    }
+    #expect(metalQuantLevels == expectedQuantLevels)
 
     let fused = try backend.rateControlBucketDataBatch([
         (distortions: distortions, packetByteCosts: packetByteCosts),
@@ -1670,28 +2481,6 @@ import Metal
         let decodedMetal = try PyrowaveCodec().decode(metal)
         #expect(decodedMetal == decodedCPU)
     }
-}
-
-@Test func metalCappedRateControlMatchesCPUReferenceWhenDeviceExists() throws {
-    do {
-        _ = try MetalPyrowaveBackend()
-    } catch PyrowaveError.externalToolUnavailable {
-        return
-    }
-
-    let frame = try TestFrames.synthetic420(width: 160, height: 96)
-    let baseline = try PyrowaveCodec().encode(
-        frame,
-        configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0)
-    )
-    let configuration = CodecConfiguration(
-        quantizationStep: 1.0 / 2048.0,
-        maximumEncodedBytes: baseline.data.count - 200
-    )
-    let cpu = try PyrowaveCodec().encode(frame, configuration: configuration)
-    let metal = try PyrowaveCodec().encode(frame, configuration: configuration)
-    #expect(cpu.data.count <= configuration.maximumEncodedBytes!)
-    #expect(metal.data == cpu.data)
 }
 
 @Test func metalWaveletMatchesCPUReferenceWhenDeviceExists() throws {
@@ -1802,40 +2591,52 @@ import Metal
     }
 }
 
-@Test func sparseRateControlCapsEncodedFrameSize() throws {
-    let frame = try TestFrames.synthetic420(width: 256, height: 144)
-    let codec = try PyrowaveCodec()
-    let uncapped = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
-    let cap = max(512, uncapped.data.count / 2)
-    let capped = try codec.encode(
-        frame,
-        configuration: CodecConfiguration(
-            quantizationStep: 1.0 / 1024.0,
-            maximumEncodedBytes: cap
-        )
+@Test func tiledMetalInverseWaveletMatchesCPUReferenceWhenDeviceExists() throws {
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let width = 128
+    let height = 128
+    let levels = 3
+    let samples = (0..<(width * height)).map { index in
+        Float((index * 37 + (index / width) * 19) % 4099) / 4099.0 - 0.5
+    }
+    var coefficients = samples
+    Wavelet.forward2D(&coefficients, width: width, height: height, levels: levels)
+    var cpuReference = coefficients
+    Wavelet.inverse2D(&cpuReference, width: width, height: height, levels: levels)
+
+    let byteLength = coefficients.count * MemoryLayout<Float>.stride
+    let input = try #require(backend.device.makeBuffer(bytes: coefficients, length: byteLength, options: .storageModeShared))
+    let output = try backend.inverseWaveletBuffer(
+        input,
+        sampleCount: coefficients.count,
+        width: width,
+        height: height,
+        levels: levels,
+        useTiledLevelZero: true
     )
+    let readback = try #require(backend.device.makeBuffer(length: byteLength, options: .storageModeShared))
+    guard let commandBuffer = backend.commandQueue.makeCommandBuffer(),
+          let blit = commandBuffer.makeBlitCommandEncoder() else {
+        throw PyrowaveError.processFailed("failed to create Metal readback command buffer")
+    }
+    blit.copy(from: output, sourceOffset: 0, to: readback, destinationOffset: 0, size: byteLength)
+    blit.endEncoding()
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+    if let error = commandBuffer.error {
+        throw PyrowaveError.processFailed("Metal tiled iDWT readback failed: \(error.localizedDescription)")
+    }
 
-    #expect(capped.data.count <= cap)
-    #expect(capped.data.count < uncapped.data.count)
-
-    let decoded = try codec.decode(capped)
-    let metrics = try Metrics.compare(frame, decoded)
-    #expect(metrics.weightedPSNR > 20.0)
-}
-
-@Test func generousSparseRateControlCapKeepsDefaultSparseFrame() throws {
-    let frame = try TestFrames.synthetic420(width: 160, height: 96)
-    let configuration = CodecConfiguration(quantizationStep: 1.0 / 1024.0)
-    let uncapped = try PyrowaveCodec().encode(frame, configuration: configuration)
-    let generouslyCapped = try PyrowaveCodec().encode(
-        frame,
-        configuration: CodecConfiguration(
-            quantizationStep: configuration.quantizationStep,
-            maximumEncodedBytes: uncapped.data.count
-        )
-    )
-
-    #expect(generouslyCapped.data == uncapped.data)
+    let pointer = readback.contents().bindMemory(to: Float.self, capacity: coefficients.count)
+    let metal = Array(UnsafeBufferPointer(start: pointer, count: coefficients.count))
+    let maxError = zip(metal, cpuReference).map { abs($0 - $1) }.max() ?? 0
+    #expect(maxError < 0.0001)
 }
 
 @Test func codecUsesPyrowaveSequenceHeaderStreamOnly() throws {
@@ -2696,41 +3497,4 @@ import Metal
     #expect(highDistortion > lowDistortion)
     #expect(lowDistortion >= 0)
     #expect(highDistortion < 128)
-}
-
-@Test func pyrowaveRateControllerSelectsThresholdsToMeetCap() throws {
-    let stride = 32
-    var coefficients = Array(repeating: Int16(0), count: stride * stride)
-    coefficients[0] = 1
-    coefficients[1] = 2
-    coefficients[2] = 4
-    coefficients[3] = 8
-    coefficients[4] = 14
-
-    let block = try PyrowaveRateController.makeBlock(
-        blockIndex: 0,
-        coefficients: coefficients,
-        stride: stride,
-        originX: 0,
-        originY: 0,
-        validWidth: 32,
-        validHeight: 32,
-        quantCode: PyrowaveQuantization.identityQScaleCode,
-        qScaleCode: PyrowaveQuantization.identityQScaleCode
-    )
-
-    let targetBytes = block.packetByteCosts[14]
-    let thresholds = try #require(PyrowaveRateController.selectThresholds(
-        blocksByPlane: [[block]],
-        fixedHeaderBytes: 0,
-        maximumEncodedBytes: targetBytes
-    ))
-    let estimatedBytes = PyrowaveRateController.estimateFrameBytes(
-        blocksByPlane: [[block]],
-        thresholdsByPlane: thresholds,
-        fixedHeaderBytes: 0
-    )
-
-    #expect(estimatedBytes <= targetBytes)
-    #expect((thresholds.first?.first ?? 0) > 0)
 }

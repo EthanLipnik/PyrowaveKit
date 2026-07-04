@@ -165,56 +165,6 @@ enum PyrowaveRateController {
         return packetByteCosts
     }
 
-    static func selectThresholds(
-        blocksByPlane: [[PyrowaveRateControlBlock]],
-        fixedHeaderBytes: Int,
-        maximumEncodedBytes: Int,
-        bucketIndicesByPlane: [[[Int]]]? = nil,
-        cumulativeBucketSavings: [Int]? = nil
-    ) -> [[Int]]? {
-        var thresholds = blocksByPlane.map { Array(repeating: 0, count: $0.count) }
-        var currentBytes = estimateFrameBytes(
-            blocksByPlane: blocksByPlane,
-            thresholdsByPlane: thresholds,
-            fixedHeaderBytes: fixedHeaderBytes
-        )
-        var requiredSavings = currentBytes - maximumEncodedBytes
-        guard requiredSavings > 0 else {
-            return thresholds
-        }
-        if let cumulativeBucketSavings,
-           (cumulativeBucketSavings.last ?? 0) < requiredSavings {
-            return nil
-        }
-
-        let operations = makeRDOperations(
-            blocksByPlane: blocksByPlane,
-            bucketIndicesByPlane: bucketIndicesByPlane
-        )
-        guard !operations.isEmpty else {
-            return nil
-        }
-
-        for operation in operations where requiredSavings > 0 {
-            let currentLevel = thresholds[operation.planeIndex][operation.blockIndex]
-            guard operation.quantLevel > currentLevel else {
-                continue
-            }
-
-            let block = blocksByPlane[operation.planeIndex][operation.blockIndex]
-            let actualSaving = block.packetByteCost(quantLevel: currentLevel) - block.packetByteCost(quantLevel: operation.quantLevel)
-            guard actualSaving > 0 else {
-                continue
-            }
-
-            thresholds[operation.planeIndex][operation.blockIndex] = operation.quantLevel
-            currentBytes -= actualSaving
-            requiredSavings -= actualSaving
-        }
-
-        return currentBytes <= maximumEncodedBytes ? thresholds : nil
-    }
-
     static func cumulativeBucketSavings(
         blocksByPlane: [[PyrowaveRateControlBlock]],
         bucketIndicesByPlane: [[[Int]]]? = nil

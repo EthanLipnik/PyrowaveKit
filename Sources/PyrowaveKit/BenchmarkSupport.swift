@@ -66,7 +66,7 @@ public struct PyrowaveBenchmarkReport: Codable, Equatable, Sendable {
     public var frameRateNumerator: Int
     public var frameRateDenominator: Int
     public var bitrate: Int
-    public var pyrowaveFrameBudgetBytes: Int?
+    public var hevcQuality: Double
     public var artifacts: PyrowaveBenchmarkArtifacts
     public var pyrowave: CodecBenchmarkResult
     public var hevc: CodecBenchmarkResult
@@ -80,7 +80,7 @@ public struct PyrowaveBenchmarkReport: Codable, Equatable, Sendable {
         frameRateNumerator: Int,
         frameRateDenominator: Int,
         bitrate: Int,
-        pyrowaveFrameBudgetBytes: Int?,
+        hevcQuality: Double,
         artifacts: PyrowaveBenchmarkArtifacts = PyrowaveBenchmarkArtifacts(),
         pyrowave: CodecBenchmarkResult,
         hevc: CodecBenchmarkResult,
@@ -93,7 +93,7 @@ public struct PyrowaveBenchmarkReport: Codable, Equatable, Sendable {
         self.frameRateNumerator = frameRateNumerator
         self.frameRateDenominator = frameRateDenominator
         self.bitrate = bitrate
-        self.pyrowaveFrameBudgetBytes = pyrowaveFrameBudgetBytes
+        self.hevcQuality = hevcQuality
         self.artifacts = artifacts
         self.pyrowave = pyrowave
         self.hevc = hevc
@@ -108,7 +108,9 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
     public static let defaultFrames = 60
     public static let defaultBitrate = 80_000_000
     public static let defaultQuantizationStep: Float = 1.0 / 1024.0
-    public static let usage = "Usage: pyrowave-swift-bench [--input file.y4m] [--frames N] [--preset 6k|4k|1080p|720p] [--size WxH] [--output-dir DIR] [--bitrate BPS] [--quantization-step Q] [--max-pyrowave-bytes N|--unbounded-pyrowave] [--require-pyrowave-faster-than-hevc|--require-pyrowave-encode-speedup X|--require-pyrowave-decode-speedup X]"
+    public static let defaultHEVCQuality = 0.8
+    public static let maximumHEVCQuality = 0.8
+    public static let usage = "Usage: pyrowave-swift-bench [--input file.y4m] [--frames N] [--preset 6k|4k|1080p|720p] [--size WxH] [--output-dir DIR] [--bitrate BPS] [--hevc-quality Q<=0.8] [--quantization-step Q] [--pyrowave-only] [--require-pyrowave-faster-than-hevc|--require-pyrowave-encode-speedup X|--require-pyrowave-decode-speedup X]"
 
     public var input: URL?
     public var frames: Int
@@ -116,11 +118,11 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
     public var width: Int
     public var height: Int
     public var bitrate: Int
+    public var hevcQuality: Double
     public var quantizationStep: Float
-    public var maximumPyrowaveBytes: Int?
-    public var matchHEVCFrameBudget: Bool
     public var requiredPyrowaveEncodeSpeedup: Double?
     public var requiredPyrowaveDecodeSpeedup: Double?
+    public var pyrowaveOnly: Bool
     public var shouldShowHelp: Bool
 
     public init(_ arguments: [String] = Array(CommandLine.arguments.dropFirst())) throws {
@@ -130,11 +132,11 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
         width = Self.defaultWidth
         height = Self.defaultHeight
         bitrate = Self.defaultBitrate
+        hevcQuality = Self.defaultHEVCQuality
         quantizationStep = Self.defaultQuantizationStep
-        maximumPyrowaveBytes = nil
-        matchHEVCFrameBudget = true
         requiredPyrowaveEncodeSpeedup = nil
         requiredPyrowaveDecodeSpeedup = nil
+        pyrowaveOnly = false
         shouldShowHelp = false
 
         var iterator = arguments.makeIterator()
@@ -152,6 +154,9 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
             case "--bitrate":
                 guard let value = iterator.next(), let parsed = Int(value) else { throw PyrowaveError.invalidDimensions }
                 bitrate = parsed
+            case "--hevc-quality":
+                guard let value = iterator.next(), let parsed = Double(value) else { throw PyrowaveError.invalidDimensions }
+                hevcQuality = parsed
             case "--width":
                 guard let value = iterator.next(), let parsed = Int(value) else { throw PyrowaveError.invalidDimensions }
                 width = parsed
@@ -174,13 +179,8 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
             case "--quantization-step":
                 guard let value = iterator.next(), let parsed = Float(value) else { throw PyrowaveError.invalidDimensions }
                 quantizationStep = parsed
-            case "--max-pyrowave-bytes":
-                guard let value = iterator.next(), let parsed = Int(value) else { throw PyrowaveError.invalidDimensions }
-                maximumPyrowaveBytes = parsed
-                matchHEVCFrameBudget = false
-            case "--unbounded-pyrowave":
-                maximumPyrowaveBytes = nil
-                matchHEVCFrameBudget = false
+            case "--pyrowave-only":
+                pyrowaveOnly = true
             case "--require-pyrowave-faster-than-hevc":
                 requiredPyrowaveEncodeSpeedup = max(requiredPyrowaveEncodeSpeedup ?? 1.0, 1.0)
                 requiredPyrowaveDecodeSpeedup = max(requiredPyrowaveDecodeSpeedup ?? 1.0, 1.0)
@@ -194,7 +194,7 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
                 throw PyrowaveError.unsupportedFormat("unknown argument \(argument)")
             }
         }
-        guard shouldShowHelp || (frames > 0 && width > 0 && height > 0 && bitrate > 0 && quantizationStep > 0) else {
+        guard shouldShowHelp || (frames > 0 && width > 0 && height > 0 && bitrate > 0 && hevcQuality >= 0 && hevcQuality <= Self.maximumHEVCQuality && quantizationStep > 0) else {
             throw PyrowaveError.invalidDimensions
         }
     }
@@ -260,9 +260,17 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
 enum PyrowaveBenchmarkRunner {
     static let pyrowaveCodecName = "pyrowavekit-swift-metal"
     static let timedBenchmarkScopeNote = "Timed encode/decode excludes input loading, pixel-buffer preparation, reusable output allocation, artifact writes, report serialization, and quality metric generation; encode starts from reusable CoreVideo-backed Metal texture views and decode writes into reusable CVPixelBuffer-backed Metal texture views."
-    static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane, texture, and NV12 texture-channel pad, crop, DWT/iDWT, block quantization, sparse packet byte-cost prefiltering, sparse packet emission, sparse decode apply, rate-control stats, bucket resolve, and savings prefix, 32x32 sparse packets, and optional frame-size cap. \(timedBenchmarkScopeNote)"
+    static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane, texture, and NV12 texture-channel pad, crop, DWT/iDWT, block quantization, sparse packet emission, and sparse decode apply, 32x32 sparse packets. Benchmark policy leaves Pyrowave uncapped and compares against HEVC with AVVideoQualityKey defaulting to 0.8. \(timedBenchmarkScopeNote)"
 
     private struct DecodeTarget {
+        var pixelBuffer: CVPixelBuffer
+        var yTextureReference: CVMetalTexture
+        var cbCrTextureReference: CVMetalTexture
+        var yTexture: MTLTexture
+        var cbCrTexture: MTLTexture
+    }
+
+    private struct EncodeSource {
         var pixelBuffer: CVPixelBuffer
         var yTextureReference: CVMetalTexture
         var cbCrTextureReference: CVMetalTexture
@@ -297,63 +305,113 @@ enum PyrowaveBenchmarkRunner {
     static func runPyrowave(
         loaded: PyrowaveBenchmarkFrames,
         configuration: CodecConfiguration,
-        outputDirectory: URL
+        outputDirectory: URL,
+        writesArtifactsAndMetrics: Bool = true
     ) throws -> CodecBenchmarkResult {
         let codec = try PyrowaveCodec()
         let frames = loaded.frames
         let inputPixelBuffers = try frames.map {
             try $0.makeCVPixelBuffer(pixelFormat: YUVFrame.cvPixelFormat(for: $0.videoSignal))
         }
-        var encodedFrames = [EncodedFrame]()
-        encodedFrames.reserveCapacity(frames.count)
-
-        var stopwatch = Stopwatch()
-        for pixelBuffer in inputPixelBuffers {
-            encodedFrames.append(try codec.encode(pixelBuffer, configuration: configuration))
+        let encodeSources = try inputPixelBuffers.map {
+            try makeEncodeSource(
+                codec: codec,
+                pixelBuffer: $0,
+                width: frames[0].width,
+                height: frames[0].height
+            )
         }
-        let encodeSeconds = stopwatch.lapSeconds()
-
-        let decodeTargets = try makeDecodeTargets(
+        let timedDecodeTarget = try makeDecodeTarget(
             codec: codec,
             width: frames[0].width,
             height: frames[0].height,
-            pixelFormat: YUVFrame.cvPixelFormat(for: frames[0].videoSignal),
-            count: frames.count
+            pixelFormat: YUVFrame.cvPixelFormat(for: frames[0].videoSignal)
         )
-        for index in encodedFrames.indices {
-            try codec.decodeToNV12Textures(
-                encodedFrames[index],
-                yTexture: decodeTargets[index].yTexture,
-                cbCrTexture: decodeTargets[index].cbCrTexture
+        var encodedBytes = 0
+        var encodeSeconds = 0.0
+        var decodeSeconds = 0.0
+        for source in encodeSources {
+            var stopwatch = Stopwatch()
+            let encodedFrame = try codec.encodeGPUFrame(
+                yTexture: source.yTexture,
+                cbCrTexture: source.cbCrTexture,
+                configuration: configuration,
+                videoSignal: frames[0].videoSignal,
+                reusesPacketBuffers: true
             )
-        }
-        let decodeSeconds = stopwatch.lapSeconds()
-        let decodedFrames = try decodeTargets.map {
-            try YUVFrame(cvPixelBuffer: $0.pixelBuffer, videoSignal: frames[0].videoSignal)
+            encodeSeconds += stopwatch.lapSeconds()
+
+            stopwatch = Stopwatch()
+            try codec.decodeGPUFrameToNV12Textures(
+                encodedFrame,
+                yTexture: timedDecodeTarget.yTexture,
+                cbCrTexture: timedDecodeTarget.cbCrTexture
+            )
+            decodeSeconds += stopwatch.lapSeconds()
+            encodedBytes += encodedFrame.encodedByteCountForInspection()
         }
 
-        let encodedBytes = encodedFrames.reduce(0) { $0 + $1.data.count }
-        let streamURL = outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.pyrowaveStream)
-        var stream = try PyrowaveStreamWriter(
-            url: streamURL,
-            header: PyrowaveStreamHeader(
-                frame: frames[0],
+        let metric: FrameMetrics?
+        if writesArtifactsAndMetrics {
+            let artifactCodec = try PyrowaveCodec()
+            let artifactEncodeSources = try inputPixelBuffers.map {
+                try makeEncodeSource(
+                    codec: artifactCodec,
+                    pixelBuffer: $0,
+                    width: frames[0].width,
+                    height: frames[0].height
+                )
+            }
+            let artifactGPUFrames = try artifactEncodeSources.map { source in
+                try artifactCodec.encodeGPUFrame(
+                    yTexture: source.yTexture,
+                    cbCrTexture: source.cbCrTexture,
+                    configuration: configuration,
+                    videoSignal: frames[0].videoSignal
+                )
+            }
+            let exportedFrames = try artifactGPUFrames.map { try artifactCodec.exportGPUFrame($0) }
+            let artifactDecodeTargets = try makeDecodeTargets(
+                codec: artifactCodec,
+                width: frames[0].width,
+                height: frames[0].height,
+                pixelFormat: YUVFrame.cvPixelFormat(for: frames[0].videoSignal),
+                count: frames.count
+            )
+            for (index, gpuFrame) in artifactGPUFrames.enumerated() {
+                try artifactCodec.decodeGPUFrameToNV12Textures(
+                    gpuFrame,
+                    yTexture: artifactDecodeTargets[index].yTexture,
+                    cbCrTexture: artifactDecodeTargets[index].cbCrTexture
+                )
+            }
+            let decodedFrames = try artifactDecodeTargets.map {
+                try YUVFrame(cvPixelBuffer: $0.pixelBuffer, videoSignal: frames[0].videoSignal)
+            }
+            let streamURL = outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.pyrowaveStream)
+            var stream = try PyrowaveStreamWriter(
+                url: streamURL,
+                header: PyrowaveStreamHeader(
+                    frame: frames[0],
+                    frameRateNumerator: loaded.frameRateNumerator,
+                    frameRateDenominator: loaded.frameRateDenominator,
+                    bitDepth: loaded.bitDepth
+                )
+            )
+            for frame in exportedFrames {
+                try stream.writeFrame(frame)
+            }
+            try YUV4MPEGWriter.write(
+                frames: decodedFrames,
+                to: outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.pyrowaveDecodedY4M),
                 frameRateNumerator: loaded.frameRateNumerator,
-                frameRateDenominator: loaded.frameRateDenominator,
-                bitDepth: loaded.bitDepth
+                frameRateDenominator: loaded.frameRateDenominator
             )
-        )
-        for frame in encodedFrames {
-            try stream.writeFrame(frame)
+            metric = try Metrics.compare(frames, decodedFrames)
+        } else {
+            metric = nil
         }
-        try YUV4MPEGWriter.write(
-            frames: decodedFrames,
-            to: outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.pyrowaveDecodedY4M),
-            frameRateNumerator: loaded.frameRateNumerator,
-            frameRateDenominator: loaded.frameRateDenominator
-        )
 
-        let metric = try Metrics.compare(frames, decodedFrames)
         return CodecBenchmarkResult(
             codec: pyrowaveCodecName,
             frameCount: frames.count,
@@ -361,7 +419,7 @@ enum PyrowaveBenchmarkRunner {
             encodeSeconds: encodeSeconds,
             decodeSeconds: decodeSeconds,
             metrics: metric,
-            note: pyrowaveImplementationNote
+            note: pyrowaveImplementationNote + " Timed Pyrowave benchmark uses PyrowaveGPUFrame from reusable CoreVideo-backed Metal input textures to reusable CoreVideo-backed Metal output textures; byte-count inspection, compatibility stream export, decoded Y4M writing, and metric generation are outside timed encode/decode sections."
         )
     }
 
@@ -428,6 +486,37 @@ enum PyrowaveBenchmarkRunner {
         )
     }
 
+    private static func makeEncodeSource(
+        codec: PyrowaveCodec,
+        pixelBuffer: CVPixelBuffer,
+        width: Int,
+        height: Int
+    ) throws -> EncodeSource {
+        let y = try makeMetalTexture(
+            codec: codec,
+            pixelBuffer: pixelBuffer,
+            pixelFormat: .r8Unorm,
+            width: width,
+            height: height,
+            planeIndex: 0
+        )
+        let cbCr = try makeMetalTexture(
+            codec: codec,
+            pixelBuffer: pixelBuffer,
+            pixelFormat: .rg8Unorm,
+            width: width / 2,
+            height: height / 2,
+            planeIndex: 1
+        )
+        return EncodeSource(
+            pixelBuffer: pixelBuffer,
+            yTextureReference: y.reference,
+            cbCrTextureReference: cbCr.reference,
+            yTexture: y.texture,
+            cbCrTexture: cbCr.texture
+        )
+    }
+
     private static func makeMetalTexture(
         codec: PyrowaveCodec,
         pixelBuffer: CVPixelBuffer,
@@ -468,42 +557,45 @@ public enum PyrowaveBenchmarkCLI {
         try FileManager.default.createDirectory(at: arguments.outputDirectory, withIntermediateDirectories: true)
         let loaded = try PyrowaveBenchmarkRunner.loadFrames(arguments: arguments)
         let frames = loaded.frames
-        try YUV4MPEGWriter.write(
-            frames: frames,
-            to: arguments.outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.referenceY4M),
-            frameRateNumerator: loaded.frameRateNumerator,
-            frameRateDenominator: loaded.frameRateDenominator
-        )
-
-        let pyrowaveBudget: Int?
-        if let maximumPyrowaveBytes = arguments.maximumPyrowaveBytes {
-            pyrowaveBudget = maximumPyrowaveBytes
-        } else if arguments.matchHEVCFrameBudget {
-            pyrowaveBudget = try HEVCComparison.matchedFrameByteBudget(
-                bitrate: arguments.bitrate,
+        if !arguments.pyrowaveOnly {
+            try YUV4MPEGWriter.write(
+                frames: frames,
+                to: arguments.outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.referenceY4M),
                 frameRateNumerator: loaded.frameRateNumerator,
                 frameRateDenominator: loaded.frameRateDenominator
             )
-        } else {
-            pyrowaveBudget = nil
         }
 
         let configuration = CodecConfiguration(
-            quantizationStep: arguments.quantizationStep,
-            maximumEncodedBytes: pyrowaveBudget
+            quantizationStep: arguments.quantizationStep
         )
         let pyrowave = try PyrowaveBenchmarkRunner.runPyrowave(
             loaded: loaded,
             configuration: configuration,
-            outputDirectory: arguments.outputDirectory
+            outputDirectory: arguments.outputDirectory,
+            writesArtifactsAndMetrics: !arguments.pyrowaveOnly
         )
-        let hevc = try HEVCComparison.runAVKitHEVCComparison(
-            referenceFrames: frames,
-            workingDirectory: arguments.outputDirectory,
-            bitrate: arguments.bitrate,
-            frameRateNumerator: loaded.frameRateNumerator,
-            frameRateDenominator: loaded.frameRateDenominator
-        )
+        let hevc: CodecBenchmarkResult
+        if arguments.pyrowaveOnly {
+            hevc = CodecBenchmarkResult(
+                codec: "hevc_avkit_skipped",
+                frameCount: frames.count,
+                encodedBytes: 0,
+                encodeSeconds: 0,
+                decodeSeconds: 0,
+                metrics: nil,
+                note: "Skipped by --pyrowave-only to profile the Pyrowave timed path without HEVC, metrics, or artifact writes."
+            )
+        } else {
+            hevc = try HEVCComparison.runAVKitHEVCComparison(
+                referenceFrames: frames,
+                workingDirectory: arguments.outputDirectory,
+                bitrate: arguments.bitrate,
+                quality: arguments.hevcQuality,
+                frameRateNumerator: loaded.frameRateNumerator,
+                frameRateDenominator: loaded.frameRateDenominator
+            )
+        }
 
         let report = PyrowaveBenchmarkReport(
             generatedAt: ISO8601DateFormatter().string(from: Date()),
@@ -513,7 +605,7 @@ public enum PyrowaveBenchmarkCLI {
             frameRateNumerator: loaded.frameRateNumerator,
             frameRateDenominator: loaded.frameRateDenominator,
             bitrate: arguments.bitrate,
-            pyrowaveFrameBudgetBytes: pyrowaveBudget,
+            hevcQuality: arguments.hevcQuality,
             artifacts: PyrowaveBenchmarkArtifacts(),
             pyrowave: pyrowave,
             hevc: hevc,
@@ -525,7 +617,9 @@ public enum PyrowaveBenchmarkCLI {
         let reportData = try encoder.encode(report)
         let reportURL = arguments.outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.report)
         try reportData.write(to: reportURL)
-        try arguments.validate(report: report)
+        if !arguments.pyrowaveOnly {
+            try arguments.validate(report: report)
+        }
         return reportURL
     }
 }

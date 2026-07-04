@@ -4,6 +4,7 @@ import Metal
 private struct SparseCoefficientOutputKey: Hashable {
     var planeIndex: Int
     var sampleCount: Int
+    var storageModeRawValue: UInt
 }
 
 private enum ReusableBufferPurpose: Hashable {
@@ -18,8 +19,10 @@ private enum ReusableBufferPurpose: Hashable {
     case packetCostDescriptor
     case packetCostOutput
     case packetCostSignCount
+    case quantizedCoefficient
     case sparsePacketDescriptor
     case sparsePacketQScale
+    case sparsePacketOutput
     case sparsePacketSize
     case dwtPrimary
     case dwtScratch
@@ -45,23 +48,28 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     private let quantizePlaneTilesPipeline: MTLComputePipelineState
     private let sparseApplyPipeline: MTLComputePipelineState
     private let sparsePacketDecodePipeline: MTLComputePipelineState
+    private let sparsePacketDecodeThreadgroupPipeline: MTLComputePipelineState
     private let rateControlStatsPipeline: MTLComputePipelineState
     private let packetByteCostsPipeline: MTLComputePipelineState
     private let packetByteCostsSmallblocksPipeline: MTLComputePipelineState
     private let packetByteCostsFinalizePipeline: MTLComputePipelineState
-    private let sparsePacketEncodePipeline: MTLComputePipelineState
+    private let sparsePacketEncodeSerialPipeline: MTLComputePipelineState
+    private let sparsePacketEncodeThreadgroupPipeline: MTLComputePipelineState
     private let rateControlBucketPipeline: MTLComputePipelineState
     private let rateControlTileStatsBucketPipeline: MTLComputePipelineState
     private let rateControlBucketSavingsPipeline: MTLComputePipelineState
     private let rateControlBucketSavingsPrefixPipeline: MTLComputePipelineState
+    private let rateControlQuantLevelPipeline: MTLComputePipelineState
     private let dwtLiftRowsPipeline: MTLComputePipelineState
     private let dwtLiftColumnsPipeline: MTLComputePipelineState
     private let dwtPackRowsPipeline: MTLComputePipelineState
     private let dwtPackColumnsPipeline: MTLComputePipelineState
+    private let dwtTiledLevel0Pipeline: MTLComputePipelineState
     private let dwtUnpackRowsPipeline: MTLComputePipelineState
     private let dwtUnpackColumnsPipeline: MTLComputePipelineState
     private let idwtUnpackRowsScaledPipeline: MTLComputePipelineState
     private let idwtUnpackColumnsScaledPipeline: MTLComputePipelineState
+    private let idwtTiledLevel0Pipeline: MTLComputePipelineState
     private let idwtLiftRowsPipeline: MTLComputePipelineState
     private let idwtLiftColumnsPipeline: MTLComputePipelineState
     private var sparseCoefficientOutputs: [SparseCoefficientOutputKey: MTLBuffer] = [:]
@@ -97,23 +105,28 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         quantizePlaneTilesPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize_plane_tiles", library: library))
         sparseApplyPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_apply_sparse_coefficients", library: library))
         sparsePacketDecodePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_decode_sparse_packets", library: library))
+        sparsePacketDecodeThreadgroupPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_decode_sparse_packets_threadgroup", library: library))
         rateControlStatsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_tile_stats", library: library))
         packetByteCostsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_packet_byte_costs", library: library))
         packetByteCostsSmallblocksPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_packet_byte_costs_smallblocks", library: library))
         packetByteCostsFinalizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_packet_byte_costs_finalize", library: library))
-        sparsePacketEncodePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_encode_sparse_packets", library: library))
+        sparsePacketEncodeSerialPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_encode_sparse_packets_serial", library: library))
+        sparsePacketEncodeThreadgroupPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_encode_sparse_packets", library: library))
         rateControlBucketPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_bucket_indices", library: library))
         rateControlTileStatsBucketPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_tile_stats_bucket_indices", library: library))
         rateControlBucketSavingsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_bucket_savings", library: library))
         rateControlBucketSavingsPrefixPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_bucket_savings_prefix", library: library))
+        rateControlQuantLevelPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_select_quant_levels", library: library))
         dwtLiftRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_rows", library: library))
         dwtLiftColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_columns", library: library))
         dwtPackRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_pack_rows", library: library))
         dwtPackColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_pack_columns", library: library))
+        dwtTiledLevel0Pipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_tiled_level0", library: library))
         dwtUnpackRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_unpack_rows", library: library))
         dwtUnpackColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_unpack_columns", library: library))
         idwtUnpackRowsScaledPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_idwt_unpack_rows_scaled", library: library))
         idwtUnpackColumnsScaledPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_idwt_unpack_columns_scaled", library: library))
+        idwtTiledLevel0Pipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_idwt_tiled_level0", library: library))
         idwtLiftRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_idwt_lift_rows", library: library))
         idwtLiftColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_idwt_lift_columns", library: library))
     }
@@ -266,7 +279,9 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     }
 
     func padTexturePlaneBuffersAndForwardWaveletBuffers(
-        _ planes: [(texture: MTLTexture, channel: Int, paddedWidth: Int, paddedHeight: Int, levels: Int)]
+        _ planes: [(texture: MTLTexture, channel: Int, paddedWidth: Int, paddedHeight: Int, levels: Int)],
+        useTiledLevelZero: Bool = true,
+        waitsForCompletion: Bool = true
     ) throws -> [MTLBuffer] {
         guard !planes.isEmpty else {
             return []
@@ -347,6 +362,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             active.reserveCapacity(planes.count)
             for (planeIndex, plane) in planes.enumerated() where level < plane.levels {
                 active.append(DWTBatchDispatch(
+                    planeIndex: planeIndex,
                     primary: outputs[planeIndex],
                     scratch: scratchBuffers[planeIndex],
                     activeWidth: plane.paddedWidth >> level,
@@ -356,6 +372,28 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             }
             guard !active.isEmpty else {
                 continue
+            }
+
+            if useTiledLevelZero && level == 0 {
+                let tiled = active.filter { canUseTiledLevelZero(activeWidth: $0.activeWidth, activeHeight: $0.activeHeight) }
+                if !tiled.isEmpty {
+                    try encodeDWTTiledLevelZeroBatch(
+                        commandBuffer: commandBuffer,
+                        dispatches: tiled.map {
+                            (input: $0.primary, output: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride)
+                        }
+                    )
+                    try encodeDWTBufferCopies(
+                        commandBuffer: commandBuffer,
+                        copies: tiled.map {
+                            (input: $0.scratch, output: $0.primary, byteLength: $0.stride * $0.activeHeight * MemoryLayout<Float>.stride)
+                        }
+                    )
+                    active.removeAll { canUseTiledLevelZero(activeWidth: $0.activeWidth, activeHeight: $0.activeHeight) }
+                    guard !active.isEmpty else {
+                        continue
+                    }
+                }
             }
 
             for phase in 0...4 {
@@ -393,7 +431,11 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             )
         }
 
-        try finish(commandBuffer: commandBuffer, context: "Metal texture padding/DWT")
+        if waitsForCompletion {
+            try finish(commandBuffer: commandBuffer, context: "Metal texture padding/DWT")
+        } else {
+            commandBuffer.commit()
+        }
         return outputs
     }
 
@@ -546,6 +588,43 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         yTexture: MTLTexture,
         cbCrTexture: MTLTexture
     ) throws {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw PyrowaveError.processFailed("failed to create Metal NV12 crop command buffer")
+        }
+
+        try encodeCropPlanesToNV12Textures(
+            commandBuffer: commandBuffer,
+            yBuffer: yBuffer,
+            ySampleCount: ySampleCount,
+            yPaddedWidth: yPaddedWidth,
+            cbBuffer: cbBuffer,
+            cbSampleCount: cbSampleCount,
+            crBuffer: crBuffer,
+            crSampleCount: crSampleCount,
+            chromaPaddedWidth: chromaPaddedWidth,
+            width: width,
+            height: height,
+            yTexture: yTexture,
+            cbCrTexture: cbCrTexture
+        )
+        try finish(commandBuffer: commandBuffer, context: "Metal NV12 texture crop")
+    }
+
+    private func encodeCropPlanesToNV12Textures(
+        commandBuffer: MTLCommandBuffer,
+        yBuffer: MTLBuffer,
+        ySampleCount: Int,
+        yPaddedWidth: Int,
+        cbBuffer: MTLBuffer,
+        cbSampleCount: Int,
+        crBuffer: MTLBuffer,
+        crSampleCount: Int,
+        chromaPaddedWidth: Int,
+        width: Int,
+        height: Int,
+        yTexture: MTLTexture,
+        cbCrTexture: MTLTexture
+    ) throws {
         let chromaWidth = width / 2
         let chromaHeight = height / 2
         guard yTexture.pixelFormat == .r8Unorm,
@@ -577,8 +656,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             outputWidth: UInt32(width),
             outputHeight: UInt32(height)
         )
-        guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw PyrowaveError.processFailed("failed to create Metal NV12 crop command encoder")
         }
 
@@ -596,12 +675,134 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             threadsPerThreadgroup: MTLSize(width: threadWidth, height: threadHeight, depth: 1)
         )
         encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
+    }
 
-        if let error = commandBuffer.error {
-            throw PyrowaveError.processFailed("Metal NV12 texture crop command failed: \(error)")
+    func decodeSparsePacketsInverseAndCropToNV12Textures(
+        packetData: Data,
+        planes: [(sampleCount: Int, paddedWidth: Int, paddedHeight: Int, levels: Int, descriptors: [MetalSparsePacketDecodeDescriptor])],
+        width: Int,
+        height: Int,
+        yTexture: MTLTexture,
+        cbCrTexture: MTLTexture
+    ) throws {
+        guard planes.count == 3 else {
+            throw PyrowaveError.invalidDimensions
         }
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw PyrowaveError.processFailed("failed to create Metal combined NV12 decode command buffer")
+        }
+
+        let sparseBuffers = try encodeSparsePacketDecodeBuffers(
+            commandBuffer: commandBuffer,
+            packetData: packetData,
+            planes: planes.map {
+                (sampleCount: $0.sampleCount, descriptors: $0.descriptors)
+            }
+        )
+        guard sparseBuffers.count == planes.count else {
+            throw PyrowaveError.processFailed("Metal sparse packet decode returned \(sparseBuffers.count) buffers for \(planes.count) planes")
+        }
+
+        let reconstructed = try encodeInverseWaveletBuffers(
+            commandBuffer: commandBuffer,
+            planes.indices.map { index in
+                (
+                    buffer: sparseBuffers[index],
+                    sampleCount: planes[index].sampleCount,
+                    width: planes[index].paddedWidth,
+                    height: planes[index].paddedHeight,
+                    levels: planes[index].levels
+                )
+            },
+            useTiledLevelZero: true
+        )
+        guard reconstructed.count == planes.count else {
+            throw PyrowaveError.processFailed("Metal iDWT returned \(reconstructed.count) buffers for \(planes.count) planes")
+        }
+
+        try encodeCropPlanesToNV12Textures(
+            commandBuffer: commandBuffer,
+            yBuffer: reconstructed[0],
+            ySampleCount: planes[0].sampleCount,
+            yPaddedWidth: planes[0].paddedWidth,
+            cbBuffer: reconstructed[1],
+            cbSampleCount: planes[1].sampleCount,
+            crBuffer: reconstructed[2],
+            crSampleCount: planes[2].sampleCount,
+            chromaPaddedWidth: planes[1].paddedWidth,
+            width: width,
+            height: height,
+            yTexture: yTexture,
+            cbCrTexture: cbCrTexture
+        )
+        try finish(commandBuffer: commandBuffer, context: "Metal combined NV12 decode")
+    }
+
+    func decodeSparsePacketBuffersInverseAndCropToNV12Textures(
+        packetPlanes: [(packetBuffer: MTLBuffer, packetByteLength: Int, sampleCount: Int, paddedWidth: Int, paddedHeight: Int, levels: Int, descriptorCount: Int, descriptorBuffer: MTLBuffer)],
+        width: Int,
+        height: Int,
+        yTexture: MTLTexture,
+        cbCrTexture: MTLTexture
+    ) throws {
+        guard packetPlanes.count == 3 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw PyrowaveError.processFailed("failed to create Metal GPU-frame NV12 decode command buffer")
+        }
+
+        let sparseBuffers = try encodeSparsePacketDecodeBuffers(
+            commandBuffer: commandBuffer,
+            packetPlanes: packetPlanes.map {
+                (
+                    packetBuffer: $0.packetBuffer,
+                    packetByteLength: $0.packetByteLength,
+                    sampleCount: $0.sampleCount,
+                    descriptorCount: $0.descriptorCount,
+                    descriptors: nil,
+                    descriptorBuffer: $0.descriptorBuffer
+                )
+            },
+            outputStorageMode: .private
+        )
+        guard sparseBuffers.count == packetPlanes.count else {
+            throw PyrowaveError.processFailed("Metal sparse packet decode returned \(sparseBuffers.count) buffers for \(packetPlanes.count) planes")
+        }
+
+        let reconstructed = try encodeInverseWaveletBuffers(
+            commandBuffer: commandBuffer,
+            packetPlanes.indices.map { index in
+                (
+                    buffer: sparseBuffers[index],
+                    sampleCount: packetPlanes[index].sampleCount,
+                    width: packetPlanes[index].paddedWidth,
+                    height: packetPlanes[index].paddedHeight,
+                    levels: packetPlanes[index].levels
+                )
+            },
+            useTiledLevelZero: true
+        )
+        guard reconstructed.count == packetPlanes.count else {
+            throw PyrowaveError.processFailed("Metal iDWT returned \(reconstructed.count) buffers for \(packetPlanes.count) planes")
+        }
+
+        try encodeCropPlanesToNV12Textures(
+            commandBuffer: commandBuffer,
+            yBuffer: reconstructed[0],
+            ySampleCount: packetPlanes[0].sampleCount,
+            yPaddedWidth: packetPlanes[0].paddedWidth,
+            cbBuffer: reconstructed[1],
+            cbSampleCount: packetPlanes[1].sampleCount,
+            crBuffer: reconstructed[2],
+            crSampleCount: packetPlanes[2].sampleCount,
+            chromaPaddedWidth: packetPlanes[1].paddedWidth,
+            width: width,
+            height: height,
+            yTexture: yTexture,
+            cbCrTexture: cbCrTexture
+        )
+        try finish(commandBuffer: commandBuffer, context: "Metal GPU-frame combined NV12 decode")
     }
 
     func quantize(_ samples: [Float], quantizationStep: Float) throws -> [Int16] {
@@ -698,7 +899,29 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     }
 
     func quantizePlaneBufferResults(
-        _ planes: [(samples: MTLBuffer, sampleCount: Int, stride: Int, descriptors: [MetalPlaneQuantizationDescriptor])]
+        _ planes: [(samples: MTLBuffer, sampleCount: Int, stride: Int, descriptors: [MetalPlaneQuantizationDescriptor])],
+        reusesOutputBuffers: Bool = false,
+        readsQScaleCodes: Bool = true
+    ) throws -> [MetalPlaneQuantizationBufferResult] {
+        try quantizePlaneBufferResultsResidentDescriptors(
+            planes.map {
+                (
+                    samples: $0.samples,
+                    sampleCount: $0.sampleCount,
+                    stride: $0.stride,
+                    descriptors: $0.descriptors,
+                    descriptorBuffer: nil
+                )
+            },
+            reusesOutputBuffers: reusesOutputBuffers,
+            readsQScaleCodes: readsQScaleCodes
+        )
+    }
+
+    func quantizePlaneBufferResultsResidentDescriptors(
+        _ planes: [(samples: MTLBuffer, sampleCount: Int, stride: Int, descriptors: [MetalPlaneQuantizationDescriptor], descriptorBuffer: MTLBuffer?)],
+        reusesOutputBuffers: Bool = false,
+        readsQScaleCodes: Bool = true
     ) throws -> [MetalPlaneQuantizationBufferResult] {
         guard !planes.isEmpty else {
             return []
@@ -724,15 +947,27 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             }
 
             let coefficientByteLength = plane.sampleCount * MemoryLayout<Int16>.stride
-            guard let output = device.makeBuffer(length: coefficientByteLength, options: .storageModeShared) else {
-                throw PyrowaveError.processFailed("failed to allocate Metal plane quantization output buffer")
+            let output: MTLBuffer
+            if reusesOutputBuffers {
+                output = try reusableSharedBuffer(
+                    byteLength: coefficientByteLength,
+                    purpose: .quantizedCoefficient,
+                    planeIndex: results.count
+                )
+            } else {
+                guard let allocated = device.makeBuffer(length: coefficientByteLength, options: .storageModeShared) else {
+                    throw PyrowaveError.processFailed("failed to allocate Metal plane quantization output buffer")
+                }
+                output = allocated
             }
 
             let resultIndex = results.count
             results.append(MetalPlaneQuantizationBufferResult(
                 coefficientBuffer: output,
                 coefficientCount: plane.sampleCount,
-                qScaleCodesByDescriptor: []
+                qScaleCodesByDescriptor: [],
+                qScaleBuffer: nil,
+                qScaleDescriptorCount: 0
             ))
 
             guard !plane.descriptors.isEmpty else {
@@ -740,8 +975,19 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             }
 
             let qScaleByteLength = plane.descriptors.count * 16 * MemoryLayout<UInt8>.stride
-            let descriptorBuffer = try reusableSharedBuffer(bytes: plane.descriptors, purpose: .quantizeDescriptor, planeIndex: resultIndex)
+            let descriptorByteLength = plane.descriptors.count * MemoryLayout<MetalPlaneQuantizationDescriptor>.stride
+            let descriptorBuffer: MTLBuffer
+            if let cachedDescriptorBuffer = plane.descriptorBuffer {
+                guard cachedDescriptorBuffer.length >= descriptorByteLength else {
+                    throw PyrowaveError.invalidDimensions
+                }
+                descriptorBuffer = cachedDescriptorBuffer
+            } else {
+                descriptorBuffer = try reusableSharedBuffer(bytes: plane.descriptors, purpose: .quantizeDescriptor, planeIndex: resultIndex)
+            }
             let qScaleBuffer = try reusableSharedBuffer(byteLength: qScaleByteLength, purpose: .quantizeQScale, planeIndex: resultIndex)
+            results[resultIndex].qScaleBuffer = qScaleBuffer
+            results[resultIndex].qScaleDescriptorCount = plane.descriptors.count
 
             work.append((
                 resultIndex: resultIndex,
@@ -778,22 +1024,40 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         }
         encoder.endEncoding()
         commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
 
-        if let error = commandBuffer.error {
-            throw PyrowaveError.processFailed("Metal plane quantization command failed: \(error)")
-        }
-
-        for item in work {
-            let qScaleCount = item.descriptorCount * 16
-            let qScalePointer = item.qScaleBuffer.contents().bindMemory(to: UInt8.self, capacity: qScaleCount)
-            let flatQScales = Array(UnsafeBufferPointer(start: qScalePointer, count: qScaleCount))
-            let perDescriptor = Swift.stride(from: 0, to: flatQScales.count, by: 16).map {
-                Array(flatQScales[$0..<$0 + 16])
+        if readsQScaleCodes {
+            commandBuffer.waitUntilCompleted()
+            if let error = commandBuffer.error {
+                throw PyrowaveError.processFailed("Metal plane quantization command failed: \(error)")
             }
-            results[item.resultIndex].qScaleCodesByDescriptor = perDescriptor
+            for item in work {
+                let qScaleCount = item.descriptorCount * 16
+                let qScalePointer = item.qScaleBuffer.contents().bindMemory(to: UInt8.self, capacity: qScaleCount)
+                let flatQScales = Array(UnsafeBufferPointer(start: qScalePointer, count: qScaleCount))
+                let perDescriptor = Swift.stride(from: 0, to: flatQScales.count, by: 16).map {
+                    Array(flatQScales[$0..<$0 + 16])
+                }
+                results[item.resultIndex].qScaleCodesByDescriptor = perDescriptor
+            }
         }
         return results
+    }
+
+    func makeStaticSharedBuffer<T>(bytes values: [T]) throws -> MTLBuffer {
+        let byteLength = values.count * MemoryLayout<T>.stride
+        guard byteLength > 0 else {
+            guard let buffer = device.makeBuffer(length: 1, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate empty Metal shared buffer")
+            }
+            return buffer
+        }
+        return try values.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress,
+                  let buffer = device.makeBuffer(bytes: baseAddress, length: byteLength, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal static shared buffer")
+            }
+            return buffer
+        }
     }
 
     func applySparseCoefficients(sampleCount: Int, entries: [MetalSparseCoefficientEntry]) throws -> [Float] {
@@ -904,6 +1168,24 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         packetData: Data,
         planes: [(sampleCount: Int, descriptors: [MetalSparsePacketDecodeDescriptor])]
     ) throws -> [MTLBuffer] {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw PyrowaveError.processFailed("failed to create Metal sparse packet decode command buffer")
+        }
+        let outputs = try encodeSparsePacketDecodeBuffers(
+            commandBuffer: commandBuffer,
+            packetData: packetData,
+            planes: planes
+        )
+        try finish(commandBuffer: commandBuffer, context: "Metal sparse packet decode")
+        return outputs
+    }
+
+    private func encodeSparsePacketDecodeBuffers(
+        commandBuffer: MTLCommandBuffer,
+        packetData: Data,
+        planes: [(sampleCount: Int, descriptors: [MetalSparsePacketDecodeDescriptor])],
+        outputStorageMode: MTLStorageMode = .shared
+    ) throws -> [MTLBuffer] {
         guard !planes.isEmpty else {
             return []
         }
@@ -915,43 +1197,89 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         }
 
         let packetBuffer = try reusableSharedBuffer(data: packetData, purpose: .sparsePacketDecodeData, planeIndex: 0)
-        var outputs = [MTLBuffer]()
-        outputs.reserveCapacity(planes.count)
-        var zeroFills = [(buffer: MTLBuffer, byteLength: Int)]()
-        zeroFills.reserveCapacity(planes.count)
-        var dispatches = [(planeIndex: Int, descriptorBuffer: MTLBuffer, descriptorCount: Int, sampleCount: Int)]()
-        dispatches.reserveCapacity(planes.count)
+        return try encodeSparsePacketDecodeBuffers(
+            commandBuffer: commandBuffer,
+            packetPlanes: planes.map {
+                (
+                    packetBuffer: packetBuffer,
+                    packetByteLength: packetData.count,
+                    sampleCount: $0.sampleCount,
+                    descriptorCount: $0.descriptors.count,
+                    descriptors: $0.descriptors,
+                    descriptorBuffer: nil
+                )
+            },
+            outputStorageMode: outputStorageMode
+        )
+    }
 
-        for (planeIndex, plane) in planes.enumerated() {
+    private func encodeSparsePacketDecodeBuffers(
+        commandBuffer: MTLCommandBuffer,
+        packetPlanes: [(packetBuffer: MTLBuffer, packetByteLength: Int, sampleCount: Int, descriptorCount: Int, descriptors: [MetalSparsePacketDecodeDescriptor]?, descriptorBuffer: MTLBuffer?)],
+        outputStorageMode: MTLStorageMode = .shared
+    ) throws -> [MTLBuffer] {
+        guard !packetPlanes.isEmpty else {
+            return []
+        }
+        guard packetPlanes.allSatisfy({
+            $0.packetByteLength > 0 &&
+            $0.packetByteLength <= $0.packetBuffer.length &&
+            $0.packetByteLength <= Int(UInt32.max) &&
+            $0.sampleCount >= 0 &&
+            $0.sampleCount <= Int(UInt32.max) &&
+            $0.descriptorCount <= Int(UInt32.max)
+        }) else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        var outputs = [MTLBuffer]()
+        outputs.reserveCapacity(packetPlanes.count)
+        var zeroFills = [(buffer: MTLBuffer, byteLength: Int)]()
+        zeroFills.reserveCapacity(packetPlanes.count)
+        var dispatches = [(planeIndex: Int, packetBuffer: MTLBuffer, descriptorBuffer: MTLBuffer, descriptorCount: Int, sampleCount: Int)]()
+        dispatches.reserveCapacity(packetPlanes.count)
+
+        for (planeIndex, plane) in packetPlanes.enumerated() {
             if plane.sampleCount == 0 {
-                guard plane.descriptors.isEmpty else {
+                guard plane.descriptorCount == 0 else {
                     throw PyrowaveError.invalidDimensions
                 }
-                let output = try sparseCoefficientOutput(planeIndex: planeIndex, sampleCount: 0)
-                output.contents().storeBytes(of: Float(0), as: Float.self)
+                let output = try sparseCoefficientOutput(planeIndex: planeIndex, sampleCount: 0, storageMode: outputStorageMode)
+                if outputStorageMode == .shared {
+                    output.contents().storeBytes(of: Float(0), as: Float.self)
+                }
                 outputs.append(output)
                 continue
             }
 
             let byteLength = plane.sampleCount * MemoryLayout<Float>.stride
-            let output = try sparseCoefficientOutput(planeIndex: planeIndex, sampleCount: plane.sampleCount)
+            let output = try sparseCoefficientOutput(planeIndex: planeIndex, sampleCount: plane.sampleCount, storageMode: outputStorageMode)
             outputs.append(output)
             zeroFills.append((buffer: output, byteLength: byteLength))
 
-            guard !plane.descriptors.isEmpty else {
+            guard plane.descriptorCount > 0 else {
                 continue
             }
-            let descriptorBuffer = try reusableSharedBuffer(bytes: plane.descriptors, purpose: .sparsePacketDecodeDescriptor, planeIndex: planeIndex)
+            let descriptorByteLength = plane.descriptorCount * MemoryLayout<MetalSparsePacketDecodeDescriptor>.stride
+            let descriptorBuffer: MTLBuffer
+            if let cachedDescriptorBuffer = plane.descriptorBuffer {
+                guard cachedDescriptorBuffer.length >= descriptorByteLength else {
+                    throw PyrowaveError.invalidDimensions
+                }
+                descriptorBuffer = cachedDescriptorBuffer
+            } else {
+                guard let descriptors = plane.descriptors, descriptors.count == plane.descriptorCount else {
+                    throw PyrowaveError.invalidDimensions
+                }
+                descriptorBuffer = try reusableSharedBuffer(bytes: descriptors, purpose: .sparsePacketDecodeDescriptor, planeIndex: planeIndex)
+            }
             dispatches.append((
                 planeIndex: planeIndex,
+                packetBuffer: plane.packetBuffer,
                 descriptorBuffer: descriptorBuffer,
-                descriptorCount: plane.descriptors.count,
+                descriptorCount: plane.descriptorCount,
                 sampleCount: plane.sampleCount
             ))
-        }
-
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-            throw PyrowaveError.processFailed("failed to create Metal sparse packet decode command buffer")
         }
 
         if !zeroFills.isEmpty {
@@ -969,42 +1297,44 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 throw PyrowaveError.processFailed("failed to create Metal sparse packet decode command encoder")
             }
 
-            encoder.setComputePipelineState(sparsePacketDecodePipeline)
-            let width = min(sparsePacketDecodePipeline.maxTotalThreadsPerThreadgroup, 256)
-            let threadsPerThreadgroup = MTLSize(width: width, height: 1, depth: 1)
+            encoder.setComputePipelineState(sparsePacketDecodeThreadgroupPipeline)
+            let threadgroupWidth = 128
+            guard sparsePacketDecodeThreadgroupPipeline.maxTotalThreadsPerThreadgroup >= threadgroupWidth else {
+                throw PyrowaveError.processFailed("Metal sparse packet threadgroup decoder requires 128 threads per threadgroup")
+            }
+            let threadsPerThreadgroup = MTLSize(width: threadgroupWidth, height: 1, depth: 1)
             for dispatch in dispatches {
                 var constants = SparsePacketDecodeConstants(
                     descriptorCount: UInt32(dispatch.descriptorCount),
                     sampleCount: UInt32(dispatch.sampleCount)
                 )
                 encoder.setBuffer(outputs[dispatch.planeIndex], offset: 0, index: 0)
-                encoder.setBuffer(packetBuffer, offset: 0, index: 1)
+                encoder.setBuffer(dispatch.packetBuffer, offset: 0, index: 1)
                 encoder.setBuffer(dispatch.descriptorBuffer, offset: 0, index: 2)
                 encoder.setBytes(&constants, length: MemoryLayout<SparsePacketDecodeConstants>.stride, index: 3)
-                encoder.dispatchThreads(
-                    MTLSize(width: dispatch.descriptorCount * 16, height: 1, depth: 1),
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: dispatch.descriptorCount, height: 1, depth: 1),
                     threadsPerThreadgroup: threadsPerThreadgroup
                 )
             }
             encoder.endEncoding()
         }
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-
-        if let error = commandBuffer.error {
-            throw PyrowaveError.processFailed("Metal sparse packet decode command failed: \(error)")
-        }
 
         return outputs
     }
 
-    private func sparseCoefficientOutput(planeIndex: Int, sampleCount: Int) throws -> MTLBuffer {
-        let key = SparseCoefficientOutputKey(planeIndex: planeIndex, sampleCount: sampleCount)
+    private func sparseCoefficientOutput(planeIndex: Int, sampleCount: Int, storageMode: MTLStorageMode = .shared) throws -> MTLBuffer {
+        let key = SparseCoefficientOutputKey(
+            planeIndex: planeIndex,
+            sampleCount: sampleCount,
+            storageModeRawValue: storageMode.rawValue
+        )
         let byteLength = max(sampleCount, 1) * MemoryLayout<Float>.stride
         if let output = sparseCoefficientOutputs[key], output.length >= byteLength {
             return output
         }
-        guard let output = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
+        let options: MTLResourceOptions = storageMode == .private ? .storageModePrivate : .storageModeShared
+        guard let output = device.makeBuffer(length: byteLength, options: options) else {
             throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient output")
         }
         sparseCoefficientOutputs[key] = output
@@ -1340,7 +1670,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     func encodeSparsePackets(
         coefficients: [Int16],
         descriptors: [MetalSparsePacketEncodeDescriptor],
-        qScaleCodes: [[UInt8]]
+        qScaleCodes: [[UInt8]],
+        sequence: UInt8 = 0
     ) throws -> [Data?] {
         guard !coefficients.isEmpty else {
             throw PyrowaveError.invalidDimensions
@@ -1348,26 +1679,99 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         guard let coefficientBuffer = device.makeBuffer(bytes: coefficients, length: coefficients.count * MemoryLayout<Int16>.stride, options: .storageModeShared) else {
             throw PyrowaveError.processFailed("failed to allocate Metal sparse packet coefficient buffer")
         }
-        return try encodeSparsePackets(coefficientBuffer: coefficientBuffer, coefficientCount: coefficients.count, descriptors: descriptors, qScaleCodes: qScaleCodes)
+        return try encodeSparsePackets(coefficientBuffer: coefficientBuffer, coefficientCount: coefficients.count, descriptors: descriptors, qScaleCodes: qScaleCodes, sequence: sequence)
     }
 
     func encodeSparsePackets(
         coefficientBuffer: MTLBuffer,
         coefficientCount: Int,
         descriptors: [MetalSparsePacketEncodeDescriptor],
-        qScaleCodes: [[UInt8]]
+        qScaleCodes: [[UInt8]],
+        sequence: UInt8 = 0
     ) throws -> [Data?] {
         try encodeSparsePacketsBatch([(
             coefficientBuffer: coefficientBuffer,
             coefficientCount: coefficientCount,
             descriptors: descriptors,
             qScaleCodes: qScaleCodes
-        )])[0]
+        )], sequence: sequence)[0]
     }
 
     func encodeSparsePacketsBatch(
-        _ planes: [(coefficientBuffer: MTLBuffer, coefficientCount: Int, descriptors: [MetalSparsePacketEncodeDescriptor], qScaleCodes: [[UInt8]])]
+        _ planes: [(coefficientBuffer: MTLBuffer, coefficientCount: Int, descriptors: [MetalSparsePacketEncodeDescriptor], qScaleCodes: [[UInt8]])],
+        sequence: UInt8 = 0
     ) throws -> [[Data?]] {
+        let encodedPlanes = try encodeSparsePacketBuffersBatch(planes, sequence: sequence)
+        return encodedPlanes.map { encodedPlane in
+            guard encodedPlane.descriptorCount > 0 else {
+                return []
+            }
+            let outputByteCount = encodedPlane.descriptorCount * encodedPlane.maxPacketBytes
+            let bytesPointer = encodedPlane.outputBuffer.contents().bindMemory(to: UInt8.self, capacity: outputByteCount)
+            let sizePointer = encodedPlane.sizeBuffer.contents().bindMemory(to: UInt32.self, capacity: encodedPlane.descriptorCount)
+            let retainedOutputBuffer = encodedPlane.outputBuffer
+            return (0..<encodedPlane.descriptorCount).map { index in
+                let size = Int(sizePointer[index])
+                guard size > 0 else {
+                    return nil
+                }
+                guard size <= encodedPlane.maxPacketBytes else {
+                    return nil
+                }
+                let start = index * encodedPlane.maxPacketBytes
+                let packetPointer = UnsafeMutableRawPointer(bytesPointer.advanced(by: start))
+                return Data(bytesNoCopy: packetPointer, count: size, deallocator: .custom { _, _ in
+                    _ = retainedOutputBuffer
+                })
+            }
+        }
+    }
+
+    func encodeSparsePacketBuffersBatch(
+        _ planes: [(coefficientBuffer: MTLBuffer, coefficientCount: Int, descriptors: [MetalSparsePacketEncodeDescriptor], qScaleCodes: [[UInt8]])],
+        sequence: UInt8 = 0,
+        outputStorageMode: MTLStorageMode = .shared,
+        reusesOutputBuffers: Bool = false
+    ) throws -> [MetalSparsePacketEncodedPlane] {
+        var residentPlanes = [(coefficientBuffer: MTLBuffer, coefficientCount: Int, descriptorCount: Int, descriptors: [MetalSparsePacketEncodeDescriptor]?, descriptorBuffer: MTLBuffer?, qScaleBuffer: MTLBuffer, qScaleDescriptorCount: Int)]()
+        residentPlanes.reserveCapacity(planes.count)
+        for (planeIndex, plane) in planes.enumerated() {
+            guard plane.descriptors.count == plane.qScaleCodes.count else {
+                throw PyrowaveError.invalidDimensions
+            }
+            var flatQScaleCodes = [UInt8]()
+            flatQScaleCodes.reserveCapacity(plane.qScaleCodes.count * 16)
+            for codes in plane.qScaleCodes {
+                guard codes.count == 16 else {
+                    throw PyrowaveError.invalidBitstream("expected sixteen 8x8 quant scale codes")
+                }
+                flatQScaleCodes.append(contentsOf: codes)
+            }
+            let qScaleBuffer = try reusableSharedBuffer(bytes: flatQScaleCodes, purpose: .sparsePacketQScale, planeIndex: planeIndex)
+            residentPlanes.append((
+                coefficientBuffer: plane.coefficientBuffer,
+                coefficientCount: plane.coefficientCount,
+                descriptorCount: plane.descriptors.count,
+                descriptors: plane.descriptors,
+                descriptorBuffer: nil,
+                qScaleBuffer: qScaleBuffer,
+                qScaleDescriptorCount: plane.qScaleCodes.count
+            ))
+        }
+        return try encodeSparsePacketBuffersBatchResidentQScales(
+            residentPlanes,
+            sequence: sequence,
+            outputStorageMode: outputStorageMode,
+            reusesOutputBuffers: reusesOutputBuffers
+        )
+    }
+
+    func encodeSparsePacketBuffersBatchResidentQScales(
+        _ planes: [(coefficientBuffer: MTLBuffer, coefficientCount: Int, descriptorCount: Int, descriptors: [MetalSparsePacketEncodeDescriptor]?, descriptorBuffer: MTLBuffer?, qScaleBuffer: MTLBuffer, qScaleDescriptorCount: Int)],
+        sequence: UInt8 = 0,
+        outputStorageMode: MTLStorageMode = .shared,
+        reusesOutputBuffers: Bool = false
+    ) throws -> [MetalSparsePacketEncodedPlane] {
         guard !planes.isEmpty else {
             return []
         }
@@ -1383,44 +1787,78 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             descriptorCount: Int
         )]()
         work.reserveCapacity(planes.count)
-        var results = Array(repeating: [Data?](), count: planes.count)
+        var results = Array(
+            repeating: MetalSparsePacketEncodedPlane(
+                outputBuffer: emptySparsePacketOutputBuffer(),
+                sizeBuffer: emptySparsePacketOutputBuffer(),
+                descriptorCount: 0,
+                maxPacketBytes: maxPacketBytes
+            ),
+            count: planes.count
+        )
 
         for (planeIndex, plane) in planes.enumerated() {
             guard plane.coefficientCount > 0,
                   plane.coefficientBuffer.length >= plane.coefficientCount * MemoryLayout<Int16>.stride,
-                  plane.descriptors.count == plane.qScaleCodes.count,
-                  plane.descriptors.count <= Int(UInt32.max) else {
+                  plane.descriptorCount == plane.qScaleDescriptorCount,
+                  plane.qScaleBuffer.length >= plane.qScaleDescriptorCount * 16 * MemoryLayout<UInt8>.stride,
+                  plane.descriptorCount <= Int(UInt32.max) else {
                 throw PyrowaveError.invalidDimensions
             }
-            guard !plane.descriptors.isEmpty else {
+            guard plane.descriptorCount > 0 else {
                 continue
             }
 
-            var flatQScaleCodes = [UInt8]()
-            flatQScaleCodes.reserveCapacity(plane.qScaleCodes.count * 16)
-            for codes in plane.qScaleCodes {
-                guard codes.count == 16 else {
-                    throw PyrowaveError.invalidBitstream("expected sixteen 8x8 quant scale codes")
+            let outputByteCount = plane.descriptorCount * maxPacketBytes
+            let outputSizeByteCount = plane.descriptorCount * MemoryLayout<UInt32>.stride
+            let descriptorByteLength = plane.descriptorCount * MemoryLayout<MetalSparsePacketEncodeDescriptor>.stride
+            let descriptorBuffer: MTLBuffer
+            if let cachedDescriptorBuffer = plane.descriptorBuffer {
+                guard cachedDescriptorBuffer.length >= descriptorByteLength else {
+                    throw PyrowaveError.invalidDimensions
                 }
-                flatQScaleCodes.append(contentsOf: codes)
+                descriptorBuffer = cachedDescriptorBuffer
+            } else {
+                guard let descriptors = plane.descriptors, descriptors.count == plane.descriptorCount else {
+                    throw PyrowaveError.invalidDimensions
+                }
+                descriptorBuffer = try reusableSharedBuffer(bytes: descriptors, purpose: .sparsePacketDescriptor, planeIndex: planeIndex)
             }
-
-            let outputByteCount = plane.descriptors.count * maxPacketBytes
-            let outputSizeByteCount = plane.descriptors.count * MemoryLayout<UInt32>.stride
-            let descriptorBuffer = try reusableSharedBuffer(bytes: plane.descriptors, purpose: .sparsePacketDescriptor, planeIndex: planeIndex)
-            let qScaleBuffer = try reusableSharedBuffer(bytes: flatQScaleCodes, purpose: .sparsePacketQScale, planeIndex: planeIndex)
-            let sizeBuffer = try reusableSharedBuffer(byteLength: outputSizeByteCount, purpose: .sparsePacketSize, planeIndex: planeIndex)
-            guard let outputBuffer = device.makeBuffer(length: outputByteCount, options: .storageModeShared) else {
-                throw PyrowaveError.processFailed("failed to allocate Metal sparse packet encode output")
+            let sizeBuffer: MTLBuffer
+            if reusesOutputBuffers {
+                sizeBuffer = try reusableSharedBuffer(byteLength: outputSizeByteCount, purpose: .sparsePacketSize, planeIndex: planeIndex)
+            } else {
+                guard let allocated = device.makeBuffer(length: max(outputSizeByteCount, 1), options: .storageModeShared) else {
+                    throw PyrowaveError.processFailed("failed to allocate Metal sparse packet size output")
+                }
+                sizeBuffer = allocated
             }
+            let outputBuffer: MTLBuffer
+            if reusesOutputBuffers {
+                outputBuffer = outputStorageMode == .private
+                    ? try reusablePrivateBuffer(byteLength: outputByteCount, purpose: .sparsePacketOutput, planeIndex: planeIndex)
+                    : try reusableSharedBuffer(byteLength: outputByteCount, purpose: .sparsePacketOutput, planeIndex: planeIndex)
+            } else {
+                let outputOptions: MTLResourceOptions = outputStorageMode == .private ? .storageModePrivate : .storageModeShared
+                guard let allocated = device.makeBuffer(length: max(outputByteCount, 1), options: outputOptions) else {
+                    throw PyrowaveError.processFailed("failed to allocate Metal sparse packet encode output")
+                }
+                outputBuffer = allocated
+            }
+            results[planeIndex] = MetalSparsePacketEncodedPlane(
+                outputBuffer: outputBuffer,
+                sizeBuffer: sizeBuffer,
+                descriptorCount: plane.descriptorCount,
+                maxPacketBytes: maxPacketBytes
+            )
             work.append((
                 planeIndex: planeIndex,
                 coefficientBuffer: plane.coefficientBuffer,
                 descriptorBuffer: descriptorBuffer,
-                qScaleBuffer: qScaleBuffer,
+                qScaleBuffer: plane.qScaleBuffer,
                 outputBuffer: outputBuffer,
                 sizeBuffer: sizeBuffer,
-                descriptorCount: plane.descriptors.count
+                descriptorCount: plane.descriptorCount
             ))
         }
 
@@ -1433,24 +1871,39 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("failed to create Metal sparse packet encode command encoder")
         }
 
-        encoder.setComputePipelineState(sparsePacketEncodePipeline)
-        let width = min(sparsePacketEncodePipeline.maxTotalThreadsPerThreadgroup, 256)
-        let threadsPerThreadgroup = MTLSize(width: width, height: 1, depth: 1)
+        let threadgroupDescriptorLimit = 4_096
+        let serialWidth = min(sparsePacketEncodeSerialPipeline.maxTotalThreadsPerThreadgroup, 256)
+        let serialThreads = MTLSize(width: serialWidth, height: 1, depth: 1)
+        let threadgroupWidth = 128
+        guard sparsePacketEncodeThreadgroupPipeline.maxTotalThreadsPerThreadgroup >= threadgroupWidth else {
+            throw PyrowaveError.processFailed("Metal sparse packet threadgroup encoder requires 128 threads per threadgroup")
+        }
+        let threadgroupThreads = MTLSize(width: threadgroupWidth, height: 1, depth: 1)
         for item in work {
             var constants = SparsePacketEncodeConstants(
                 descriptorCount: UInt32(item.descriptorCount),
-                maxPacketBytes: UInt32(maxPacketBytes)
+                maxPacketBytes: UInt32(maxPacketBytes),
+                sequence: UInt32(sequence)
             )
+            let useThreadgroupEncoder = item.descriptorCount <= threadgroupDescriptorLimit
+            encoder.setComputePipelineState(useThreadgroupEncoder ? sparsePacketEncodeThreadgroupPipeline : sparsePacketEncodeSerialPipeline)
             encoder.setBuffer(item.coefficientBuffer, offset: 0, index: 0)
             encoder.setBuffer(item.descriptorBuffer, offset: 0, index: 1)
             encoder.setBuffer(item.qScaleBuffer, offset: 0, index: 2)
             encoder.setBuffer(item.outputBuffer, offset: 0, index: 3)
             encoder.setBuffer(item.sizeBuffer, offset: 0, index: 4)
             encoder.setBytes(&constants, length: MemoryLayout<SparsePacketEncodeConstants>.stride, index: 5)
-            encoder.dispatchThreads(
-                MTLSize(width: item.descriptorCount, height: 1, depth: 1),
-                threadsPerThreadgroup: threadsPerThreadgroup
-            )
+            if useThreadgroupEncoder {
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: item.descriptorCount, height: 1, depth: 1),
+                    threadsPerThreadgroup: threadgroupThreads
+                )
+            } else {
+                encoder.dispatchThreads(
+                    MTLSize(width: item.descriptorCount, height: 1, depth: 1),
+                    threadsPerThreadgroup: serialThreads
+                )
+            }
         }
         encoder.endEncoding()
         commandBuffer.commit()
@@ -1460,27 +1913,35 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("Metal sparse packet encode command failed: \(error)")
         }
 
-        for item in work {
-            let outputByteCount = item.descriptorCount * maxPacketBytes
-            let bytesPointer = item.outputBuffer.contents().bindMemory(to: UInt8.self, capacity: outputByteCount)
-            let sizePointer = item.sizeBuffer.contents().bindMemory(to: UInt32.self, capacity: item.descriptorCount)
-            let retainedOutputBuffer = item.outputBuffer
-            results[item.planeIndex] = (0..<item.descriptorCount).map { index in
-                let size = Int(sizePointer[index])
-                guard size > 0 else {
-                    return nil
-                }
-                guard size <= maxPacketBytes else {
-                    return nil
-                }
-                let start = index * maxPacketBytes
-                let packetPointer = UnsafeMutableRawPointer(bytesPointer.advanced(by: start))
-                return Data(bytesNoCopy: packetPointer, count: size, deallocator: .custom { _, _ in
-                    _ = retainedOutputBuffer
-                })
-            }
-        }
         return results
+    }
+
+    func sharedReadbackBuffer(from source: MTLBuffer, byteLength: Int) throws -> MTLBuffer {
+        guard byteLength >= 0, byteLength <= source.length else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard source.storageMode != .shared else {
+            return source
+        }
+        guard let readback = device.makeBuffer(length: max(byteLength, 1), options: .storageModeShared),
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal readback buffer")
+        }
+        if byteLength > 0 {
+            blitEncoder.copy(from: source, sourceOffset: 0, to: readback, destinationOffset: 0, size: byteLength)
+        }
+        blitEncoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal buffer readback failed: \(error.localizedDescription)")
+        }
+        return readback
+    }
+
+    private func emptySparsePacketOutputBuffer() -> MTLBuffer {
+        device.makeBuffer(length: 1, options: .storageModeShared)!
     }
 
     func rateControlBucketIndices(
@@ -2029,6 +2490,109 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         return Array(UnsafeBufferPointer(start: pointer, count: cumulativeSavings.count)).map(Int.init)
     }
 
+    func rateControlSelectedQuantLevels(
+        bucketIndices: [[Int]],
+        packetByteCosts: [[Int]],
+        cumulativeSavings: [Int],
+        requiredSavings: Int
+    ) throws -> [Int] {
+        guard bucketIndices.count == packetByteCosts.count else {
+            throw PyrowaveError.processFailed("rate-control bucket and packet-cost counts differ")
+        }
+        guard cumulativeSavings.count == 128 else {
+            throw PyrowaveError.processFailed("rate-control quant-level selection expects 128 cumulative buckets")
+        }
+        guard requiredSavings >= 0, requiredSavings <= Int(UInt32.max) else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard !bucketIndices.isEmpty else {
+            return []
+        }
+        guard bucketIndices.count <= Int(UInt32.max) else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        var flatBuckets = [UInt32]()
+        var flatPacketByteCosts = [UInt32]()
+        flatBuckets.reserveCapacity(bucketIndices.count * PyrowaveBlockStats.candidateCount)
+        flatPacketByteCosts.reserveCapacity(packetByteCosts.count * PyrowaveBlockStats.candidateCount)
+        for index in bucketIndices.indices {
+            guard bucketIndices[index].count == PyrowaveBlockStats.candidateCount,
+                  packetByteCosts[index].count == PyrowaveBlockStats.candidateCount else {
+                throw PyrowaveError.processFailed("rate-control quant-level input must contain \(PyrowaveBlockStats.candidateCount) candidates per block")
+            }
+            for bucket in bucketIndices[index] {
+                guard bucket >= 0, bucket < 128 else {
+                    throw PyrowaveError.invalidDimensions
+                }
+                flatBuckets.append(UInt32(bucket))
+            }
+            for cost in packetByteCosts[index] {
+                guard cost >= 0, cost <= Int(UInt32.max) else {
+                    throw PyrowaveError.invalidDimensions
+                }
+                flatPacketByteCosts.append(UInt32(cost))
+            }
+        }
+
+        let flatCumulativeSavings = try cumulativeSavings.map { saving -> UInt32 in
+            guard saving >= 0, saving <= Int(UInt32.max) else {
+                throw PyrowaveError.invalidDimensions
+            }
+            return UInt32(saving)
+        }
+        let initialQuantLevels = Array(repeating: UInt32(0), count: bucketIndices.count)
+        guard let cumulativeSavingsBuffer = device.makeBuffer(
+            bytes: flatCumulativeSavings,
+            length: flatCumulativeSavings.count * MemoryLayout<UInt32>.stride,
+            options: .storageModeShared
+        ),
+              let bucketBuffer = device.makeBuffer(
+                bytes: flatBuckets,
+                length: flatBuckets.count * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+              ),
+              let packetByteCostBuffer = device.makeBuffer(
+                bytes: flatPacketByteCosts,
+                length: flatPacketByteCosts.count * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+              ),
+              let quantLevelBuffer = device.makeBuffer(
+                bytes: initialQuantLevels,
+                length: initialQuantLevels.count * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+              ),
+              let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to allocate Metal rate-control quant-level buffers")
+        }
+
+        var constants = RateControlQuantLevelConstants(
+            blockCount: UInt32(bucketIndices.count),
+            requiredSavings: UInt32(requiredSavings)
+        )
+        encoder.setComputePipelineState(rateControlQuantLevelPipeline)
+        encoder.setBuffer(cumulativeSavingsBuffer, offset: 0, index: 0)
+        encoder.setBuffer(bucketBuffer, offset: 0, index: 1)
+        encoder.setBuffer(packetByteCostBuffer, offset: 0, index: 2)
+        encoder.setBuffer(quantLevelBuffer, offset: 0, index: 3)
+        encoder.setBytes(&constants, length: MemoryLayout<RateControlQuantLevelConstants>.stride, index: 4)
+        encoder.dispatchThreads(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal rate-control quant-level command failed: \(error)")
+        }
+
+        let pointer = quantLevelBuffer.contents().bindMemory(to: UInt32.self, capacity: initialQuantLevels.count)
+        return Array(UnsafeBufferPointer(start: pointer, count: initialQuantLevels.count)).map(Int.init)
+    }
+
     func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
         try validateWaveletInput(samples, width: width, height: height, levels: levels)
         guard !samples.isEmpty else { return [] }
@@ -2042,11 +2606,24 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         return Array(UnsafeBufferPointer(start: pointer, count: samples.count))
     }
 
-    func forwardWaveletBuffer(_ buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int) throws -> MTLBuffer {
-        return try forwardWaveletBuffers([(buffer: buffer, sampleCount: sampleCount, width: width, height: height, levels: levels)])[0]
+    func forwardWaveletBuffer(
+        _ buffer: MTLBuffer,
+        sampleCount: Int,
+        width: Int,
+        height: Int,
+        levels: Int,
+        useTiledLevelZero: Bool = true
+    ) throws -> MTLBuffer {
+        return try forwardWaveletBuffers(
+            [(buffer: buffer, sampleCount: sampleCount, width: width, height: height, levels: levels)],
+            useTiledLevelZero: useTiledLevelZero
+        )[0]
     }
 
-    func forwardWaveletBuffers(_ planes: [(buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int)]) throws -> [MTLBuffer] {
+    func forwardWaveletBuffers(
+        _ planes: [(buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int)],
+        useTiledLevelZero: Bool = true
+    ) throws -> [MTLBuffer] {
         guard !planes.isEmpty else {
             return []
         }
@@ -2083,6 +2660,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             active.reserveCapacity(planes.count)
             for (planeIndex, plane) in planes.enumerated() where plane.sampleCount > 0 && level < plane.levels {
                 active.append(DWTBatchDispatch(
+                    planeIndex: planeIndex,
                     primary: plane.buffer,
                     scratch: scratchBuffers[planeIndex],
                     activeWidth: plane.width >> level,
@@ -2092,6 +2670,28 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             }
             guard !active.isEmpty else {
                 continue
+            }
+
+            if useTiledLevelZero && level == 0 {
+                let tiled = active.filter { canUseTiledLevelZero(activeWidth: $0.activeWidth, activeHeight: $0.activeHeight) }
+                if !tiled.isEmpty {
+                    try encodeDWTTiledLevelZeroBatch(
+                        commandBuffer: commandBuffer,
+                        dispatches: tiled.map {
+                            (input: $0.primary, output: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride)
+                        }
+                    )
+                    try encodeDWTBufferCopies(
+                        commandBuffer: commandBuffer,
+                        copies: tiled.map {
+                            (input: $0.scratch, output: $0.primary, byteLength: $0.stride * $0.activeHeight * MemoryLayout<Float>.stride)
+                        }
+                    )
+                    active.removeAll { canUseTiledLevelZero(activeWidth: $0.activeWidth, activeHeight: $0.activeHeight) }
+                    guard !active.isEmpty else {
+                        continue
+                    }
+                }
             }
 
             for phase in 0...4 {
@@ -2141,12 +2741,19 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         guard let primary = device.makeBuffer(bytes: coefficients, length: byteLength, options: .storageModeShared) else {
             throw PyrowaveError.processFailed("failed to allocate Metal iDWT input buffer")
         }
-        let output = try inverseWaveletBuffer(primary, sampleCount: coefficients.count, width: width, height: height, levels: levels)
+        let output = try inverseWaveletBuffer(primary, sampleCount: coefficients.count, width: width, height: height, levels: levels, useTiledLevelZero: false)
         let pointer = output.contents().bindMemory(to: Float.self, capacity: coefficients.count)
         return Array(UnsafeBufferPointer(start: pointer, count: coefficients.count))
     }
 
-    func inverseWaveletBuffer(_ buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int) throws -> MTLBuffer {
+    func inverseWaveletBuffer(
+        _ buffer: MTLBuffer,
+        sampleCount: Int,
+        width: Int,
+        height: Int,
+        levels: Int,
+        useTiledLevelZero: Bool = false
+    ) throws -> MTLBuffer {
         guard sampleCount == width * height,
               buffer.length >= sampleCount * MemoryLayout<Float>.stride else {
             throw PyrowaveError.invalidDimensions
@@ -2154,10 +2761,33 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         try validateWaveletShape(width: width, height: height, levels: levels)
         guard sampleCount > 0 else { return buffer }
 
-        return try inverseWaveletBuffers([(buffer: buffer, sampleCount: sampleCount, width: width, height: height, levels: levels)])[0]
+        return try inverseWaveletBuffers(
+            [(buffer: buffer, sampleCount: sampleCount, width: width, height: height, levels: levels)],
+            useTiledLevelZero: useTiledLevelZero
+        )[0]
     }
 
-    func inverseWaveletBuffers(_ planes: [(buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int)]) throws -> [MTLBuffer] {
+    func inverseWaveletBuffers(
+        _ planes: [(buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int)],
+        useTiledLevelZero: Bool = false
+    ) throws -> [MTLBuffer] {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw PyrowaveError.processFailed("failed to create Metal iDWT command buffer")
+        }
+        let outputs = try encodeInverseWaveletBuffers(
+            commandBuffer: commandBuffer,
+            planes,
+            useTiledLevelZero: useTiledLevelZero
+        )
+        try finish(commandBuffer: commandBuffer, context: "Metal iDWT")
+        return outputs
+    }
+
+    private func encodeInverseWaveletBuffers(
+        commandBuffer: MTLCommandBuffer,
+        _ planes: [(buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int)],
+        useTiledLevelZero: Bool
+    ) throws -> [MTLBuffer] {
         guard !planes.isEmpty else {
             return []
         }
@@ -2171,7 +2801,10 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
 
         var scratchBuffers = [MTLBuffer]()
         scratchBuffers.reserveCapacity(planes.count)
+        var currentBuffers = [MTLBuffer]()
+        currentBuffers.reserveCapacity(planes.count)
         for (planeIndex, plane) in planes.enumerated() {
+            currentBuffers.append(plane.buffer)
             guard plane.sampleCount > 0 else {
                 scratchBuffers.append(plane.buffer)
                 continue
@@ -2184,13 +2817,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             scratchBuffers.append(scratch)
         }
 
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-            throw PyrowaveError.processFailed("failed to create Metal iDWT command buffer")
-        }
-
         let maxLevels = planes.map(\.levels).max() ?? 0
         guard maxLevels > 0 else {
-            try finish(commandBuffer: commandBuffer, context: "Metal iDWT")
             return planes.map(\.buffer)
         }
         let useScaledUnpack = shouldFoldInverseWaveletScaleIntoUnpack(planes)
@@ -2199,7 +2827,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             active.reserveCapacity(planes.count)
             for (planeIndex, plane) in planes.enumerated() where plane.sampleCount > 0 && level < plane.levels {
                 active.append(DWTBatchDispatch(
-                    primary: plane.buffer,
+                    planeIndex: planeIndex,
+                    primary: currentBuffers[planeIndex],
                     scratch: scratchBuffers[planeIndex],
                     activeWidth: plane.width >> level,
                     activeHeight: plane.height >> level,
@@ -2208,6 +2837,25 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             }
             guard !active.isEmpty else {
                 continue
+            }
+
+            if useTiledLevelZero && level == 0 {
+                let tiled = active.filter { canUseTiledLevelZero(activeWidth: $0.activeWidth, activeHeight: $0.activeHeight) }
+                if !tiled.isEmpty {
+                    try encodeIDWTTiledLevelZeroBatch(
+                        commandBuffer: commandBuffer,
+                        dispatches: tiled.map {
+                            (input: $0.primary, output: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride)
+                        }
+                    )
+                    for dispatch in tiled {
+                        currentBuffers[dispatch.planeIndex] = dispatch.scratch
+                    }
+                    active.removeAll { canUseTiledLevelZero(activeWidth: $0.activeWidth, activeHeight: $0.activeHeight) }
+                    guard !active.isEmpty else {
+                        continue
+                    }
+                }
             }
 
             try encodeDWTCopyBatch(
@@ -2245,8 +2893,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             }
         }
 
-        try finish(commandBuffer: commandBuffer, context: "Metal iDWT")
-        return planes.map(\.buffer)
+        return currentBuffers
     }
 
     private func shouldFoldInverseWaveletScaleIntoUnpack(
@@ -2461,6 +3108,94 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         encoder.endEncoding()
     }
 
+    private func canUseTiledLevelZero(activeWidth: Int, activeHeight: Int) -> Bool {
+        activeWidth >= 32 && activeHeight >= 32 && activeWidth.isMultiple(of: 32) && activeHeight.isMultiple(of: 32)
+    }
+
+    private func encodeDWTTiledLevelZeroBatch(
+        commandBuffer: MTLCommandBuffer,
+        dispatches: [(input: MTLBuffer, output: MTLBuffer, activeWidth: Int, activeHeight: Int, stride: Int)]
+    ) throws {
+        guard !dispatches.isEmpty else {
+            return
+        }
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal tiled DWT command encoder")
+        }
+
+        encoder.setComputePipelineState(dwtTiledLevel0Pipeline)
+        let threadsPerThreadgroup = MTLSize(width: 64, height: 1, depth: 1)
+        for dispatch in dispatches {
+            var constants = DWTConstants(
+                activeWidth: UInt32(dispatch.activeWidth),
+                activeHeight: UInt32(dispatch.activeHeight),
+                stride: UInt32(dispatch.stride),
+                phase: 0
+            )
+            encoder.setBuffer(dispatch.input, offset: 0, index: 0)
+            encoder.setBuffer(dispatch.output, offset: 0, index: 1)
+            encoder.setBytes(&constants, length: MemoryLayout<DWTConstants>.stride, index: 2)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: dispatch.activeWidth / 32, height: dispatch.activeHeight / 32, depth: 1),
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
+        encoder.endEncoding()
+    }
+
+    private func encodeIDWTTiledLevelZeroBatch(
+        commandBuffer: MTLCommandBuffer,
+        dispatches: [(input: MTLBuffer, output: MTLBuffer, activeWidth: Int, activeHeight: Int, stride: Int)]
+    ) throws {
+        guard !dispatches.isEmpty else {
+            return
+        }
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal tiled iDWT command encoder")
+        }
+
+        encoder.setComputePipelineState(idwtTiledLevel0Pipeline)
+        let threadsPerThreadgroup = MTLSize(width: 64, height: 1, depth: 1)
+        for dispatch in dispatches {
+            var constants = DWTConstants(
+                activeWidth: UInt32(dispatch.activeWidth),
+                activeHeight: UInt32(dispatch.activeHeight),
+                stride: UInt32(dispatch.stride),
+                phase: 0
+            )
+            encoder.setBuffer(dispatch.input, offset: 0, index: 0)
+            encoder.setBuffer(dispatch.output, offset: 0, index: 1)
+            encoder.setBytes(&constants, length: MemoryLayout<DWTConstants>.stride, index: 2)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: dispatch.activeWidth / 32, height: dispatch.activeHeight / 32, depth: 1),
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
+        encoder.endEncoding()
+    }
+
+    private func encodeDWTBufferCopies(
+        commandBuffer: MTLCommandBuffer,
+        copies: [(input: MTLBuffer, output: MTLBuffer, byteLength: Int)]
+    ) throws {
+        guard !copies.isEmpty else {
+            return
+        }
+        guard let encoder = commandBuffer.makeBlitCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal DWT copy encoder")
+        }
+        for copy in copies {
+            encoder.copy(
+                from: copy.input,
+                sourceOffset: 0,
+                to: copy.output,
+                destinationOffset: 0,
+                size: copy.byteLength
+            )
+        }
+        encoder.endEncoding()
+    }
+
     private func dispatchDWT(
         pipeline: MTLComputePipelineState,
         activeWidth: Int,
@@ -2567,6 +3302,8 @@ struct MetalPlaneQuantizationBufferResult {
     var coefficientBuffer: MTLBuffer
     var coefficientCount: Int
     var qScaleCodesByDescriptor: [[UInt8]]
+    var qScaleBuffer: MTLBuffer?
+    var qScaleDescriptorCount: Int
 }
 
 struct MetalSparseCoefficientEntry {
@@ -2625,6 +3362,13 @@ struct MetalPacketByteCostDescriptor {
     var stride: UInt32
 }
 
+struct MetalSparsePacketEncodedPlane {
+    var outputBuffer: MTLBuffer
+    var sizeBuffer: MTLBuffer
+    var descriptorCount: Int
+    var maxPacketBytes: Int
+}
+
 struct MetalSparsePacketEncodeDescriptor {
     var originX: UInt32
     var originY: UInt32
@@ -2633,7 +3377,6 @@ struct MetalSparsePacketEncodeDescriptor {
     var stride: UInt32
     var blockIndex: UInt32
     var quantLevel: UInt32
-    var sequence: UInt32
     var quantCode: UInt32
 }
 
@@ -2683,9 +3426,11 @@ private struct PacketByteCostConstants {
 private struct SparsePacketEncodeConstants {
     var descriptorCount: UInt32
     var maxPacketBytes: UInt32
+    var sequence: UInt32
 }
 
 private struct DWTBatchDispatch {
+    var planeIndex: Int
     var primary: MTLBuffer
     var scratch: MTLBuffer
     var activeWidth: Int
@@ -2699,6 +3444,11 @@ private struct RateControlBucketConstants {
 
 private struct RateControlBucketSavingsConstants {
     var blockCount: UInt32
+}
+
+private struct RateControlQuantLevelConstants {
+    var blockCount: UInt32
+    var requiredSavings: UInt32
 }
 
 private struct DWTConstants {

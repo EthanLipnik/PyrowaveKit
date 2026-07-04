@@ -124,11 +124,36 @@ extension YUVFrame {
 }
 
 extension PyrowaveCodec {
+    public func encodeGPUFrame(
+        _ cvPixelBuffer: CVPixelBuffer,
+        configuration: CodecConfiguration = CodecConfiguration(),
+        videoSignal: VideoSignalMetadata? = nil
+    ) throws -> PyrowaveGPUFrame {
+        let textures = try makeNV12MetalTexturesAndSignal(from: cvPixelBuffer, videoSignal: videoSignal)
+        return try encodeGPUFrame(
+            yTexture: textures.yTexture,
+            cbCrTexture: textures.cbCrTexture,
+            configuration: configuration,
+            videoSignal: textures.videoSignal
+        )
+    }
+
     public func encode(
         _ cvPixelBuffer: CVPixelBuffer,
         configuration: CodecConfiguration = CodecConfiguration(),
         videoSignal: VideoSignalMetadata? = nil
     ) throws -> EncodedFrame {
+        try exportGPUFrame(try encodeGPUFrame(
+            cvPixelBuffer,
+            configuration: configuration,
+            videoSignal: videoSignal
+        ))
+    }
+
+    private func makeNV12MetalTexturesAndSignal(
+        from cvPixelBuffer: CVPixelBuffer,
+        videoSignal: VideoSignalMetadata?
+    ) throws -> (yTexture: MTLTexture, cbCrTexture: MTLTexture, videoSignal: VideoSignalMetadata, yReference: CVMetalTexture, cbCrReference: CVMetalTexture) {
         let pixelFormat = CVPixelBufferGetPixelFormatType(cvPixelBuffer)
         let supportedFormats: Set<OSType> = [
             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
@@ -167,11 +192,12 @@ extension PyrowaveCodec {
         let inferredSignal = VideoSignalMetadata(
             yCbCrRange: pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ? .limited : .full
         )
-        return try encode(
+        return (
             yTexture: yTexture.texture,
             cbCrTexture: cbCrTexture.texture,
-            configuration: configuration,
-            videoSignal: videoSignal ?? inferredSignal
+            videoSignal: videoSignal ?? inferredSignal,
+            yReference: yTexture.reference,
+            cbCrReference: cbCrTexture.reference
         )
     }
 
@@ -206,12 +232,17 @@ extension PyrowaveCodec {
         _ frame: EncodedFrame,
         pixelFormat: OSType? = nil
     ) throws -> CVPixelBuffer {
-        var reader = BinaryReader(frame.data)
-        let sequence = try PyrowaveSequenceHeader(reader: &reader)
-        guard sequence.chroma == .yuv420 else {
+        try decodeGPUFrameToCVPixelBuffer(try importGPUFrame(frame), pixelFormat: pixelFormat)
+    }
+
+    public func decodeGPUFrameToCVPixelBuffer(
+        _ frame: PyrowaveGPUFrame,
+        pixelFormat: OSType? = nil
+    ) throws -> CVPixelBuffer {
+        guard frame.chroma == .yuv420 else {
             throw PyrowaveError.unsupportedFormat("CVPixelBuffer decode expects yuv420 frames")
         }
-        let format = pixelFormat ?? YUVFrame.cvPixelFormat(for: sequence.videoSignal)
+        let format = pixelFormat ?? YUVFrame.cvPixelFormat(for: frame.videoSignal)
         let supportedFormats: Set<OSType> = [
             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
@@ -227,8 +258,8 @@ extension PyrowaveCodec {
         ] as CFDictionary
         let status = CVPixelBufferCreate(
             nil,
-            sequence.width,
-            sequence.height,
+            frame.width,
+            frame.height,
             format,
             attributes,
             &pixelBuffer
@@ -237,21 +268,47 @@ extension PyrowaveCodec {
             throw PyrowaveError.processFailed("failed to allocate decode CVPixelBuffer")
         }
 
+        try decodeGPUFrame(frame, to: pixelBuffer)
+        return pixelBuffer
+    }
+
+    public func decodeGPUFrame(
+        _ frame: PyrowaveGPUFrame,
+        to cvPixelBuffer: CVPixelBuffer
+    ) throws {
+        let pixelFormat = CVPixelBufferGetPixelFormatType(cvPixelBuffer)
+        let supportedFormats: Set<OSType> = [
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        ]
+        guard frame.chroma == .yuv420,
+              supportedFormats.contains(pixelFormat),
+              CVPixelBufferGetPlaneCount(cvPixelBuffer) >= 2,
+              CVPixelBufferGetWidthOfPlane(cvPixelBuffer, 0) == frame.width,
+              CVPixelBufferGetHeightOfPlane(cvPixelBuffer, 0) == frame.height,
+              CVPixelBufferGetWidthOfPlane(cvPixelBuffer, 1) == frame.width / 2,
+              CVPixelBufferGetHeightOfPlane(cvPixelBuffer, 1) == frame.height / 2 else {
+            throw PyrowaveError.invalidDimensions
+        }
+
         let yTexture = try makeMetalTexture(
-            from: pixelBuffer,
+            from: cvPixelBuffer,
             pixelFormat: .r8Unorm,
-            width: sequence.width,
-            height: sequence.height,
+            width: frame.width,
+            height: frame.height,
             planeIndex: 0
         )
         let cbCrTexture = try makeMetalTexture(
-            from: pixelBuffer,
+            from: cvPixelBuffer,
             pixelFormat: .rg8Unorm,
-            width: sequence.width / 2,
-            height: sequence.height / 2,
+            width: frame.width / 2,
+            height: frame.height / 2,
             planeIndex: 1
         )
-        try decodeToNV12Textures(frame, yTexture: yTexture.texture, cbCrTexture: cbCrTexture.texture)
-        return pixelBuffer
+        try decodeGPUFrameToNV12Textures(
+            frame,
+            yTexture: yTexture.texture,
+            cbCrTexture: cbCrTexture.texture
+        )
     }
 }

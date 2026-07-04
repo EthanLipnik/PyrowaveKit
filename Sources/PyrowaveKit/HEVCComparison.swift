@@ -39,6 +39,9 @@ public struct CodecBenchmarkResult: Codable, Equatable, Sendable {
 
 public struct CodecBenchmarkComparison: Codable, Equatable, Sendable {
     public var pyrowaveToHEVCByteRatio: Double?
+    public var pyrowaveBytesPerFrame: Double
+    public var hevcBytesPerFrame: Double
+    public var pyrowaveToHEVCBytesPerFrameRatio: Double?
     public var pyrowaveEncodeSpeedupOverHEVC: Double?
     public var pyrowaveDecodeSpeedupOverHEVC: Double?
     public var weightedPSNRDelta: Double?
@@ -46,6 +49,9 @@ public struct CodecBenchmarkComparison: Codable, Equatable, Sendable {
 
     public init(pyrowave: CodecBenchmarkResult, hevc: CodecBenchmarkResult) {
         pyrowaveToHEVCByteRatio = Self.ratio(Double(pyrowave.encodedBytes), Double(hevc.encodedBytes))
+        pyrowaveBytesPerFrame = pyrowave.encodedBytesPerFrame
+        hevcBytesPerFrame = hevc.encodedBytesPerFrame
+        pyrowaveToHEVCBytesPerFrameRatio = Self.ratio(pyrowave.encodedBytesPerFrame, hevc.encodedBytesPerFrame)
         pyrowaveEncodeSpeedupOverHEVC = Self.ratio(hevc.encodeSeconds, pyrowave.encodeSeconds)
         pyrowaveDecodeSpeedupOverHEVC = Self.ratio(hevc.decodeSeconds, pyrowave.decodeSeconds)
         if let pyrowavePSNR = pyrowave.metrics?.weightedPSNR,
@@ -54,7 +60,7 @@ public struct CodecBenchmarkComparison: Codable, Equatable, Sendable {
         } else {
             weightedPSNRDelta = nil
         }
-        note = "Ratios above 1.0 mean Pyrowave used more bytes or was faster than HEVC; weightedPSNRDelta is Pyrowave minus HEVC in dB."
+        note = "Ratios above 1.0 mean Pyrowave used more bytes per frame or was faster than HEVC; weightedPSNRDelta is Pyrowave minus HEVC in dB."
     }
 
     private static func ratio(_ numerator: Double, _ denominator: Double) -> Double? {
@@ -66,13 +72,15 @@ public struct CodecBenchmarkComparison: Codable, Equatable, Sendable {
 }
 
 enum HEVCComparison {
-    private static let maximumQualityReferenceFrameRate = 60
-    static let avKitTimingNote = "Timed HEVC encode/decode stops at AVFoundation pixel-buffer append/read; planar conversion, PSNR, Y4M artifacts, and report writing are excluded."
+    static let defaultQuality = 0.8
+    static let maximumQuality = 0.8
+    static let avKitTimingNote = "Timed HEVC encode/decode stops at AVFoundation pixel-buffer append/read with AVVideoQualityKey 0.8; planar conversion, PSNR, Y4M artifacts, and report writing are excluded."
 
     static func runAVKitHEVCComparison(
         referenceFrames: [YUVFrame],
         workingDirectory: URL,
         bitrate: Int,
+        quality: Double = defaultQuality,
         frameRateNumerator: Int = 60,
         frameRateDenominator: Int = 1
     ) throws -> CodecBenchmarkResult {
@@ -80,6 +88,9 @@ enum HEVCComparison {
             throw PyrowaveError.truncatedInput
         }
         guard bitrate > 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard quality >= 0, quality <= Self.maximumQuality else {
             throw PyrowaveError.invalidDimensions
         }
         for frame in referenceFrames {
@@ -113,6 +124,7 @@ enum HEVCComparison {
             frameSize: (width: firstFrame.width, height: firstFrame.height),
             to: hevcURL,
             bitrate: bitrate,
+            quality: quality,
             frameDuration: frameDuration
         )
 
@@ -149,43 +161,6 @@ enum HEVCComparison {
         )
     }
 
-    static func matchedFrameByteBudget(
-        bitrate: Int,
-        frameRateNumerator: Int,
-        frameRateDenominator: Int
-    ) throws -> Int {
-        guard bitrate > 0 else {
-            throw PyrowaveError.invalidDimensions
-        }
-        let referenceFrameRate = try qualityReferenceFrameRate(
-            numerator: frameRateNumerator,
-            denominator: frameRateDenominator
-        )
-        let numerator = Int64(referenceFrameRate.numerator)
-        let denominator = Int64(referenceFrameRate.denominator)
-        let bitsPerFrameDenominator = Int64(8) * numerator
-        let multiplied = Int64(bitrate).multipliedReportingOverflow(by: denominator)
-        guard !multiplied.overflow, multiplied.partialValue > 0, bitsPerFrameDenominator > 0 else {
-            throw PyrowaveError.invalidDimensions
-        }
-        let bitsPerFrameNumerator = multiplied.partialValue
-        let roundedNumerator = bitsPerFrameNumerator.addingReportingOverflow(bitsPerFrameDenominator - 1)
-        guard !roundedNumerator.overflow else {
-            throw PyrowaveError.invalidDimensions
-        }
-        return max(1, Int(roundedNumerator.partialValue / bitsPerFrameDenominator))
-    }
-
-    static func qualityReferenceFrameRate(numerator: Int, denominator: Int) throws -> (numerator: Int, denominator: Int) {
-        guard numerator > 0, denominator > 0 else {
-            throw PyrowaveError.invalidDimensions
-        }
-        if numerator > maximumQualityReferenceFrameRate * denominator {
-            return (maximumQualityReferenceFrameRate, 1)
-        }
-        return (numerator, denominator)
-    }
-
     static func frameDuration(numerator: Int, denominator: Int) throws -> CMTime {
         guard numerator > 0, denominator > 0 else {
             throw PyrowaveError.invalidDimensions
@@ -198,6 +173,7 @@ enum HEVCComparison {
         frameSize: (width: Int, height: Int),
         to url: URL,
         bitrate: Int,
+        quality: Double,
         frameDuration: CMTime
     ) throws -> Double {
         guard !pixelBuffers.isEmpty else {
@@ -206,6 +182,7 @@ enum HEVCComparison {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let compressionProperties: [String: Any] = [
             AVVideoAverageBitRateKey: bitrate,
+            AVVideoQualityKey: quality,
             AVVideoExpectedSourceFrameRateKey: max(1, Int(round(Double(frameDuration.timescale) / Double(frameDuration.value))))
         ]
         let outputSettings: [String: Any] = [

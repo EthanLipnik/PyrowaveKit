@@ -92,16 +92,13 @@ public struct VideoSignalMetadata: Codable, Equatable, Sendable {
 public struct CodecConfiguration: Codable, Equatable, Sendable {
     public var decompositionLevels: Int
     public var quantizationStep: Float
-    public var maximumEncodedBytes: Int?
 
     public init(
         decompositionLevels: Int = 5,
-        quantizationStep: Float = 1.0 / 1024.0,
-        maximumEncodedBytes: Int? = nil
+        quantizationStep: Float = 1.0 / 1024.0
     ) {
         self.decompositionLevels = decompositionLevels
         self.quantizationStep = quantizationStep
-        self.maximumEncodedBytes = maximumEncodedBytes
     }
 }
 
