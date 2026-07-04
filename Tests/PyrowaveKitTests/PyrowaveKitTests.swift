@@ -382,6 +382,32 @@ import Testing
     #expect(PyrowaveBenchmarkArguments.usage.contains("--preset 6k|4k|1080p|720p"))
 }
 
+@Test func benchmarkInputMustProvideRequestedFrameCount() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("short.y4m")
+    let frame = try TestFrames.synthetic420(width: 64, height: 64)
+    try YUV4MPEGWriter.write(
+        frames: [frame],
+        to: url,
+        frameRateNumerator: 24000,
+        frameRateDenominator: 1001
+    )
+
+    let oneFrame = try PyrowaveBenchmarkRunner.loadFrames(
+        arguments: PyrowaveBenchmarkArguments(["--input", url.path, "--frames", "1"])
+    )
+    #expect(oneFrame.frames == [frame])
+    #expect(oneFrame.frameRateNumerator == 24000)
+    #expect(oneFrame.frameRateDenominator == 1001)
+
+    #expect(throws: PyrowaveError.truncatedInput) {
+        _ = try PyrowaveBenchmarkRunner.loadFrames(
+            arguments: PyrowaveBenchmarkArguments(["--input", url.path, "--frames", "2"])
+        )
+    }
+}
+
 @Test func benchmarkReportSchemaNamesReviewArtifacts() throws {
     let pyrowave = CodecBenchmarkResult(
         codec: "pyrowavekit-swift-metal-hybrid",

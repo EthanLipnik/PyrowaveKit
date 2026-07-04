@@ -217,6 +217,9 @@ public enum PyrowaveBenchmarkRunner {
             while frames.count < arguments.frames, let frame = try reader.readFrame() {
                 frames.append(frame)
             }
+            guard frames.count == arguments.frames else {
+                throw PyrowaveError.truncatedInput
+            }
             return try PyrowaveBenchmarkFrames(
                 frames: frames,
                 frameRateNumerator: reader.frameRateNumerator,
