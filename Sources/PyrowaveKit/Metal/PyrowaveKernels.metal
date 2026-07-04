@@ -923,6 +923,42 @@ kernel void pyrowave_dwt_unpack_columns(
     output[y * constants.stride + x] = input[packedY * constants.stride + x];
 }
 
+kernel void pyrowave_idwt_unpack_rows_scaled(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant DWTConstants &constants [[buffer(2)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    uint x = position.x;
+    uint y = position.y;
+    if (x >= constants.activeWidth || y >= constants.activeHeight) {
+        return;
+    }
+
+    uint lowCount = (constants.activeWidth + 1u) >> 1u;
+    uint packedX = ((x & 1u) == 0u) ? (x >> 1u) : (lowCount + (x >> 1u));
+    float scale = ((x & 1u) != 0u) ? dwtInvK : dwtK;
+    output[y * constants.stride + x] = input[y * constants.stride + packedX] * scale;
+}
+
+kernel void pyrowave_idwt_unpack_columns_scaled(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant DWTConstants &constants [[buffer(2)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    uint x = position.x;
+    uint y = position.y;
+    if (x >= constants.activeWidth || y >= constants.activeHeight) {
+        return;
+    }
+
+    uint lowCount = (constants.activeHeight + 1u) >> 1u;
+    uint packedY = ((y & 1u) == 0u) ? (y >> 1u) : (lowCount + (y >> 1u));
+    float scale = ((y & 1u) != 0u) ? dwtInvK : dwtK;
+    output[y * constants.stride + x] = input[packedY * constants.stride + x] * scale;
+}
+
 kernel void pyrowave_idwt_lift_rows(
     device float *samples [[buffer(0)]],
     constant DWTConstants &constants [[buffer(1)]],

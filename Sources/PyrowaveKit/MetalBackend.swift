@@ -26,6 +26,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     private let dwtPackColumnsPipeline: MTLComputePipelineState
     private let dwtUnpackRowsPipeline: MTLComputePipelineState
     private let dwtUnpackColumnsPipeline: MTLComputePipelineState
+    private let idwtUnpackRowsScaledPipeline: MTLComputePipelineState
+    private let idwtUnpackColumnsScaledPipeline: MTLComputePipelineState
     private let idwtLiftRowsPipeline: MTLComputePipelineState
     private let idwtLiftColumnsPipeline: MTLComputePipelineState
 
@@ -69,6 +71,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         dwtPackColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_pack_columns", library: library))
         dwtUnpackRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_unpack_rows", library: library))
         dwtUnpackColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_unpack_columns", library: library))
+        idwtUnpackRowsScaledPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_idwt_unpack_rows_scaled", library: library))
+        idwtUnpackColumnsScaledPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_idwt_unpack_columns_scaled", library: library))
         idwtLiftRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_idwt_lift_rows", library: library))
         idwtLiftColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_idwt_lift_columns", library: library))
     }
@@ -1643,6 +1647,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             try finish(commandBuffer: commandBuffer, context: "Metal iDWT")
             return planes.map(\.buffer)
         }
+        let useScaledUnpack = shouldFoldInverseWaveletScaleIntoUnpack(planes)
         for level in stride(from: maxLevels - 1, through: 0, by: -1) {
             var active = [DWTBatchDispatch]()
             active.reserveCapacity(planes.count)
@@ -1661,12 +1666,12 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
 
             try encodeDWTCopyBatch(
                 commandBuffer: commandBuffer,
-                pipeline: dwtUnpackColumnsPipeline,
+                pipeline: useScaledUnpack ? idwtUnpackColumnsScaledPipeline : dwtUnpackColumnsPipeline,
                 dispatches: active.map {
                     (input: $0.primary, output: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: 0)
                 }
             )
-            for phase in 0...4 {
+            for phase in (useScaledUnpack ? 1 : 0)...4 {
                 try encodeDWTInPlaceBatch(
                     commandBuffer: commandBuffer,
                     pipeline: idwtLiftColumnsPipeline,
@@ -1678,12 +1683,12 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
 
             try encodeDWTCopyBatch(
                 commandBuffer: commandBuffer,
-                pipeline: dwtUnpackRowsPipeline,
+                pipeline: useScaledUnpack ? idwtUnpackRowsScaledPipeline : dwtUnpackRowsPipeline,
                 dispatches: active.map {
                     (input: $0.scratch, output: $0.primary, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: 0)
                 }
             )
-            for phase in 0...4 {
+            for phase in (useScaledUnpack ? 1 : 0)...4 {
                 try encodeDWTInPlaceBatch(
                     commandBuffer: commandBuffer,
                     pipeline: idwtLiftRowsPipeline,
@@ -1696,6 +1701,13 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
 
         try finish(commandBuffer: commandBuffer, context: "Metal iDWT")
         return planes.map(\.buffer)
+    }
+
+    private func shouldFoldInverseWaveletScaleIntoUnpack(
+        _ planes: [(buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int)]
+    ) -> Bool {
+        let largestPlaneSamples = planes.map(\.sampleCount).max() ?? 0
+        return largestPlaneSamples >= 6144 * 3456
     }
 
     private static func makeFunction(named name: String, library: MTLLibrary) throws -> MTLFunction {
