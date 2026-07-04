@@ -647,6 +647,8 @@ public final class PyrowaveCodec: @unchecked Sendable {
         var levels: Int
         var quantCodesByBlockIndex: [Int: UInt8]
         var qScaleCodesByBlockIndex: [Int: [UInt8]]
+        var quantCodesByDescriptor: [UInt8]
+        var qScaleCodesByDescriptor: [[UInt8]]
         var coefficients: [Int16]
         var coefficientBuffer: MTLBuffer?
         var coefficientCount: Int
@@ -682,6 +684,13 @@ public final class PyrowaveCodec: @unchecked Sendable {
         var originY: Int
         var validWidth: Int
         var validHeight: Int
+    }
+
+    private struct PlaneQuantizationMetadata {
+        var quantCodesByBlockIndex: [Int: UInt8]
+        var qScaleCodesByBlockIndex: [Int: [UInt8]]
+        var quantCodesByDescriptor: [UInt8]
+        var qScaleCodesByDescriptor: [[UInt8]]
     }
 
     private struct DecodedPlane {
@@ -852,8 +861,10 @@ public final class PyrowaveCodec: @unchecked Sendable {
                 paddedWidth: geometries[index].paddedWidth,
                 paddedHeight: geometries[index].paddedHeight,
                 levels: levels[index],
-                quantCodesByBlockIndex: quantized.quantCodesByBlockIndex,
-                qScaleCodesByBlockIndex: quantized.qScaleCodesByBlockIndex,
+                quantCodesByBlockIndex: quantized.metadata.quantCodesByBlockIndex,
+                qScaleCodesByBlockIndex: quantized.metadata.qScaleCodesByBlockIndex,
+                quantCodesByDescriptor: quantized.metadata.quantCodesByDescriptor,
+                qScaleCodesByDescriptor: quantized.metadata.qScaleCodesByDescriptor,
                 coefficients: [],
                 coefficientBuffer: quantized.coefficientBuffer,
                 coefficientCount: quantized.coefficientCount
@@ -888,8 +899,10 @@ public final class PyrowaveCodec: @unchecked Sendable {
             paddedWidth: paddedWidth,
             paddedHeight: paddedHeight,
             levels: levels,
-            quantCodesByBlockIndex: quantized.quantCodesByBlockIndex,
-            qScaleCodesByBlockIndex: quantized.qScaleCodesByBlockIndex,
+            quantCodesByBlockIndex: quantized.metadata.quantCodesByBlockIndex,
+            qScaleCodesByBlockIndex: quantized.metadata.qScaleCodesByBlockIndex,
+            quantCodesByDescriptor: quantized.metadata.quantCodesByDescriptor,
+            qScaleCodesByDescriptor: quantized.metadata.qScaleCodesByDescriptor,
             coefficients: quantized.coefficients,
             coefficientBuffer: nil,
             coefficientCount: quantized.coefficients.count
@@ -923,8 +936,10 @@ public final class PyrowaveCodec: @unchecked Sendable {
             paddedWidth: paddedWidth,
             paddedHeight: paddedHeight,
             levels: levels,
-            quantCodesByBlockIndex: quantized.quantCodesByBlockIndex,
-            qScaleCodesByBlockIndex: quantized.qScaleCodesByBlockIndex,
+            quantCodesByBlockIndex: quantized.metadata.quantCodesByBlockIndex,
+            qScaleCodesByBlockIndex: quantized.metadata.qScaleCodesByBlockIndex,
+            quantCodesByDescriptor: quantized.metadata.quantCodesByDescriptor,
+            qScaleCodesByDescriptor: quantized.metadata.qScaleCodesByDescriptor,
             coefficients: [],
             coefficientBuffer: quantized.coefficientBuffer,
             coefficientCount: quantized.coefficientCount
@@ -1127,9 +1142,9 @@ public final class PyrowaveCodec: @unchecked Sendable {
                     blockIndex: UInt32(descriptor.blockIndex),
                     quantLevel: UInt32(quantLevel),
                     sequence: UInt32(sequence),
-                    quantCode: UInt32(try quantCode(for: descriptor, plane: plane))
+                    quantCode: UInt32(try quantCode(for: descriptor, descriptorIndex: descriptorIndex, plane: plane))
                 ))
-                packetQScaleCodes.append(try qScaleCodes(for: descriptor, plane: plane))
+                packetQScaleCodes.append(try qScaleCodes(for: descriptor, descriptorIndex: descriptorIndex, plane: plane))
                 blockIndices.append(descriptor.blockIndex)
             }
 
@@ -1197,9 +1212,9 @@ public final class PyrowaveCodec: @unchecked Sendable {
                 blockIndex: UInt32(descriptor.blockIndex),
                 quantLevel: UInt32(quantLevel),
                 sequence: UInt32(sequence),
-                quantCode: UInt32(try quantCode(for: descriptor, plane: plane))
+                quantCode: UInt32(try quantCode(for: descriptor, descriptorIndex: index, plane: plane))
             ))
-            packetQScaleCodes.append(try qScaleCodes(for: descriptor, plane: plane))
+            packetQScaleCodes.append(try qScaleCodes(for: descriptor, descriptorIndex: index, plane: plane))
             blockIndices.append(descriptor.blockIndex)
         }
 
@@ -1249,9 +1264,9 @@ public final class PyrowaveCodec: @unchecked Sendable {
         for (planeIndex, plane) in planes.enumerated() {
             var statsDescriptors = [MetalRateControlStatsDescriptor]()
             statsDescriptors.reserveCapacity(descriptorsByPlane[planeIndex].count * 16)
-            for descriptor in descriptorsByPlane[planeIndex] {
-                let quantCode = try quantCode(for: descriptor, plane: plane)
-                let qScaleCodes = try qScaleCodes(for: descriptor, plane: plane)
+            for (descriptorIndex, descriptor) in descriptorsByPlane[planeIndex].enumerated() {
+                let quantCode = try quantCode(for: descriptor, descriptorIndex: descriptorIndex, plane: plane)
+                let qScaleCodes = try qScaleCodes(for: descriptor, descriptorIndex: descriptorIndex, plane: plane)
                 let rdoDistortionScale = PyrowaveQuantization.rdoDistortionScale(
                     level: descriptor.globalLevel,
                     component: plane.component,
@@ -1340,9 +1355,9 @@ public final class PyrowaveCodec: @unchecked Sendable {
         var metalDescriptors = [MetalRateControlStatsDescriptor]()
         metalDescriptors.reserveCapacity(descriptors.count * 16)
 
-        for descriptor in descriptors {
-            let quantCode = try quantCode(for: descriptor, plane: plane)
-            let qScaleCodes = try qScaleCodes(for: descriptor, plane: plane)
+        for (descriptorIndex, descriptor) in descriptors.enumerated() {
+            let quantCode = try quantCode(for: descriptor, descriptorIndex: descriptorIndex, plane: plane)
+            let qScaleCodes = try qScaleCodes(for: descriptor, descriptorIndex: descriptorIndex, plane: plane)
             let rdoDistortionScale = PyrowaveQuantization.rdoDistortionScale(
                 level: descriptor.globalLevel,
                 component: plane.component,
@@ -1476,6 +1491,8 @@ public final class PyrowaveCodec: @unchecked Sendable {
             levels: levels,
             quantCodesByBlockIndex: [:],
             qScaleCodesByBlockIndex: [:],
+            quantCodesByDescriptor: [],
+            qScaleCodesByDescriptor: [],
             coefficients: [],
             coefficientBuffer: nil,
             coefficientCount: 0
@@ -1502,6 +1519,8 @@ public final class PyrowaveCodec: @unchecked Sendable {
             levels: levels,
             quantCodesByBlockIndex: [:],
             qScaleCodesByBlockIndex: [:],
+            quantCodesByDescriptor: [],
+            qScaleCodesByDescriptor: [],
             coefficients: [],
             coefficientBuffer: nil,
             coefficientCount: 0
@@ -1745,11 +1764,25 @@ public final class PyrowaveCodec: @unchecked Sendable {
         return quantCode
     }
 
+    private func quantCode(for descriptor: PlaneBlockDescriptor, descriptorIndex: Int, plane: EncodedPlane) throws -> UInt8 {
+        if descriptorIndex < plane.quantCodesByDescriptor.count {
+            return plane.quantCodesByDescriptor[descriptorIndex]
+        }
+        return try quantCode(for: descriptor, plane: plane)
+    }
+
     private func qScaleCodes(for descriptor: PlaneBlockDescriptor, plane: EncodedPlane) throws -> [UInt8] {
         guard let qScaleCodes = plane.qScaleCodesByBlockIndex[descriptor.blockIndex] else {
             throw PyrowaveError.processFailed("missing 8x8 quant scale codes for block \(descriptor.blockIndex)")
         }
         return qScaleCodes
+    }
+
+    private func qScaleCodes(for descriptor: PlaneBlockDescriptor, descriptorIndex: Int, plane: EncodedPlane) throws -> [UInt8] {
+        if descriptorIndex < plane.qScaleCodesByDescriptor.count {
+            return plane.qScaleCodesByDescriptor[descriptorIndex]
+        }
+        return try qScaleCodes(for: descriptor, plane: plane)
     }
 
     private func planeGeometry(component: Int, frameWidth: Int, frameHeight: Int, chroma: ChromaSubsampling, requestedLevels: Int) -> PlaneGeometry {
@@ -1806,7 +1839,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         descriptors: [PlaneBlockDescriptor],
         component: Int,
         configuration: CodecConfiguration
-    ) throws -> (coefficients: [Int16], quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]]) {
+    ) throws -> (coefficients: [Int16], metadata: PlaneQuantizationMetadata) {
         try quantizeWithMetal(
             samples,
             stride: stride,
@@ -1824,7 +1857,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         descriptors: [PlaneBlockDescriptor],
         component: Int,
         configuration: CodecConfiguration
-    ) throws -> (coefficients: [Int16], quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]]) {
+    ) throws -> (coefficients: [Int16], metadata: PlaneQuantizationMetadata) {
         try quantizeWithMetal(
             samples,
             sampleCount: sampleCount,
@@ -1843,7 +1876,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         descriptors: [PlaneBlockDescriptor],
         component: Int,
         configuration: CodecConfiguration
-    ) throws -> (coefficientBuffer: MTLBuffer, coefficientCount: Int, quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]]) {
+    ) throws -> (coefficientBuffer: MTLBuffer, coefficientCount: Int, metadata: PlaneQuantizationMetadata) {
         try quantizeWithMetalResident(
             samples,
             sampleCount: sampleCount,
@@ -1858,8 +1891,8 @@ public final class PyrowaveCodec: @unchecked Sendable {
     private func quantizeResidentBuffers(
         _ planes: [(samples: MTLBuffer, sampleCount: Int, stride: Int, descriptors: [PlaneBlockDescriptor], component: Int)],
         configuration: CodecConfiguration
-    ) throws -> [(coefficientBuffer: MTLBuffer, coefficientCount: Int, quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]])] {
-        var descriptorInputs = [(metalDescriptors: [MetalPlaneQuantizationDescriptor], quantCodes: [Int: UInt8])]()
+    ) throws -> [(coefficientBuffer: MTLBuffer, coefficientCount: Int, metadata: PlaneQuantizationMetadata)] {
+        var descriptorInputs = [(metalDescriptors: [MetalPlaneQuantizationDescriptor], quantCodesByBlockIndex: [Int: UInt8], quantCodesByDescriptor: [UInt8])]()
         descriptorInputs.reserveCapacity(planes.count)
         for plane in planes {
             descriptorInputs.append(try makeQuantizationDescriptors(
@@ -1886,7 +1919,8 @@ public final class PyrowaveCodec: @unchecked Sendable {
             try finishQuantizationBufferResult(
                 results[index],
                 descriptors: planes[index].descriptors,
-                quantCodes: descriptorInputs[index].quantCodes
+                quantCodesByBlockIndex: descriptorInputs[index].quantCodesByBlockIndex,
+                quantCodesByDescriptor: descriptorInputs[index].quantCodesByDescriptor
             )
         }
     }
@@ -1898,7 +1932,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         component: Int,
         configuration: CodecConfiguration,
         backend: MetalPyrowaveBackend
-    ) throws -> (coefficients: [Int16], quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]]) {
+    ) throws -> (coefficients: [Int16], metadata: PlaneQuantizationMetadata) {
         let input = try makeQuantizationDescriptors(
             stride: stride,
             descriptors: descriptors,
@@ -1906,7 +1940,12 @@ public final class PyrowaveCodec: @unchecked Sendable {
             configuration: configuration
         )
         let result = try backend.quantizePlane(samples, stride: stride, descriptors: input.metalDescriptors)
-        return try finishQuantizationResult(result, descriptors: descriptors, quantCodes: input.quantCodes)
+        return try finishQuantizationResult(
+            result,
+            descriptors: descriptors,
+            quantCodesByBlockIndex: input.quantCodesByBlockIndex,
+            quantCodesByDescriptor: input.quantCodesByDescriptor
+        )
     }
 
     private func quantizeWithMetal(
@@ -1917,7 +1956,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         component: Int,
         configuration: CodecConfiguration,
         backend: MetalPyrowaveBackend
-    ) throws -> (coefficients: [Int16], quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]]) {
+    ) throws -> (coefficients: [Int16], metadata: PlaneQuantizationMetadata) {
         let input = try makeQuantizationDescriptors(
             stride: stride,
             descriptors: descriptors,
@@ -1925,7 +1964,12 @@ public final class PyrowaveCodec: @unchecked Sendable {
             configuration: configuration
         )
         let result = try backend.quantizePlaneBuffer(samples, sampleCount: sampleCount, stride: stride, descriptors: input.metalDescriptors)
-        return try finishQuantizationResult(result, descriptors: descriptors, quantCodes: input.quantCodes)
+        return try finishQuantizationResult(
+            result,
+            descriptors: descriptors,
+            quantCodesByBlockIndex: input.quantCodesByBlockIndex,
+            quantCodesByDescriptor: input.quantCodesByDescriptor
+        )
     }
 
     private func quantizeWithMetalResident(
@@ -1936,7 +1980,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         component: Int,
         configuration: CodecConfiguration,
         backend: MetalPyrowaveBackend
-    ) throws -> (coefficientBuffer: MTLBuffer, coefficientCount: Int, quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]]) {
+    ) throws -> (coefficientBuffer: MTLBuffer, coefficientCount: Int, metadata: PlaneQuantizationMetadata) {
         let input = try makeQuantizationDescriptors(
             stride: stride,
             descriptors: descriptors,
@@ -1944,7 +1988,12 @@ public final class PyrowaveCodec: @unchecked Sendable {
             configuration: configuration
         )
         let result = try backend.quantizePlaneBufferResult(samples, sampleCount: sampleCount, stride: stride, descriptors: input.metalDescriptors)
-        return try finishQuantizationBufferResult(result, descriptors: descriptors, quantCodes: input.quantCodes)
+        return try finishQuantizationBufferResult(
+            result,
+            descriptors: descriptors,
+            quantCodesByBlockIndex: input.quantCodesByBlockIndex,
+            quantCodesByDescriptor: input.quantCodesByDescriptor
+        )
     }
 
     private func makeQuantizationDescriptors(
@@ -1952,10 +2001,14 @@ public final class PyrowaveCodec: @unchecked Sendable {
         descriptors: [PlaneBlockDescriptor],
         component: Int,
         configuration: CodecConfiguration
-    ) throws -> (metalDescriptors: [MetalPlaneQuantizationDescriptor], quantCodes: [Int: UInt8]) {
-        var quantCodes = [Int: UInt8]()
-        quantCodes.reserveCapacity(descriptors.count)
-        let metalDescriptors = try descriptors.map { descriptor in
+    ) throws -> (metalDescriptors: [MetalPlaneQuantizationDescriptor], quantCodesByBlockIndex: [Int: UInt8], quantCodesByDescriptor: [UInt8]) {
+        var quantCodesByBlockIndex = [Int: UInt8]()
+        quantCodesByBlockIndex.reserveCapacity(descriptors.count)
+        var quantCodesByDescriptor = [UInt8]()
+        quantCodesByDescriptor.reserveCapacity(descriptors.count)
+        var metalDescriptors = [MetalPlaneQuantizationDescriptor]()
+        metalDescriptors.reserveCapacity(descriptors.count)
+        for descriptor in descriptors {
             let requestedStep = PyrowaveQuantization.quantizationStep(
                 level: descriptor.globalLevel,
                 component: component,
@@ -1964,9 +2017,10 @@ public final class PyrowaveCodec: @unchecked Sendable {
             )
             let quantCode = try PyrowaveQuantization.encodeBlockScale(requestedStep)
             let decodedStep = PyrowaveQuantization.decodeBlockScale(quantCode)
-            quantCodes[descriptor.blockIndex] = quantCode
+            quantCodesByBlockIndex[descriptor.blockIndex] = quantCode
+            quantCodesByDescriptor.append(quantCode)
 
-            return MetalPlaneQuantizationDescriptor(
+            metalDescriptors.append(MetalPlaneQuantizationDescriptor(
                 originX: UInt32(descriptor.originX),
                 originY: UInt32(descriptor.originY),
                 validWidth: UInt32(descriptor.validWidth),
@@ -1974,19 +2028,23 @@ public final class PyrowaveCodec: @unchecked Sendable {
                 stride: UInt32(stride),
                 quantCode: UInt32(quantCode),
                 baseScale: 1.0 / decodedStep
-            )
+            ))
         }
 
-        return (metalDescriptors, quantCodes)
+        return (metalDescriptors, quantCodesByBlockIndex, quantCodesByDescriptor)
     }
 
     private func finishQuantizationResult(
         _ result: MetalPlaneQuantizationResult,
         descriptors: [PlaneBlockDescriptor],
-        quantCodes: [Int: UInt8]
-    ) throws -> (coefficients: [Int16], quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]]) {
+        quantCodesByBlockIndex: [Int: UInt8],
+        quantCodesByDescriptor: [UInt8]
+    ) throws -> (coefficients: [Int16], metadata: PlaneQuantizationMetadata) {
         guard result.qScaleCodesByDescriptor.count == descriptors.count else {
             throw PyrowaveError.processFailed("Metal quantization returned \(result.qScaleCodesByDescriptor.count) q-scale rows for \(descriptors.count) descriptors")
+        }
+        guard quantCodesByDescriptor.count == descriptors.count else {
+            throw PyrowaveError.processFailed("Metal quantization returned \(quantCodesByDescriptor.count) quant codes for \(descriptors.count) descriptors")
         }
 
         var qScaleCodes = [Int: [UInt8]]()
@@ -1994,16 +2052,28 @@ public final class PyrowaveCodec: @unchecked Sendable {
         for (index, descriptor) in descriptors.enumerated() {
             qScaleCodes[descriptor.blockIndex] = result.qScaleCodesByDescriptor[index]
         }
-        return (result.coefficients, quantCodes, qScaleCodes)
+        return (
+            result.coefficients,
+            PlaneQuantizationMetadata(
+                quantCodesByBlockIndex: quantCodesByBlockIndex,
+                qScaleCodesByBlockIndex: qScaleCodes,
+                quantCodesByDescriptor: quantCodesByDescriptor,
+                qScaleCodesByDescriptor: result.qScaleCodesByDescriptor
+            )
+        )
     }
 
     private func finishQuantizationBufferResult(
         _ result: MetalPlaneQuantizationBufferResult,
         descriptors: [PlaneBlockDescriptor],
-        quantCodes: [Int: UInt8]
-    ) throws -> (coefficientBuffer: MTLBuffer, coefficientCount: Int, quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]]) {
+        quantCodesByBlockIndex: [Int: UInt8],
+        quantCodesByDescriptor: [UInt8]
+    ) throws -> (coefficientBuffer: MTLBuffer, coefficientCount: Int, metadata: PlaneQuantizationMetadata) {
         guard result.qScaleCodesByDescriptor.count == descriptors.count else {
             throw PyrowaveError.processFailed("Metal quantization returned \(result.qScaleCodesByDescriptor.count) q-scale rows for \(descriptors.count) descriptors")
+        }
+        guard quantCodesByDescriptor.count == descriptors.count else {
+            throw PyrowaveError.processFailed("Metal quantization returned \(quantCodesByDescriptor.count) quant codes for \(descriptors.count) descriptors")
         }
 
         var qScaleCodes = [Int: [UInt8]]()
@@ -2011,6 +2081,15 @@ public final class PyrowaveCodec: @unchecked Sendable {
         for (index, descriptor) in descriptors.enumerated() {
             qScaleCodes[descriptor.blockIndex] = result.qScaleCodesByDescriptor[index]
         }
-        return (result.coefficientBuffer, result.coefficientCount, quantCodes, qScaleCodes)
+        return (
+            result.coefficientBuffer,
+            result.coefficientCount,
+            PlaneQuantizationMetadata(
+                quantCodesByBlockIndex: quantCodesByBlockIndex,
+                qScaleCodesByBlockIndex: qScaleCodes,
+                quantCodesByDescriptor: quantCodesByDescriptor,
+                qScaleCodesByDescriptor: result.qScaleCodesByDescriptor
+            )
+        )
     }
 }
