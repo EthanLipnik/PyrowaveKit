@@ -16,6 +16,34 @@ import Testing
     #expect(metrics.weightedPSNR > 44.0)
 }
 
+@Test func waveletPaddingUsesMirroredRepeat() throws {
+    let plane = try Plane8(width: 3, height: 2, data: [
+        0, 50, 100,
+        150, 200, 250
+    ])
+    let padded = Wavelet.padPlane(plane, paddedWidth: 6, paddedHeight: 5)
+    let denormalized = padded.samples.map { UInt8((($0 + 0.5) * 255.0).rounded()) }
+
+    #expect(padded.width == 6)
+    #expect(padded.height == 5)
+    #expect(Array(denormalized[0..<6]) == [0, 50, 100, 50, 0, 50])
+    #expect(Array(denormalized[6..<12]) == [150, 200, 250, 200, 150, 200])
+    #expect(Array(denormalized[12..<18]) == [0, 50, 100, 50, 0, 50])
+}
+
+@Test func roundTripNonAlignedSynthetic420UsesMirroredPadding() throws {
+    let frame = try TestFrames.synthetic420(width: 130, height: 74)
+    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
+    let decoded = try codec.decode(encoded)
+    let metrics = try Metrics.compare(frame, decoded)
+
+    #expect(decoded.width == frame.width)
+    #expect(decoded.height == frame.height)
+    #expect(decoded.chroma == .yuv420)
+    #expect(metrics.weightedPSNR > 36.0)
+}
+
 @Test func yuv4mpegReadWrite() throws {
     let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

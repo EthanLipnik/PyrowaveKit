@@ -34,9 +34,9 @@ enum Wavelet {
         var samples = Array(repeating: Float(0), count: paddedWidth * paddedHeight)
 
         for y in 0..<paddedHeight {
-            let sourceY = min(y, plane.height - 1)
+            let sourceY = mirror(y, count: plane.height)
             for x in 0..<paddedWidth {
-                let sourceX = min(x, plane.width - 1)
+                let sourceX = mirror(x, count: plane.width)
                 samples[y * paddedWidth + x] = Float(plane.data[sourceY * plane.width + sourceX]) / 255.0 - 0.5
             }
         }
@@ -123,13 +123,9 @@ enum Wavelet {
 
     private static func mirror(_ index: Int, count: Int) -> Int {
         guard count > 1 else { return 0 }
-        if index < 0 {
-            return -index
-        }
-        if index >= count {
-            return 2 * count - index - 2
-        }
-        return index
+        let period = 2 * count - 2
+        let wrapped = ((index % period) + period) % period
+        return wrapped < count ? wrapped : period - wrapped
     }
 
     private static func forward1D(_ values: inout [Float]) {
