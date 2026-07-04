@@ -89,9 +89,13 @@ public final class PyrowavePacketStreamDecoder {
                 if isStale(sequence.sequence) {
                     return
                 }
+                try validate(sequence)
                 if lastSequence != sequence.sequence {
                     beginSequence(sequence)
                 } else {
+                    if let sequenceHeader, sequenceHeader != sequence {
+                        throw PyrowaveError.invalidBitstream("sequence header changed within active sequence")
+                    }
                     sequenceHeader = sequence
                 }
                 continue
@@ -154,6 +158,17 @@ public final class PyrowavePacketStreamDecoder {
         blockPackets.removeAll(keepingCapacity: true)
         decodedFrameForCurrentSequence = false
         lastSequence = sequence.sequence
+    }
+
+    private func validate(_ sequence: PyrowaveSequenceHeader) throws {
+        guard let expectedFrame else {
+            return
+        }
+        guard sequence.width == expectedFrame.width,
+              sequence.height == expectedFrame.height,
+              sequence.chroma == expectedFrame.chroma else {
+            throw PyrowaveError.invalidBitstream("sequence header does not match decoder geometry")
+        }
     }
 
     private func isStale(_ sequence: UInt8) -> Bool {

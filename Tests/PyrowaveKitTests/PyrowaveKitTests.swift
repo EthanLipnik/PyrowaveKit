@@ -353,6 +353,51 @@ import Testing
     #expect(decoded.chroma == .yuv420)
 }
 
+@Test func geometryAwarePacketStreamDecoderRejectsMismatchedSequenceHeader() throws {
+    let stream = try PyrowavePacketStreamDecoder(width: 64, height: 64, chroma: .yuv420, useMetalAcceleration: false)
+    var writer = BinaryWriter()
+    try PyrowaveSequenceHeader(
+        width: 96,
+        height: 64,
+        sequence: 1,
+        totalBlocks: 1,
+        chroma: .yuv420
+    ).write(to: &writer)
+
+    #expect(throws: PyrowaveError.invalidBitstream("sequence header does not match decoder geometry")) {
+        try stream.pushPacket(EncodedPacket(data: writer.data))
+    }
+}
+
+@Test func packetStreamDecoderRejectsSameSequenceHeaderMutation() throws {
+    let frame = try TestFrames.synthetic420(width: 64, height: 64)
+    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+        frame,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
+    )
+    let packets = try encoded.packetized(maximumPacketBytes: 8)
+    let sequencePacket = try #require(packets.first)
+    var sequenceReader = BinaryReader(sequencePacket.data)
+    let sequence = try PyrowaveSequenceHeader(reader: &sequenceReader)
+    let stream = PyrowavePacketStreamDecoder(useMetalAcceleration: false)
+
+    try stream.pushPacket(sequencePacket)
+    try stream.pushPacket(try #require(packets.dropFirst().first))
+
+    var mutatedWriter = BinaryWriter()
+    try PyrowaveSequenceHeader(
+        width: sequence.width,
+        height: sequence.height,
+        sequence: sequence.sequence,
+        totalBlocks: sequence.totalBlocks + 1,
+        chroma: sequence.chroma
+    ).write(to: &mutatedWriter)
+
+    #expect(throws: PyrowaveError.invalidBitstream("sequence header changed within active sequence")) {
+        try stream.pushPacket(EncodedPacket(data: mutatedWriter.data))
+    }
+}
+
 @Test func codecPreservesSequenceVideoSignalMetadata() throws {
     let source = try TestFrames.synthetic420(width: 64, height: 64)
     let frame = try YUVFrame(
