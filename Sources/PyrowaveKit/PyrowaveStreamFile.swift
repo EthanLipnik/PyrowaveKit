@@ -132,6 +132,7 @@ public struct PyrowaveStreamWriter {
         guard frame.data.count <= Int(UInt32.max) else {
             throw PyrowaveError.invalidBitstream("encoded frame exceeds stream packet size limit")
         }
+        try header.validate(frame: frame)
 
         var writer = BinaryWriter()
         writer.append(UInt32(frame.data.count))
@@ -173,7 +174,21 @@ public struct PyrowaveStreamReader {
         guard let frameData = try handle.readStreamExactly(byteCount: byteCount) else {
             throw PyrowaveError.truncatedInput
         }
-        return EncodedFrame(data: frameData)
+        let frame = EncodedFrame(data: frameData)
+        try header.validate(frame: frame)
+        return frame
+    }
+}
+
+private extension PyrowaveStreamHeader {
+    func validate(frame: EncodedFrame) throws {
+        var reader = BinaryReader(frame.data)
+        let sequence = try PyrowaveSequenceHeader(reader: &reader)
+        guard sequence.width == width,
+              sequence.height == height,
+              sequence.chroma == chroma else {
+            throw PyrowaveError.invalidBitstream("encoded frame does not match stream header")
+        }
     }
 }
 

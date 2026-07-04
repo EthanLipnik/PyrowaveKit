@@ -423,6 +423,58 @@ import Testing
     }
 }
 
+@Test func pyrowaveStreamFileRejectsFrameThatDoesNotMatchHeader() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("mismatch-write.pwks")
+    let headerFrame = try TestFrames.synthetic420(width: 96, height: 64)
+    let mismatchedFrame = try TestFrames.synthetic444(width: 96, height: 64)
+    let mismatchedEncoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+        mismatchedFrame,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
+    )
+
+    var writer = try PyrowaveStreamWriter(url: url, header: PyrowaveStreamHeader(frame: headerFrame))
+    #expect(throws: PyrowaveError.invalidBitstream("encoded frame does not match stream header")) {
+        try writer.writeFrame(mismatchedEncoded)
+    }
+}
+
+@Test func pyrowaveStreamFileReaderRejectsMismatchedEmbeddedFrame() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("mismatch-read.pwks")
+    let header = try PyrowaveStreamHeader(width: 96, height: 64, chroma: .yuv420)
+    let mismatchedFrame = try TestFrames.synthetic444(width: 96, height: 64)
+    let mismatchedEncoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+        mismatchedFrame,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
+    )
+
+    var writer = BinaryWriter()
+    writer.append(data: Data("PYROWAVE".utf8))
+    for word in [
+        UInt32(header.width),
+        UInt32(header.height),
+        UInt32(0),
+        UInt32(header.chroma.rawValue),
+        UInt32(header.videoSignal.yCbCrRange.rawValue),
+        UInt32(header.frameRateNumerator),
+        UInt32(header.frameRateDenominator),
+        UInt32(header.videoSignal.chromaSiting.rawValue)
+    ] {
+        writer.append(word)
+    }
+    writer.append(UInt32(mismatchedEncoded.data.count))
+    writer.append(data: mismatchedEncoded.data)
+    try writer.data.write(to: url)
+
+    var reader = try PyrowaveStreamReader(url: url)
+    #expect(throws: PyrowaveError.invalidBitstream("encoded frame does not match stream header")) {
+        _ = try reader.readFrame()
+    }
+}
+
 @Test func packetStreamDecoderAllowsPartialFrameAfterHalfTheBlocks() throws {
     let frame = try TestFrames.synthetic420(width: 96, height: 64)
     let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
