@@ -1105,57 +1105,106 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         distortions: [[Float]],
         packetByteCosts: [[Int]]
     ) throws -> [[Int]] {
-        guard distortions.count == packetByteCosts.count else {
-            throw PyrowaveError.processFailed("rate-control distortion and packet-cost counts differ")
-        }
-        guard !distortions.isEmpty else {
+        try rateControlBucketIndicesBatch([(distortions: distortions, packetByteCosts: packetByteCosts)])[0]
+    }
+
+    func rateControlBucketIndicesBatch(
+        _ planes: [(distortions: [[Float]], packetByteCosts: [[Int]])]
+    ) throws -> [[[Int]]] {
+        guard !planes.isEmpty else {
             return []
         }
-        guard distortions.count <= Int(UInt32.max) else {
-            throw PyrowaveError.invalidDimensions
-        }
 
-        var flatDistortions = [Float]()
-        var flatPacketByteCosts = [UInt32]()
-        flatDistortions.reserveCapacity(distortions.count * PyrowaveBlockStats.candidateCount)
-        flatPacketByteCosts.reserveCapacity(packetByteCosts.count * PyrowaveBlockStats.candidateCount)
-        for index in distortions.indices {
-            guard distortions[index].count == PyrowaveBlockStats.candidateCount,
-                  packetByteCosts[index].count == PyrowaveBlockStats.candidateCount else {
-                throw PyrowaveError.processFailed("rate-control bucket input must contain \(PyrowaveBlockStats.candidateCount) candidates per block")
+        var results = Array(repeating: [[Int]](), count: planes.count)
+        var work = [(
+            planeIndex: Int,
+            distortionBuffer: MTLBuffer,
+            packetByteCostBuffer: MTLBuffer,
+            bucketIndexBuffer: MTLBuffer,
+            blockCount: Int
+        )]()
+        work.reserveCapacity(planes.count)
+
+        for (planeIndex, plane) in planes.enumerated() {
+            guard plane.distortions.count == plane.packetByteCosts.count else {
+                throw PyrowaveError.processFailed("rate-control distortion and packet-cost counts differ")
             }
-            flatDistortions.append(contentsOf: distortions[index])
-            for cost in packetByteCosts[index] {
-                guard cost >= 0, cost <= Int(UInt32.max) else {
-                    throw PyrowaveError.invalidDimensions
+            guard !plane.distortions.isEmpty else {
+                continue
+            }
+            guard plane.distortions.count <= Int(UInt32.max) else {
+                throw PyrowaveError.invalidDimensions
+            }
+
+            var flatDistortions = [Float]()
+            var flatPacketByteCosts = [UInt32]()
+            flatDistortions.reserveCapacity(plane.distortions.count * PyrowaveBlockStats.candidateCount)
+            flatPacketByteCosts.reserveCapacity(plane.packetByteCosts.count * PyrowaveBlockStats.candidateCount)
+            for index in plane.distortions.indices {
+                guard plane.distortions[index].count == PyrowaveBlockStats.candidateCount,
+                      plane.packetByteCosts[index].count == PyrowaveBlockStats.candidateCount else {
+                    throw PyrowaveError.processFailed("rate-control bucket input must contain \(PyrowaveBlockStats.candidateCount) candidates per block")
                 }
-                flatPacketByteCosts.append(UInt32(cost))
+                flatDistortions.append(contentsOf: plane.distortions[index])
+                for cost in plane.packetByteCosts[index] {
+                    guard cost >= 0, cost <= Int(UInt32.max) else {
+                        throw PyrowaveError.invalidDimensions
+                    }
+                    flatPacketByteCosts.append(UInt32(cost))
+                }
             }
+
+            let bucketIndices = Array(repeating: UInt32(0), count: flatDistortions.count)
+            guard let distortionBuffer = device.makeBuffer(
+                bytes: flatDistortions,
+                length: flatDistortions.count * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            ),
+                  let packetByteCostBuffer = device.makeBuffer(
+                    bytes: flatPacketByteCosts,
+                    length: flatPacketByteCosts.count * MemoryLayout<UInt32>.stride,
+                    options: .storageModeShared
+                  ),
+                  let bucketIndexBuffer = device.makeBuffer(
+                    bytes: bucketIndices,
+                    length: bucketIndices.count * MemoryLayout<UInt32>.stride,
+                    options: .storageModeShared
+                  ) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal rate-control bucket buffers")
+            }
+
+            work.append((
+                planeIndex: planeIndex,
+                distortionBuffer: distortionBuffer,
+                packetByteCostBuffer: packetByteCostBuffer,
+                bucketIndexBuffer: bucketIndexBuffer,
+                blockCount: plane.distortions.count
+            ))
         }
 
-        let bucketIndices = Array(repeating: UInt32(0), count: flatDistortions.count)
-        guard let distortionBuffer = device.makeBuffer(bytes: flatDistortions, length: flatDistortions.count * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let packetByteCostBuffer = device.makeBuffer(bytes: flatPacketByteCosts, length: flatPacketByteCosts.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-              let bucketIndexBuffer = device.makeBuffer(bytes: bucketIndices, length: bucketIndices.count * MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal rate-control bucket buffers")
+        guard !work.isEmpty else {
+            return results
         }
 
-        var constants = RateControlBucketConstants(blockCount: UInt32(distortions.count))
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw PyrowaveError.processFailed("failed to create Metal rate-control bucket command encoder")
         }
 
         encoder.setComputePipelineState(rateControlBucketPipeline)
-        encoder.setBuffer(distortionBuffer, offset: 0, index: 0)
-        encoder.setBuffer(packetByteCostBuffer, offset: 0, index: 1)
-        encoder.setBuffer(bucketIndexBuffer, offset: 0, index: 2)
-        encoder.setBytes(&constants, length: MemoryLayout<RateControlBucketConstants>.stride, index: 3)
         let width = min(rateControlBucketPipeline.maxTotalThreadsPerThreadgroup, 256)
-        encoder.dispatchThreads(
-            MTLSize(width: distortions.count, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
-        )
+        let threadsPerThreadgroup = MTLSize(width: width, height: 1, depth: 1)
+        for item in work {
+            var constants = RateControlBucketConstants(blockCount: UInt32(item.blockCount))
+            encoder.setBuffer(item.distortionBuffer, offset: 0, index: 0)
+            encoder.setBuffer(item.packetByteCostBuffer, offset: 0, index: 1)
+            encoder.setBuffer(item.bucketIndexBuffer, offset: 0, index: 2)
+            encoder.setBytes(&constants, length: MemoryLayout<RateControlBucketConstants>.stride, index: 3)
+            encoder.dispatchThreads(
+                MTLSize(width: item.blockCount, height: 1, depth: 1),
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -1164,11 +1213,15 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("Metal rate-control bucket command failed: \(error)")
         }
 
-        let pointer = bucketIndexBuffer.contents().bindMemory(to: UInt32.self, capacity: bucketIndices.count)
-        let flatBuckets = Array(UnsafeBufferPointer(start: pointer, count: bucketIndices.count))
-        return Swift.stride(from: 0, to: flatBuckets.count, by: PyrowaveBlockStats.candidateCount).map {
-            flatBuckets[$0..<$0 + PyrowaveBlockStats.candidateCount].map(Int.init)
+        for item in work {
+            let bucketIndexCount = item.blockCount * PyrowaveBlockStats.candidateCount
+            let pointer = item.bucketIndexBuffer.contents().bindMemory(to: UInt32.self, capacity: bucketIndexCount)
+            let flatBuckets = Array(UnsafeBufferPointer(start: pointer, count: bucketIndexCount))
+            results[item.planeIndex] = Swift.stride(from: 0, to: flatBuckets.count, by: PyrowaveBlockStats.candidateCount).map {
+                flatBuckets[$0..<$0 + PyrowaveBlockStats.candidateCount].map(Int.init)
+            }
         }
+        return results
     }
 
     func rateControlCumulativeBucketSavings(

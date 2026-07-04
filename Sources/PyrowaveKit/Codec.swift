@@ -983,25 +983,32 @@ public final class PyrowaveCodec: @unchecked Sendable {
     }
 
     private func metalRateControlBucketData(blocksByPlane: [[PyrowaveRateControlBlock]]) throws -> MetalRateControlBucketData {
-        var bucketsByPlane = [[[Int]]]()
-        bucketsByPlane.reserveCapacity(blocksByPlane.count)
-        var flatBuckets = [[Int]]()
-        var flatPacketByteCosts = [[Int]]()
-        for blocks in blocksByPlane {
-            let distortions = blocks.map { block in
+        let distortionsByPlane = blocksByPlane.map { blocks in
+            blocks.map { block in
                 (0..<PyrowaveBlockStats.candidateCount).map { block.distortion(quantLevel: $0) }
             }
-            let packetByteCosts = blocks.map(\.packetByteCosts)
-            let buckets = try metalBackend.rateControlBucketIndices(
-                distortions: distortions,
-                packetByteCosts: packetByteCosts
+        }
+        let packetByteCostsByPlane = blocksByPlane.map { blocks in
+            blocks.map(\.packetByteCosts)
+        }
+        let bucketsByPlane = try metalBackend.rateControlBucketIndicesBatch(blocksByPlane.indices.map { index in
+            (
+                distortions: distortionsByPlane[index],
+                packetByteCosts: packetByteCostsByPlane[index]
             )
-            guard buckets.count == blocks.count else {
-                throw PyrowaveError.processFailed("Metal rate-control bucket pass returned \(buckets.count) blocks for \(blocks.count) inputs")
+        })
+        guard bucketsByPlane.count == blocksByPlane.count else {
+            throw PyrowaveError.processFailed("Metal rate-control bucket batch returned \(bucketsByPlane.count) planes for \(blocksByPlane.count) inputs")
+        }
+
+        var flatBuckets = [[Int]]()
+        var flatPacketByteCosts = [[Int]]()
+        for planeIndex in blocksByPlane.indices {
+            guard bucketsByPlane[planeIndex].count == blocksByPlane[planeIndex].count else {
+                throw PyrowaveError.processFailed("Metal rate-control bucket pass returned \(bucketsByPlane[planeIndex].count) blocks for \(blocksByPlane[planeIndex].count) inputs")
             }
-            bucketsByPlane.append(buckets)
-            flatBuckets.append(contentsOf: buckets)
-            flatPacketByteCosts.append(contentsOf: packetByteCosts)
+            flatBuckets.append(contentsOf: bucketsByPlane[planeIndex])
+            flatPacketByteCosts.append(contentsOf: packetByteCostsByPlane[planeIndex])
         }
         let cumulativeSavings = try metalBackend.rateControlCumulativeBucketSavings(
             bucketIndices: flatBuckets,

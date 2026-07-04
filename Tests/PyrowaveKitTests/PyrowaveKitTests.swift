@@ -1516,6 +1516,16 @@ import Metal
     let cpu = blocks.map { PyrowaveRateController.inclusiveBucketIndices(for: $0) }
 
     #expect(metal == cpu)
+    let batched = try backend.rateControlBucketIndicesBatch([
+        (distortions: distortions, packetByteCosts: packetByteCosts),
+        (distortions: Array(distortions.reversed()), packetByteCosts: Array(packetByteCosts.reversed())),
+        (distortions: [], packetByteCosts: [])
+    ])
+    #expect(batched.count == 3)
+    #expect(batched[0] == metal)
+    #expect(batched[1] == Array(cpu.reversed()))
+    #expect(batched[2].isEmpty)
+
     let metalOperations = PyrowaveRateController.makeRDOperations(
         blocksByPlane: [blocks],
         bucketIndicesByPlane: [metal]
