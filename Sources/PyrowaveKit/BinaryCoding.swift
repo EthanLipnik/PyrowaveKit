@@ -90,4 +90,11 @@ struct BinaryReader {
         }
         return values
     }
+
+    mutating func seek(to newOffset: Int) throws {
+        guard newOffset >= 0, newOffset <= data.count else {
+            throw PyrowaveError.truncatedInput
+        }
+        offset = newOffset
+    }
 }

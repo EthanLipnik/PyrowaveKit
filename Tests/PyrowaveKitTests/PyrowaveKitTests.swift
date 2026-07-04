@@ -187,3 +187,46 @@ import Testing
     let blockIndices = layout.descriptors.map(\.blockIndex)
     #expect(blockIndices == Array(0..<layout.descriptors.count))
 }
+
+@Test func pyrowaveCoefficientBlockPayloadRoundTripsBitPlanes() throws {
+    let stride = 32
+    var coefficients = Array(repeating: Int16(0), count: stride * stride)
+    coefficients[0] = 1
+    coefficients[1] = -2
+    coefficients[2] = 3
+    coefficients[8 * stride + 8] = -17
+    coefficients[31 * stride + 31] = 255
+
+    let payload = try #require(try PyrowaveCoefficientBlockCodec.encodeBlock(
+        blockIndex: 42,
+        coefficients: coefficients,
+        stride: stride,
+        originX: 0,
+        originY: 0,
+        validWidth: 32,
+        validHeight: 32,
+        threshold: 0,
+        sequence: 3,
+        quantCode: 11
+    ))
+
+    var reader = BinaryReader(payload)
+    let header = try PyrowavePacketHeader(reader: &reader)
+    #expect(header.blockIndex == 42)
+    #expect(header.sequence == 3)
+    #expect(header.quantCode == 11)
+    #expect(header.ballot == 0x8021)
+
+    var decodeReader = BinaryReader(payload)
+    let decoded = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &decodeReader)
+    let decodedMap = Dictionary(uniqueKeysWithValues: decoded.coefficients.map { (Int($0.offset), $0.value) })
+
+    #expect(decoded.blockIndex == 42)
+    #expect(decodedMap[0] == 1)
+    #expect(decodedMap[1] == -2)
+    #expect(decodedMap[2] == 3)
+    #expect(decodedMap[8 * stride + 8] == -17)
+    #expect(decodedMap[31 * stride + 31] == 255)
+    #expect(decoded.coefficients.count == 5)
+    #expect(decodeReader.offset == payload.count)
+}

@@ -209,3 +209,241 @@ struct PyrowaveBlockLayout: Sendable {
         }
     }
 }
+
+struct PyrowaveCoefficientBlockCodec {
+    private static let subblockCount = 8
+    private static let pixelsPerSubblock = 8
+
+    struct DecodedBlock {
+        var blockIndex: Int
+        var coefficients: [(offset: UInt16, value: Int16)]
+    }
+
+    static func encodeBlock(
+        blockIndex: Int,
+        coefficients: [Int16],
+        stride: Int,
+        originX: Int,
+        originY: Int,
+        validWidth: Int,
+        validHeight: Int,
+        threshold: Int,
+        sequence: UInt8 = 0,
+        quantCode: UInt8 = 0
+    ) throws -> Data? {
+        var blockValues = Array(repeating: Int16(0), count: PyrowaveBitstream.coefficientBlockSize * PyrowaveBitstream.coefficientBlockSize)
+        var ballot = UInt16(0)
+
+        for y in 0..<validHeight {
+            for x in 0..<validWidth {
+                let value = coefficients[(originY + y) * stride + originX + x]
+                if abs(Int(value)) > threshold {
+                    blockValues[y * PyrowaveBitstream.coefficientBlockSize + x] = value
+                    let smallBlock = (y / PyrowaveBitstream.smallBlockSize) * 4 + (x / PyrowaveBitstream.smallBlockSize)
+                    ballot |= UInt16(1) << UInt16(smallBlock)
+                }
+            }
+        }
+
+        guard ballot != 0 else {
+            return nil
+        }
+
+        var codeWords = [UInt16]()
+        var qScales = [UInt8]()
+        var magnitudePayload = [UInt8]()
+        var signPositions = [(offset: UInt16, negative: Bool)]()
+
+        for smallBlock in 0..<16 where (ballot & (UInt16(1) << UInt16(smallBlock))) != 0 {
+            let smallOriginX = (smallBlock % 4) * PyrowaveBitstream.smallBlockSize
+            let smallOriginY = (smallBlock / 4) * PyrowaveBitstream.smallBlockSize
+            var bitWidths = Array(repeating: 0, count: subblockCount)
+            var magnitudes = Array(repeating: 0, count: PyrowaveBitstream.smallBlockSize * PyrowaveBitstream.smallBlockSize)
+            var negatives = Array(repeating: false, count: PyrowaveBitstream.smallBlockSize * PyrowaveBitstream.smallBlockSize)
+
+            for subblock in 0..<subblockCount {
+                var maxMagnitude = 0
+                for pixel in 0..<pixelsPerSubblock {
+                    let coord = coordinateIn8x8(subblock: subblock, pixel: pixel)
+                    let x = smallOriginX + coord.x
+                    let y = smallOriginY + coord.y
+                    let value = blockValues[y * PyrowaveBitstream.coefficientBlockSize + x]
+                    let magnitude = abs(Int(value))
+                    magnitudes[subblock * pixelsPerSubblock + pixel] = magnitude
+                    negatives[subblock * pixelsPerSubblock + pixel] = value < 0
+                    maxMagnitude = max(maxMagnitude, magnitude)
+                }
+                bitWidths[subblock] = bitWidth(maxMagnitude)
+            }
+
+            let basePlanes = max(0, (bitWidths.max() ?? 0) - 3)
+            var codeWord = UInt16(0)
+            for subblock in 0..<subblockCount {
+                let encodedPlanes = max(bitWidths[subblock], basePlanes)
+                let twoBitCode = min(3, max(0, encodedPlanes - basePlanes))
+                codeWord |= UInt16(twoBitCode) << UInt16(2 * subblock)
+
+                for plane in 0..<encodedPlanes {
+                    let bit = encodedPlanes - plane - 1
+                    var byte = UInt8(0)
+                    for pixel in 0..<pixelsPerSubblock {
+                        let magnitude = magnitudes[subblock * pixelsPerSubblock + pixel]
+                        if ((magnitude >> bit) & 1) != 0 {
+                            byte |= UInt8(1) << UInt8(pixel)
+                        }
+                    }
+                    magnitudePayload.append(byte)
+                }
+            }
+
+            codeWords.append(codeWord)
+            qScales.append(UInt8(basePlanes & 0x0f))
+
+            for subblock in 0..<subblockCount {
+                for pixel in 0..<pixelsPerSubblock {
+                    let magnitude = magnitudes[subblock * pixelsPerSubblock + pixel]
+                    if magnitude != 0 {
+                        let coord = coordinateIn8x8(subblock: subblock, pixel: pixel)
+                        let x = smallOriginX + coord.x
+                        let y = smallOriginY + coord.y
+                        signPositions.append((offset: UInt16(y * PyrowaveBitstream.coefficientBlockSize + x), negative: negatives[subblock * pixelsPerSubblock + pixel]))
+                    }
+                }
+            }
+        }
+
+        var signPayload = Array(repeating: UInt8(0), count: (signPositions.count + 7) / 8)
+        for (index, sign) in signPositions.enumerated() where sign.negative {
+            signPayload[index / 8] |= UInt8(1) << UInt8(index & 7)
+        }
+
+        let unpaddedSize = 8 + codeWords.count * 2 + qScales.count + magnitudePayload.count + signPayload.count
+        let payloadWords = UInt16((unpaddedSize + 3) / 4)
+        let header = try PyrowavePacketHeader(
+            ballot: ballot,
+            payloadWords: payloadWords,
+            sequence: sequence,
+            extended: false,
+            quantCode: quantCode,
+            blockIndex: blockIndex
+        )
+
+        var writer = BinaryWriter()
+        header.write(to: &writer)
+        for codeWord in codeWords {
+            writer.append(codeWord)
+        }
+        for qScale in qScales {
+            writer.append(qScale)
+        }
+        writer.append(bytes: magnitudePayload)
+        writer.append(bytes: signPayload)
+        while writer.data.count % 4 != 0 {
+            writer.append(UInt8(0))
+        }
+        return writer.data
+    }
+
+    static func decodeBlock(reader: inout BinaryReader) throws -> DecodedBlock {
+        let blockStart = reader.offset
+        let header = try PyrowavePacketHeader(reader: &reader)
+        guard !header.extended else {
+            throw PyrowaveError.invalidBitstream("coefficient decoder received extended packet")
+        }
+        guard header.ballot != 0 else {
+            return DecodedBlock(blockIndex: header.blockIndex, coefficients: [])
+        }
+
+        let payloadEnd = blockStart + Int(header.payloadWords) * 4
+        guard payloadEnd <= reader.data.count else {
+            throw PyrowaveError.truncatedInput
+        }
+
+        let activeBlockCount = header.ballot.nonzeroBitCount
+        var codeWords = [UInt16]()
+        codeWords.reserveCapacity(activeBlockCount)
+        for _ in 0..<activeBlockCount {
+            codeWords.append(try reader.readUInt16())
+        }
+
+        var qScales = [UInt8]()
+        qScales.reserveCapacity(activeBlockCount)
+        for _ in 0..<activeBlockCount {
+            qScales.append(try reader.readUInt8())
+        }
+
+        var coefficients = Array(repeating: Int16(0), count: PyrowaveBitstream.coefficientBlockSize * PyrowaveBitstream.coefficientBlockSize)
+        var signOffsets = [UInt16]()
+        signOffsets.reserveCapacity(PyrowaveBitstream.coefficientBlockSize * PyrowaveBitstream.coefficientBlockSize)
+
+        var compactIndex = 0
+        for smallBlock in 0..<16 where (header.ballot & (UInt16(1) << UInt16(smallBlock))) != 0 {
+            let smallOriginX = (smallBlock % 4) * PyrowaveBitstream.smallBlockSize
+            let smallOriginY = (smallBlock / 4) * PyrowaveBitstream.smallBlockSize
+            let codeWord = codeWords[compactIndex]
+            let basePlanes = Int(qScales[compactIndex] & 0x0f)
+
+            for subblock in 0..<subblockCount {
+                let encodedPlanes = Int((codeWord >> UInt16(2 * subblock)) & 0x3) + basePlanes
+                var magnitudes = Array(repeating: 0, count: pixelsPerSubblock)
+
+                for _ in 0..<encodedPlanes {
+                    guard reader.offset < payloadEnd else {
+                        throw PyrowaveError.truncatedInput
+                    }
+                    let byte = try reader.readUInt8()
+                    for pixel in 0..<pixelsPerSubblock {
+                        magnitudes[pixel] <<= 1
+                        magnitudes[pixel] |= Int((byte >> UInt8(pixel)) & 1)
+                    }
+                }
+
+                for pixel in 0..<pixelsPerSubblock where magnitudes[pixel] != 0 {
+                    let coord = coordinateIn8x8(subblock: subblock, pixel: pixel)
+                    let x = smallOriginX + coord.x
+                    let y = smallOriginY + coord.y
+                    let offset = UInt16(y * PyrowaveBitstream.coefficientBlockSize + x)
+                    coefficients[Int(offset)] = Int16(magnitudes[pixel])
+                    signOffsets.append(offset)
+                }
+            }
+
+            compactIndex += 1
+        }
+
+        let signStart = reader.offset
+        let signByteCount = (signOffsets.count + 7) / 8
+        guard signStart + signByteCount <= payloadEnd else {
+            throw PyrowaveError.truncatedInput
+        }
+
+        for signIndex in signOffsets.indices {
+            let signByteOffset = signIndex / 8
+            let bit = UInt8(signIndex & 7)
+            let signByte = reader.data[signStart + signByteOffset]
+            if ((signByte >> bit) & 1) != 0 {
+                let offset = Int(signOffsets[signIndex])
+                coefficients[offset] = -coefficients[offset]
+            }
+        }
+
+        try reader.seek(to: payloadEnd)
+        let entries = coefficients.enumerated().compactMap { index, value -> (offset: UInt16, value: Int16)? in
+            value == 0 ? nil : (UInt16(index), value)
+        }
+        return DecodedBlock(blockIndex: header.blockIndex, coefficients: entries)
+    }
+
+    private static func coordinateIn8x8(subblock: Int, pixel: Int) -> (x: Int, y: Int) {
+        let x = (subblock / 4) * 4 + (pixel >> 1)
+        let y = (subblock % 4) * 2 + (pixel & 1)
+        return (x, y)
+    }
+
+    private static func bitWidth(_ value: Int) -> Int {
+        guard value > 0 else {
+            return 0
+        }
+        return Int.bitWidth - value.leadingZeroBitCount
+    }
+}

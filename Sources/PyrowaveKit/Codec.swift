@@ -131,7 +131,7 @@ public final class PyrowaveCodec: Sendable {
 
     private struct SparseBlock {
         var blockIndex: Int
-        var entries: [(offset: UInt16, value: Int16)]
+        var data: Data
     }
 
     private struct PlaneBlockDescriptor {
@@ -225,9 +225,7 @@ public final class PyrowaveCodec: Sendable {
             return 0
         }
 
-        let histogram = makeRateControlHistogram(planes)
-        let fixedSize = frameHeaderSize + planes.count * planeHeaderSize
-        if fixedSize + histogram.sparsePayloadSize(threshold: 0) <= maximumEncodedBytes {
+        if estimateFrameSize(planes: planes, sparseThreshold: 0, forceSparse: true) <= maximumEncodedBytes {
             return 0
         }
 
@@ -235,7 +233,7 @@ public final class PyrowaveCodec: Sendable {
         var high = Int(Int16.max)
         while low < high {
             let mid = (low + high) / 2
-            let size = fixedSize + histogram.sparsePayloadSize(threshold: mid)
+            let size = estimateFrameSize(planes: planes, sparseThreshold: mid, forceSparse: true)
             if size <= maximumEncodedBytes {
                 high = mid
             } else {
@@ -282,13 +280,7 @@ public final class PyrowaveCodec: Sendable {
         return histogram
     }
 
-    private func estimateFrameSize(
-        planes: [EncodedPlane],
-        frame: YUVFrame,
-        configuration: CodecConfiguration,
-        sparseThreshold: Int,
-        forceSparse: Bool
-    ) -> Int {
+    private func estimateFrameSize(planes: [EncodedPlane], sparseThreshold: Int, forceSparse: Bool) -> Int {
         var size = frameHeaderSize
         for plane in planes {
             let payload = makePlanePayload(plane, sparseThreshold: sparseThreshold, forceSparse: forceSparse)
@@ -323,13 +315,7 @@ public final class PyrowaveCodec: Sendable {
         let blocks = sparseBlocks(plane, threshold: threshold)
         var writer = BinaryWriter()
         for block in blocks {
-            writer.append(UInt32(block.blockIndex))
-            writer.append(UInt16(block.entries.count))
-            writer.append(UInt16(0))
-            for entry in block.entries {
-                writer.append(entry.offset)
-                writer.append(entry.value)
-            }
+            writer.append(data: block.data)
         }
 
         return PlanePayload(
@@ -341,28 +327,22 @@ public final class PyrowaveCodec: Sendable {
     }
 
     private func sparseBlocks(_ plane: EncodedPlane, threshold: Int) -> [SparseBlock] {
-        let blockSize = Self.sparseBlockSize
         let descriptors = planeBlockDescriptors(width: plane.paddedWidth, height: plane.paddedHeight, levels: plane.levels)
         var blocks = [SparseBlock]()
         blocks.reserveCapacity(descriptors.count)
 
         for descriptor in descriptors {
-            var entries = [(offset: UInt16, value: Int16)]()
-            entries.reserveCapacity(blockSize * blockSize)
-
-            for localY in 0..<descriptor.validHeight {
-                for localX in 0..<descriptor.validWidth {
-                    let x = descriptor.originX + localX
-                    let y = descriptor.originY + localY
-                    let coefficient = plane.coefficients[y * plane.paddedWidth + x]
-                    if abs(Int(coefficient)) > threshold {
-                        entries.append((offset: UInt16(localY * blockSize + localX), value: coefficient))
-                    }
-                }
-            }
-
-            if !entries.isEmpty {
-                blocks.append(SparseBlock(blockIndex: descriptor.blockIndex, entries: entries))
+            if let data = try? PyrowaveCoefficientBlockCodec.encodeBlock(
+                blockIndex: descriptor.blockIndex,
+                coefficients: plane.coefficients,
+                stride: plane.paddedWidth,
+                originX: descriptor.originX,
+                originY: descriptor.originY,
+                validWidth: descriptor.validWidth,
+                validHeight: descriptor.validHeight,
+                threshold: threshold
+            ) {
+                blocks.append(SparseBlock(blockIndex: descriptor.blockIndex, data: data))
             }
         }
 
@@ -387,18 +367,17 @@ public final class PyrowaveCodec: Sendable {
         var seenBlocks = Set<Int>()
 
         for _ in 0..<blockCount {
-            let blockIndex = Int(try reader.readUInt32())
-            let entryCount = Int(try reader.readUInt16())
-            _ = try reader.readUInt16()
+            let block = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
+            let blockIndex = block.blockIndex
 
             guard blockIndex >= 0, blockIndex < descriptors.count, seenBlocks.insert(blockIndex).inserted else {
                 throw PyrowaveError.invalidBitstream("bad sparse block index")
             }
 
             let descriptor = descriptors[blockIndex]
-            for _ in 0..<entryCount {
-                let localOffset = Int(try reader.readUInt16())
-                let value = try reader.readInt16()
+            for entry in block.coefficients {
+                let localOffset = Int(entry.offset)
+                let value = entry.value
                 let localX = localOffset % blockSize
                 let localY = localOffset / blockSize
                 let x = descriptor.originX + localX
