@@ -882,60 +882,101 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         descriptors: [MetalSparsePacketEncodeDescriptor],
         qScaleCodes: [[UInt8]]
     ) throws -> [Data?] {
-        guard coefficientCount > 0,
-              coefficientBuffer.length >= coefficientCount * MemoryLayout<Int16>.stride else {
-            throw PyrowaveError.invalidDimensions
-        }
-        guard descriptors.count == qScaleCodes.count else {
-            throw PyrowaveError.processFailed("sparse packet descriptor and q-scale counts differ")
-        }
-        guard !descriptors.isEmpty else {
-            return []
-        }
-        guard descriptors.count <= Int(UInt32.max) else {
-            throw PyrowaveError.invalidDimensions
-        }
+        try encodeSparsePacketsBatch([(
+            coefficientBuffer: coefficientBuffer,
+            coefficientCount: coefficientCount,
+            descriptors: descriptors,
+            qScaleCodes: qScaleCodes
+        )])[0]
+    }
 
-        var flatQScaleCodes = [UInt8]()
-        flatQScaleCodes.reserveCapacity(qScaleCodes.count * 16)
-        for codes in qScaleCodes {
-            guard codes.count == 16 else {
-                throw PyrowaveError.invalidBitstream("expected sixteen 8x8 quant scale codes")
-            }
-            flatQScaleCodes.append(contentsOf: codes)
+    func encodeSparsePacketsBatch(
+        _ planes: [(coefficientBuffer: MTLBuffer, coefficientCount: Int, descriptors: [MetalSparsePacketEncodeDescriptor], qScaleCodes: [[UInt8]])]
+    ) throws -> [[Data?]] {
+        guard !planes.isEmpty else {
+            return []
         }
 
         let maxPacketBytes = PyrowaveCoefficientBlockCodec.maximumEncodedBlockBytes
-        let outputBytes = Array(repeating: UInt8(0), count: descriptors.count * maxPacketBytes)
-        let outputSizes = Array(repeating: UInt32(0), count: descriptors.count)
-        guard let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptors.count * MemoryLayout<MetalSparsePacketEncodeDescriptor>.stride, options: .storageModeShared),
-              let qScaleBuffer = device.makeBuffer(bytes: flatQScaleCodes, length: flatQScaleCodes.count * MemoryLayout<UInt8>.stride, options: .storageModeShared),
-              let outputBuffer = device.makeBuffer(bytes: outputBytes, length: outputBytes.count * MemoryLayout<UInt8>.stride, options: .storageModeShared),
-              let sizeBuffer = device.makeBuffer(bytes: outputSizes, length: outputSizes.count * MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal sparse packet encode buffers")
+        var work = [(
+            planeIndex: Int,
+            coefficientBuffer: MTLBuffer,
+            descriptorBuffer: MTLBuffer,
+            qScaleBuffer: MTLBuffer,
+            outputBuffer: MTLBuffer,
+            sizeBuffer: MTLBuffer,
+            descriptorCount: Int
+        )]()
+        work.reserveCapacity(planes.count)
+        var results = Array(repeating: [Data?](), count: planes.count)
+
+        for (planeIndex, plane) in planes.enumerated() {
+            guard plane.coefficientCount > 0,
+                  plane.coefficientBuffer.length >= plane.coefficientCount * MemoryLayout<Int16>.stride,
+                  plane.descriptors.count == plane.qScaleCodes.count,
+                  plane.descriptors.count <= Int(UInt32.max) else {
+                throw PyrowaveError.invalidDimensions
+            }
+            guard !plane.descriptors.isEmpty else {
+                continue
+            }
+
+            var flatQScaleCodes = [UInt8]()
+            flatQScaleCodes.reserveCapacity(plane.qScaleCodes.count * 16)
+            for codes in plane.qScaleCodes {
+                guard codes.count == 16 else {
+                    throw PyrowaveError.invalidBitstream("expected sixteen 8x8 quant scale codes")
+                }
+                flatQScaleCodes.append(contentsOf: codes)
+            }
+
+            let outputBytes = Array(repeating: UInt8(0), count: plane.descriptors.count * maxPacketBytes)
+            let outputSizes = Array(repeating: UInt32(0), count: plane.descriptors.count)
+            guard let descriptorBuffer = device.makeBuffer(bytes: plane.descriptors, length: plane.descriptors.count * MemoryLayout<MetalSparsePacketEncodeDescriptor>.stride, options: .storageModeShared),
+                  let qScaleBuffer = device.makeBuffer(bytes: flatQScaleCodes, length: flatQScaleCodes.count * MemoryLayout<UInt8>.stride, options: .storageModeShared),
+                  let outputBuffer = device.makeBuffer(bytes: outputBytes, length: outputBytes.count * MemoryLayout<UInt8>.stride, options: .storageModeShared),
+                  let sizeBuffer = device.makeBuffer(bytes: outputSizes, length: outputSizes.count * MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal sparse packet encode buffers")
+            }
+            work.append((
+                planeIndex: planeIndex,
+                coefficientBuffer: plane.coefficientBuffer,
+                descriptorBuffer: descriptorBuffer,
+                qScaleBuffer: qScaleBuffer,
+                outputBuffer: outputBuffer,
+                sizeBuffer: sizeBuffer,
+                descriptorCount: plane.descriptors.count
+            ))
         }
 
-        var constants = SparsePacketEncodeConstants(
-            descriptorCount: UInt32(descriptors.count),
-            maxPacketBytes: UInt32(maxPacketBytes)
-        )
+        guard !work.isEmpty else {
+            return results
+        }
+
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw PyrowaveError.processFailed("failed to create Metal sparse packet encode command encoder")
         }
 
         encoder.setComputePipelineState(sparsePacketEncodePipeline)
-        encoder.setBuffer(coefficientBuffer, offset: 0, index: 0)
-        encoder.setBuffer(descriptorBuffer, offset: 0, index: 1)
-        encoder.setBuffer(qScaleBuffer, offset: 0, index: 2)
-        encoder.setBuffer(outputBuffer, offset: 0, index: 3)
-        encoder.setBuffer(sizeBuffer, offset: 0, index: 4)
-        encoder.setBytes(&constants, length: MemoryLayout<SparsePacketEncodeConstants>.stride, index: 5)
         let width = min(sparsePacketEncodePipeline.maxTotalThreadsPerThreadgroup, 256)
-        encoder.dispatchThreads(
-            MTLSize(width: descriptors.count, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
-        )
+        let threadsPerThreadgroup = MTLSize(width: width, height: 1, depth: 1)
+        for item in work {
+            var constants = SparsePacketEncodeConstants(
+                descriptorCount: UInt32(item.descriptorCount),
+                maxPacketBytes: UInt32(maxPacketBytes)
+            )
+            encoder.setBuffer(item.coefficientBuffer, offset: 0, index: 0)
+            encoder.setBuffer(item.descriptorBuffer, offset: 0, index: 1)
+            encoder.setBuffer(item.qScaleBuffer, offset: 0, index: 2)
+            encoder.setBuffer(item.outputBuffer, offset: 0, index: 3)
+            encoder.setBuffer(item.sizeBuffer, offset: 0, index: 4)
+            encoder.setBytes(&constants, length: MemoryLayout<SparsePacketEncodeConstants>.stride, index: 5)
+            encoder.dispatchThreads(
+                MTLSize(width: item.descriptorCount, height: 1, depth: 1),
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -944,21 +985,25 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("Metal sparse packet encode command failed: \(error)")
         }
 
-        let bytesPointer = outputBuffer.contents().bindMemory(to: UInt8.self, capacity: outputBytes.count)
-        let sizePointer = sizeBuffer.contents().bindMemory(to: UInt32.self, capacity: outputSizes.count)
-        let encodedBytes = Array(UnsafeBufferPointer(start: bytesPointer, count: outputBytes.count))
-        let encodedSizes = Array(UnsafeBufferPointer(start: sizePointer, count: outputSizes.count))
-        return encodedSizes.indices.map { index in
-            let size = Int(encodedSizes[index])
-            guard size > 0 else {
-                return nil
+        for item in work {
+            let outputByteCount = item.descriptorCount * maxPacketBytes
+            let bytesPointer = item.outputBuffer.contents().bindMemory(to: UInt8.self, capacity: outputByteCount)
+            let sizePointer = item.sizeBuffer.contents().bindMemory(to: UInt32.self, capacity: item.descriptorCount)
+            let encodedBytes = Array(UnsafeBufferPointer(start: bytesPointer, count: outputByteCount))
+            let encodedSizes = Array(UnsafeBufferPointer(start: sizePointer, count: item.descriptorCount))
+            results[item.planeIndex] = encodedSizes.indices.map { index in
+                let size = Int(encodedSizes[index])
+                guard size > 0 else {
+                    return nil
+                }
+                guard size <= maxPacketBytes else {
+                    return nil
+                }
+                let start = index * maxPacketBytes
+                return Data(encodedBytes[start..<start + size])
             }
-            guard size <= maxPacketBytes else {
-                return nil
-            }
-            let start = index * maxPacketBytes
-            return Data(encodedBytes[start..<start + size])
         }
+        return results
     }
 
     func rateControlBucketIndices(

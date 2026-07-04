@@ -1336,6 +1336,32 @@ import Metal
     #expect(metal.count == descriptors.count)
     #expect(metal[0] == cpu)
     #expect(metal[1] == nil)
+
+    let secondCoefficients = coefficients.enumerated().map { index, value in
+        index % 5 == 0 ? Int16(value / 2) : value
+    }
+    let coefficientSets = [coefficients, secondCoefficients]
+    let buffers = try coefficientSets.map { values -> MTLBuffer in
+        let byteLength = values.count * MemoryLayout<Int16>.stride
+        return try #require(backend.device.makeBuffer(bytes: values, length: byteLength, options: .storageModeShared))
+    }
+    let batched = try backend.encodeSparsePacketsBatch(buffers.indices.map {
+        (
+            coefficientBuffer: buffers[$0],
+            coefficientCount: coefficientSets[$0].count,
+            descriptors: descriptors,
+            qScaleCodes: [qScaleCodes, qScaleCodes]
+        )
+    })
+    #expect(batched.count == coefficientSets.count)
+    for index in coefficientSets.indices {
+        let single = try backend.encodeSparsePackets(
+            coefficients: coefficientSets[index],
+            descriptors: descriptors,
+            qScaleCodes: [qScaleCodes, qScaleCodes]
+        )
+        #expect(batched[index] == single)
+    }
 }
 
 @Test func metalRateControlBucketsMatchCPUReferenceWhenDeviceExists() throws {
