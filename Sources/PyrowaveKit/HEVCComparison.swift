@@ -43,6 +43,34 @@ public struct CodecBenchmarkResult: Codable, Equatable, Sendable {
     }
 }
 
+public struct CodecBenchmarkComparison: Codable, Equatable, Sendable {
+    public var pyrowaveToHEVCByteRatio: Double?
+    public var pyrowaveEncodeSpeedupOverHEVC: Double?
+    public var pyrowaveDecodeSpeedupOverHEVC: Double?
+    public var weightedPSNRDelta: Double?
+    public var note: String
+
+    public init(pyrowave: CodecBenchmarkResult, hevc: CodecBenchmarkResult) {
+        pyrowaveToHEVCByteRatio = Self.ratio(Double(pyrowave.encodedBytes), Double(hevc.encodedBytes))
+        pyrowaveEncodeSpeedupOverHEVC = Self.ratio(hevc.encodeSeconds, pyrowave.encodeSeconds)
+        pyrowaveDecodeSpeedupOverHEVC = Self.ratio(hevc.decodeSeconds, pyrowave.decodeSeconds)
+        if let pyrowavePSNR = pyrowave.metrics?.weightedPSNR,
+           let hevcPSNR = hevc.metrics?.weightedPSNR {
+            weightedPSNRDelta = pyrowavePSNR - hevcPSNR
+        } else {
+            weightedPSNRDelta = nil
+        }
+        note = "Ratios above 1.0 mean Pyrowave used more bytes or was faster than HEVC; weightedPSNRDelta is Pyrowave minus HEVC in dB."
+    }
+
+    private static func ratio(_ numerator: Double, _ denominator: Double) -> Double? {
+        guard numerator.isFinite, denominator.isFinite, denominator > 0 else {
+            return nil
+        }
+        return numerator / denominator
+    }
+}
+
 public enum HEVCComparison {
     private static let maximumQualityReferenceFrameRate = 60
 

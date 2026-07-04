@@ -13,6 +13,7 @@ struct BenchmarkReport: Codable {
     var artifacts: BenchmarkArtifacts
     var pyrowave: CodecBenchmarkResult
     var hevc: CodecBenchmarkResult
+    var comparison: CodecBenchmarkComparison
 }
 
 struct BenchmarkArtifacts: Codable {
@@ -25,7 +26,7 @@ struct BenchmarkArtifacts: Codable {
 
 struct Arguments {
     var input: URL?
-    var frames = 1
+    var frames = 60
     var outputDirectory = URL(fileURLWithPath: ".pyrowave-results", isDirectory: true)
     var width = 6144
     var height = 3456
@@ -98,6 +99,9 @@ struct Arguments {
             default:
                 throw PyrowaveError.unsupportedFormat("unknown argument \(argument)")
             }
+        }
+        guard frames > 0, width > 0, height > 0, bitrate > 0 else {
+            throw PyrowaveError.invalidDimensions
         }
     }
 }
@@ -178,7 +182,7 @@ func runPyrowave(loaded: LoadedFrames, configuration: CodecConfiguration, output
         encodeSeconds: encodeSeconds,
         decodeSeconds: decodeSeconds,
         metrics: metric,
-        note: "Hard-cutover v2 stream with Metal DWT, quantize/dequantize, sparse 32x32 blocks, and optional frame-size cap"
+        note: "Hard-cutover v2 stream with Metal plane pad/crop, DWT/iDWT, block quantization, sparse decode apply, rate-control stats, 32x32 sparse packets, and optional frame-size cap"
     )
 }
 
@@ -243,7 +247,8 @@ do {
             hevcDecodedY4M: BenchmarkArtifactNames.hevcDecodedY4M
         ),
         pyrowave: pyrowave,
-        hevc: hevc
+        hevc: hevc,
+        comparison: CodecBenchmarkComparison(pyrowave: pyrowave, hevc: hevc)
     )
 
     let encoder = JSONEncoder()

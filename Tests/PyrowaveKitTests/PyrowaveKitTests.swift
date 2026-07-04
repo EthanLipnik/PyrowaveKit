@@ -291,6 +291,53 @@ import Testing
     #expect(empty.decodeMillisecondsPerFrame == 0)
 }
 
+@Test func codecBenchmarkComparisonReportsHEVCDeltas() throws {
+    let pyrowave = CodecBenchmarkResult(
+        codec: "pyrowave",
+        frameCount: 60,
+        encodedBytes: 240,
+        encodeSeconds: 0.25,
+        decodeSeconds: 0.10,
+        metrics: FrameMetrics(
+            y: ComponentMetrics(mse: 1, psnr: 52),
+            cb: ComponentMetrics(mse: 2, psnr: 49),
+            cr: ComponentMetrics(mse: 3, psnr: 48),
+            weightedPSNR: 50
+        ),
+        note: nil
+    )
+    let hevc = CodecBenchmarkResult(
+        codec: "hevc",
+        frameCount: 60,
+        encodedBytes: 80,
+        encodeSeconds: 2.0,
+        decodeSeconds: 0.50,
+        metrics: FrameMetrics(
+            y: ComponentMetrics(mse: 2, psnr: 47),
+            cb: ComponentMetrics(mse: 3, psnr: 45),
+            cr: ComponentMetrics(mse: 4, psnr: 44),
+            weightedPSNR: 46
+        ),
+        note: nil
+    )
+
+    let comparison = CodecBenchmarkComparison(pyrowave: pyrowave, hevc: hevc)
+    #expect(comparison.pyrowaveToHEVCByteRatio == 3)
+    #expect(comparison.pyrowaveEncodeSpeedupOverHEVC == 8)
+    #expect(comparison.pyrowaveDecodeSpeedupOverHEVC == 5)
+    #expect(comparison.weightedPSNRDelta == 4)
+    #expect(comparison.note.contains("Pyrowave"))
+
+    let unavailable = CodecBenchmarkComparison(
+        pyrowave: CodecBenchmarkResult(codec: "pyrowave", frameCount: 0, encodedBytes: 0, encodeSeconds: 0, decodeSeconds: 0, metrics: nil, note: nil),
+        hevc: CodecBenchmarkResult(codec: "hevc", frameCount: 0, encodedBytes: 0, encodeSeconds: 0, decodeSeconds: 0, metrics: nil, note: nil)
+    )
+    #expect(unavailable.pyrowaveToHEVCByteRatio == nil)
+    #expect(unavailable.pyrowaveEncodeSpeedupOverHEVC == nil)
+    #expect(unavailable.pyrowaveDecodeSpeedupOverHEVC == nil)
+    #expect(unavailable.weightedPSNRDelta == nil)
+}
+
 @Test func metalBackendCompilesKernelsWhenDeviceExists() throws {
     #if canImport(Metal)
     do {
