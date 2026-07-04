@@ -1546,6 +1546,18 @@ import Metal
     for index in 1..<metalSavings.count {
         #expect(metalSavings[index] >= metalSavings[index - 1])
     }
+
+    let fused = try backend.rateControlBucketDataBatch([
+        (distortions: distortions, packetByteCosts: packetByteCosts),
+        (distortions: Array(distortions.reversed()), packetByteCosts: Array(packetByteCosts.reversed())),
+        (distortions: [], packetByteCosts: [])
+    ])
+    #expect(fused.bucketIndicesByPlane == batched)
+    let fusedCPUSavings = PyrowaveRateController.cumulativeBucketSavings(
+        blocksByPlane: [blocks, Array(blocks.reversed()), []],
+        bucketIndicesByPlane: fused.bucketIndicesByPlane
+    )
+    #expect(fused.cumulativeSavings == fusedCPUSavings)
 }
 
 @Test func metalCodecMatchesCPUReferenceWhenDeviceExists() throws {

@@ -1133,6 +1133,50 @@ public final class PyrowaveCodec: @unchecked Sendable {
         let packetByteCostsByPlane = blocksByPlane.map { blocks in
             blocks.map(\.packetByteCosts)
         }
+        let totalBlockCount = blocksByPlane.reduce(0) { $0 + $1.count }
+        if totalBlockCount < fusedRateControlBucketBlockThreshold {
+            return try separateMetalRateControlBucketData(
+                blocksByPlane: blocksByPlane,
+                distortionsByPlane: distortionsByPlane,
+                packetByteCostsByPlane: packetByteCostsByPlane
+            )
+        }
+
+        return try fusedMetalRateControlBucketData(
+            blocksByPlane: blocksByPlane,
+            distortionsByPlane: distortionsByPlane,
+            packetByteCostsByPlane: packetByteCostsByPlane
+        )
+    }
+
+    private func fusedMetalRateControlBucketData(
+        blocksByPlane: [[PyrowaveRateControlBlock]],
+        distortionsByPlane: [[[Float]]],
+        packetByteCostsByPlane: [[[Int]]]
+    ) throws -> MetalRateControlBucketData {
+        let bucketData = try metalBackend.rateControlBucketDataBatch(blocksByPlane.indices.map { index in
+            (
+                distortions: distortionsByPlane[index],
+                packetByteCosts: packetByteCostsByPlane[index]
+            )
+        })
+        let bucketsByPlane = bucketData.bucketIndicesByPlane
+        guard bucketsByPlane.count == blocksByPlane.count else {
+            throw PyrowaveError.processFailed("Metal rate-control bucket batch returned \(bucketsByPlane.count) planes for \(blocksByPlane.count) inputs")
+        }
+        for planeIndex in blocksByPlane.indices {
+            guard bucketsByPlane[planeIndex].count == blocksByPlane[planeIndex].count else {
+                throw PyrowaveError.processFailed("Metal rate-control bucket pass returned \(bucketsByPlane[planeIndex].count) blocks for \(blocksByPlane[planeIndex].count) inputs")
+            }
+        }
+        return MetalRateControlBucketData(indicesByPlane: bucketsByPlane, cumulativeSavings: bucketData.cumulativeSavings)
+    }
+
+    private func separateMetalRateControlBucketData(
+        blocksByPlane: [[PyrowaveRateControlBlock]],
+        distortionsByPlane: [[[Float]]],
+        packetByteCostsByPlane: [[[Int]]]
+    ) throws -> MetalRateControlBucketData {
         let bucketsByPlane = try metalBackend.rateControlBucketIndicesBatch(blocksByPlane.indices.map { index in
             (
                 distortions: distortionsByPlane[index],
@@ -1161,6 +1205,10 @@ public final class PyrowaveCodec: @unchecked Sendable {
 
     private var frameHeaderSize: Int {
         8
+    }
+
+    private var fusedRateControlBucketBlockThreshold: Int {
+        30_000
     }
 
     private func sparseBlocks(
