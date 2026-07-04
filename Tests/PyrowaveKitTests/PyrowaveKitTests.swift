@@ -376,6 +376,23 @@ import Testing
     }
 }
 
+@Test func packetStreamDecoderRejectsCoefficientPacketShorterThanHeader() throws {
+    let stream = try PyrowavePacketStreamDecoder(width: 64, height: 64, chroma: .yuv420, useMetalAcceleration: false)
+    var writer = BinaryWriter()
+    try PyrowavePacketHeader(
+        ballot: 1,
+        payloadWords: 1,
+        sequence: 1,
+        extended: false,
+        quantCode: 0,
+        blockIndex: 0
+    ).write(to: &writer)
+
+    #expect(throws: PyrowaveError.invalidBitstream("payload_words is not large enough")) {
+        try stream.pushPacket(EncodedPacket(data: writer.data))
+    }
+}
+
 @Test func packetStreamDecoderRejectsSameSequenceHeaderMutation() throws {
     let frame = try TestFrames.synthetic420(width: 64, height: 64)
     let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
@@ -668,6 +685,23 @@ import Testing
 
     var reader = BinaryReader(payload)
     #expect(throws: PyrowaveError.invalidBitstream("non-zero coefficient packet padding")) {
+        _ = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
+    }
+}
+
+@Test func pyrowaveCoefficientBlockRejectsPayloadShorterThanHeader() throws {
+    var writer = BinaryWriter()
+    try PyrowavePacketHeader(
+        ballot: 1,
+        payloadWords: 1,
+        sequence: 0,
+        extended: false,
+        quantCode: 0,
+        blockIndex: 0
+    ).write(to: &writer)
+
+    var reader = BinaryReader(writer.data)
+    #expect(throws: PyrowaveError.invalidBitstream("payload_words is not large enough")) {
         _ = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
     }
 }

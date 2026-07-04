@@ -102,6 +102,9 @@ public final class PyrowavePacketStreamDecoder {
             }
 
             let packetEnd = packetStart + Int(header.payloadWords) * 4
+            guard packetEnd >= reader.offset else {
+                throw PyrowaveError.invalidBitstream("payload_words is not large enough")
+            }
             guard packetEnd <= data.count else {
                 throw PyrowaveError.truncatedInput
             }

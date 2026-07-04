@@ -516,13 +516,22 @@ struct PyrowaveCoefficientBlockCodec {
         guard !header.extended else {
             throw PyrowaveError.invalidBitstream("coefficient decoder received extended packet")
         }
-        guard header.ballot != 0 else {
-            return DecodedBlock(blockIndex: header.blockIndex, sequence: header.sequence, quantCode: header.quantCode, qScaleCodes: [], coefficients: [])
-        }
 
         let payloadEnd = blockStart + Int(header.payloadWords) * 4
+        guard payloadEnd >= reader.offset else {
+            throw PyrowaveError.invalidBitstream("payload_words is not large enough")
+        }
         guard payloadEnd <= reader.data.count else {
             throw PyrowaveError.truncatedInput
+        }
+        guard header.ballot != 0 else {
+            if reader.offset < payloadEnd {
+                guard reader.data[reader.offset..<payloadEnd].allSatisfy({ $0 == 0 }) else {
+                    throw PyrowaveError.invalidBitstream("non-zero coefficient packet padding")
+                }
+            }
+            try reader.seek(to: payloadEnd)
+            return DecodedBlock(blockIndex: header.blockIndex, sequence: header.sequence, quantCode: header.quantCode, qScaleCodes: [], coefficients: [])
         }
 
         let activeBlockCount = header.ballot.nonzeroBitCount
