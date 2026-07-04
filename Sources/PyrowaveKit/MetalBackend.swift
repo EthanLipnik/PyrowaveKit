@@ -479,11 +479,30 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         stride: Int,
         descriptors: [MetalPlaneQuantizationDescriptor]
     ) throws -> MetalPlaneQuantizationResult {
+        let result = try quantizePlaneBufferResult(samples, sampleCount: sampleCount, stride: stride, descriptors: descriptors)
+        guard result.coefficientCount > 0 else {
+            return MetalPlaneQuantizationResult(coefficients: [], qScaleCodesByDescriptor: result.qScaleCodesByDescriptor)
+        }
+        let coefficientsPointer = result.coefficientBuffer.contents().bindMemory(to: Int16.self, capacity: result.coefficientCount)
+        let coefficientValues = Array(UnsafeBufferPointer(start: coefficientsPointer, count: result.coefficientCount))
+        return MetalPlaneQuantizationResult(coefficients: coefficientValues, qScaleCodesByDescriptor: result.qScaleCodesByDescriptor)
+    }
+
+    func quantizePlaneBufferResult(
+        _ samples: MTLBuffer,
+        sampleCount: Int,
+        stride: Int,
+        descriptors: [MetalPlaneQuantizationDescriptor]
+    ) throws -> MetalPlaneQuantizationBufferResult {
         guard stride > 0, sampleCount > 0, samples.length >= sampleCount * MemoryLayout<Float>.stride else {
             throw PyrowaveError.invalidDimensions
         }
         guard !descriptors.isEmpty else {
-            return MetalPlaneQuantizationResult(coefficients: Array(repeating: 0, count: sampleCount), qScaleCodesByDescriptor: [])
+            guard let output = device.makeBuffer(length: sampleCount * MemoryLayout<Int16>.stride, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal plane quantization output buffer")
+            }
+            memset(output.contents(), 0, sampleCount * MemoryLayout<Int16>.stride)
+            return MetalPlaneQuantizationBufferResult(coefficientBuffer: output, coefficientCount: sampleCount, qScaleCodesByDescriptor: [])
         }
 
         let coefficientByteLength = sampleCount * MemoryLayout<Int16>.stride
@@ -509,14 +528,12 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
             constants: &constants
         )
 
-        let coefficientsPointer = output.contents().bindMemory(to: Int16.self, capacity: sampleCount)
-        let coefficientValues = Array(UnsafeBufferPointer(start: coefficientsPointer, count: sampleCount))
         let qScalePointer = qScaleBuffer.contents().bindMemory(to: UInt8.self, capacity: descriptors.count * 16)
         let flatQScales = Array(UnsafeBufferPointer(start: qScalePointer, count: descriptors.count * 16))
         let perDescriptor = Swift.stride(from: 0, to: flatQScales.count, by: 16).map {
             Array(flatQScales[$0..<$0 + 16])
         }
-        return MetalPlaneQuantizationResult(coefficients: coefficientValues, qScaleCodesByDescriptor: perDescriptor)
+        return MetalPlaneQuantizationBufferResult(coefficientBuffer: output, coefficientCount: sampleCount, qScaleCodesByDescriptor: perDescriptor)
     }
 
     func applySparseCoefficients(sampleCount: Int, entries: [MetalSparseCoefficientEntry]) throws -> [Float] {
@@ -590,6 +607,21 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         guard !coefficients.isEmpty else {
             throw PyrowaveError.invalidDimensions
         }
+        guard let coefficientBuffer = device.makeBuffer(bytes: coefficients, length: coefficients.count * MemoryLayout<Int16>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal rate-control coefficient buffer")
+        }
+        return try rateControlTileStats(coefficientBuffer: coefficientBuffer, coefficientCount: coefficients.count, descriptors: descriptors)
+    }
+
+    func rateControlTileStats(
+        coefficientBuffer: MTLBuffer,
+        coefficientCount: Int,
+        descriptors: [MetalRateControlStatsDescriptor]
+    ) throws -> [MetalRateControlTileStats] {
+        guard coefficientCount > 0,
+              coefficientBuffer.length >= coefficientCount * MemoryLayout<Int16>.stride else {
+            throw PyrowaveError.invalidDimensions
+        }
         guard !descriptors.isEmpty else {
             return []
         }
@@ -602,8 +634,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
             repeating: MetalRateControlQuantStats(squareError: 0, encodeCostBits: 0),
             count: descriptors.count * PyrowaveBlockStats.candidateCount
         )
-        guard let coefficientBuffer = device.makeBuffer(bytes: coefficients, length: coefficients.count * MemoryLayout<Int16>.stride, options: .storageModeShared),
-              let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptors.count * MemoryLayout<MetalRateControlStatsDescriptor>.stride, options: .storageModeShared),
+        guard let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptors.count * MemoryLayout<MetalRateControlStatsDescriptor>.stride, options: .storageModeShared),
               let numPlanesBuffer = device.makeBuffer(bytes: numPlanes, length: numPlanes.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
               let statsBuffer = device.makeBuffer(bytes: stats, length: stats.count * MemoryLayout<MetalRateControlQuantStats>.stride, options: .storageModeShared) else {
             throw PyrowaveError.processFailed("failed to allocate Metal rate-control buffers")
@@ -653,6 +684,21 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         guard !coefficients.isEmpty else {
             throw PyrowaveError.invalidDimensions
         }
+        guard let coefficientBuffer = device.makeBuffer(bytes: coefficients, length: coefficients.count * MemoryLayout<Int16>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal packet byte-cost coefficient buffer")
+        }
+        return try packetByteCosts(coefficientBuffer: coefficientBuffer, coefficientCount: coefficients.count, descriptors: descriptors)
+    }
+
+    func packetByteCosts(
+        coefficientBuffer: MTLBuffer,
+        coefficientCount: Int,
+        descriptors: [MetalPacketByteCostDescriptor]
+    ) throws -> [[Int]] {
+        guard coefficientCount > 0,
+              coefficientBuffer.length >= coefficientCount * MemoryLayout<Int16>.stride else {
+            throw PyrowaveError.invalidDimensions
+        }
         guard !descriptors.isEmpty else {
             return []
         }
@@ -661,8 +707,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         }
 
         let byteCosts = Array(repeating: UInt32(0), count: descriptors.count * PyrowaveBlockStats.candidateCount)
-        guard let coefficientBuffer = device.makeBuffer(bytes: coefficients, length: coefficients.count * MemoryLayout<Int16>.stride, options: .storageModeShared),
-              let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptors.count * MemoryLayout<MetalPacketByteCostDescriptor>.stride, options: .storageModeShared),
+        guard let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptors.count * MemoryLayout<MetalPacketByteCostDescriptor>.stride, options: .storageModeShared),
               let byteCostBuffer = device.makeBuffer(bytes: byteCosts, length: byteCosts.count * MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
             throw PyrowaveError.processFailed("failed to allocate Metal packet byte-cost buffers")
         }
@@ -706,6 +751,22 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         guard !coefficients.isEmpty else {
             throw PyrowaveError.invalidDimensions
         }
+        guard let coefficientBuffer = device.makeBuffer(bytes: coefficients, length: coefficients.count * MemoryLayout<Int16>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal sparse packet coefficient buffer")
+        }
+        return try encodeSparsePackets(coefficientBuffer: coefficientBuffer, coefficientCount: coefficients.count, descriptors: descriptors, qScaleCodes: qScaleCodes)
+    }
+
+    func encodeSparsePackets(
+        coefficientBuffer: MTLBuffer,
+        coefficientCount: Int,
+        descriptors: [MetalSparsePacketEncodeDescriptor],
+        qScaleCodes: [[UInt8]]
+    ) throws -> [Data?] {
+        guard coefficientCount > 0,
+              coefficientBuffer.length >= coefficientCount * MemoryLayout<Int16>.stride else {
+            throw PyrowaveError.invalidDimensions
+        }
         guard descriptors.count == qScaleCodes.count else {
             throw PyrowaveError.processFailed("sparse packet descriptor and q-scale counts differ")
         }
@@ -728,8 +789,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         let maxPacketBytes = PyrowaveCoefficientBlockCodec.maximumEncodedBlockBytes
         let outputBytes = Array(repeating: UInt8(0), count: descriptors.count * maxPacketBytes)
         let outputSizes = Array(repeating: UInt32(0), count: descriptors.count)
-        guard let coefficientBuffer = device.makeBuffer(bytes: coefficients, length: coefficients.count * MemoryLayout<Int16>.stride, options: .storageModeShared),
-              let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptors.count * MemoryLayout<MetalSparsePacketEncodeDescriptor>.stride, options: .storageModeShared),
+        guard let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptors.count * MemoryLayout<MetalSparsePacketEncodeDescriptor>.stride, options: .storageModeShared),
               let qScaleBuffer = device.makeBuffer(bytes: flatQScaleCodes, length: flatQScaleCodes.count * MemoryLayout<UInt8>.stride, options: .storageModeShared),
               let outputBuffer = device.makeBuffer(bytes: outputBytes, length: outputBytes.count * MemoryLayout<UInt8>.stride, options: .storageModeShared),
               let sizeBuffer = device.makeBuffer(bytes: outputSizes, length: outputSizes.count * MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
@@ -1364,6 +1424,12 @@ struct MetalPlaneQuantizationDescriptor {
 
 struct MetalPlaneQuantizationResult {
     var coefficients: [Int16]
+    var qScaleCodesByDescriptor: [[UInt8]]
+}
+
+struct MetalPlaneQuantizationBufferResult {
+    var coefficientBuffer: MTLBuffer
+    var coefficientCount: Int
     var qScaleCodesByDescriptor: [[UInt8]]
 }
 
