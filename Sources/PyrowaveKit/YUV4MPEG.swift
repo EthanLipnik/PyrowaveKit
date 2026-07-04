@@ -2,9 +2,13 @@ import Foundation
 
 public struct YUV4MPEGReader {
     private var handle: FileHandle
+    private let bytesPerSample: Int
+    private let sampleMax: Int
+    private let videoSignal: VideoSignalMetadata
     public let width: Int
     public let height: Int
     public let chroma: ChromaSubsampling
+    public let bitDepth: Int
     public let headerParameters: String
 
     public init(url: URL) throws {
@@ -16,19 +20,21 @@ public struct YUV4MPEGReader {
         headerParameters = String(line.dropFirst("YUV4MPEG2 ".count))
         width = try Self.parseRequiredInt(prefix: "W", parameters: headerParameters)
         height = try Self.parseRequiredInt(prefix: "H", parameters: headerParameters)
+        let chromaToken = Self.parseChromaToken(parameters: headerParameters)
 
-        if headerParameters.contains("C444") {
+        if chromaToken?.hasPrefix("C444") == true {
             chroma = .yuv444
-        } else if headerParameters.contains("C420") || !headerParameters.contains("C") {
+        } else if chromaToken?.hasPrefix("C420") == true || chromaToken == nil {
             chroma = .yuv420
         } else {
             throw PyrowaveError.unsupportedFormat(headerParameters)
         }
 
-        if headerParameters.contains("p10") || headerParameters.contains("p12") ||
-            headerParameters.contains("p14") || headerParameters.contains("p16") {
-            throw PyrowaveError.unsupportedFormat("only 8-bit YUV4MPEG is supported by the Swift harness")
-        }
+        bitDepth = try Self.parseBitDepth(chromaToken: chromaToken)
+        bytesPerSample = bitDepth > 8 ? 2 : 1
+        sampleMax = bitDepth == 16 ? 0xffff : (1 << bitDepth) - 1
+        let range: YCbCrRange = headerParameters.contains("XCOLORRANGE=FULL") ? .full : .limited
+        videoSignal = VideoSignalMetadata(yCbCrRange: range)
     }
 
     public mutating func readFrame() throws -> YUVFrame? {
@@ -41,12 +47,12 @@ public struct YUV4MPEGReader {
 
         let chromaWidth = width / chroma.chromaDivisor
         let chromaHeight = height / chroma.chromaDivisor
-        let ySize = width * height
-        let cSize = chromaWidth * chromaHeight
+        let ySampleCount = width * height
+        let cSampleCount = chromaWidth * chromaHeight
 
-        guard let yData = try handle.readExactly(byteCount: ySize),
-              let cbData = try handle.readExactly(byteCount: cSize),
-              let crData = try handle.readExactly(byteCount: cSize) else {
+        guard let yData = try handle.readExactly(byteCount: ySampleCount * bytesPerSample),
+              let cbData = try handle.readExactly(byteCount: cSampleCount * bytesPerSample),
+              let crData = try handle.readExactly(byteCount: cSampleCount * bytesPerSample) else {
             throw PyrowaveError.truncatedInput
         }
 
@@ -54,10 +60,26 @@ public struct YUV4MPEGReader {
             width: width,
             height: height,
             chroma: chroma,
-            y: Plane8(width: width, height: height, data: [UInt8](yData)),
-            cb: Plane8(width: chromaWidth, height: chromaHeight, data: [UInt8](cbData)),
-            cr: Plane8(width: chromaWidth, height: chromaHeight, data: [UInt8](crData))
+            y: Plane8(width: width, height: height, data: Self.decodeSamples(yData, bitDepth: bitDepth, sampleMax: sampleMax)),
+            cb: Plane8(width: chromaWidth, height: chromaHeight, data: Self.decodeSamples(cbData, bitDepth: bitDepth, sampleMax: sampleMax)),
+            cr: Plane8(width: chromaWidth, height: chromaHeight, data: Self.decodeSamples(crData, bitDepth: bitDepth, sampleMax: sampleMax)),
+            videoSignal: videoSignal
         )
+    }
+
+    private static func parseChromaToken(parameters: String) -> String? {
+        parameters.split(separator: " ").first { $0.hasPrefix("C") }.map(String.init)
+    }
+
+    private static func parseBitDepth(chromaToken: String?) throws -> Int {
+        guard let chromaToken else {
+            return 8
+        }
+
+        for depth in [10, 12, 14, 16] where chromaToken.hasSuffix("p\(depth)") {
+            return depth
+        }
+        return 8
     }
 
     private static func parseRequiredInt(prefix: String, parameters: String) throws -> Int {
@@ -67,6 +89,23 @@ public struct YUV4MPEGReader {
             }
         }
         throw PyrowaveError.unsupportedFormat("missing \(prefix) parameter")
+    }
+
+    private static func decodeSamples(_ data: Data, bitDepth: Int, sampleMax: Int) -> [UInt8] {
+        guard bitDepth > 8 else {
+            return [UInt8](data)
+        }
+
+        var samples = [UInt8]()
+        samples.reserveCapacity(data.count / 2)
+        var offset = 0
+        while offset + 1 < data.count {
+            let raw = Int(data[offset]) | (Int(data[offset + 1]) << 8)
+            let clamped = min(raw, sampleMax)
+            samples.append(UInt8((clamped * 255 + sampleMax / 2) / sampleMax))
+            offset += 2
+        }
+        return samples
     }
 }
 

@@ -91,6 +91,50 @@ import Testing
     }
 }
 
+@Test func yuv4mpegReadsHighBitDepth420AndRangeMetadata() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("sample10.y4m")
+
+    var data = Data("YUV4MPEG2 W2 H2 F60:1 Ip A1:1 C420p10 XCOLORRANGE=LIMITED\nFRAME\n".utf8)
+    for sample in [0, 512, 1023, 256, 128, 768] {
+        data.append(UInt8(sample & 0xff))
+        data.append(UInt8((sample >> 8) & 0xff))
+    }
+    try data.write(to: url)
+
+    var reader = try YUV4MPEGReader(url: url)
+    #expect(reader.bitDepth == 10)
+    #expect(reader.chroma == .yuv420)
+    let frame = try #require(try reader.readFrame())
+    #expect(frame.videoSignal.yCbCrRange == .limited)
+    #expect(frame.y.data == [0, 128, 255, 64])
+    #expect(frame.cb.data == [32])
+    #expect(frame.cr.data == [191])
+}
+
+@Test func yuv4mpegReadsHighBitDepth444FullRange() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("sample444-12.y4m")
+
+    var data = Data("YUV4MPEG2 W1 H1 F60:1 Ip A1:1 C444p12 XCOLORRANGE=FULL\nFRAME\n".utf8)
+    for sample in [4095, 2048, 0] {
+        data.append(UInt8(sample & 0xff))
+        data.append(UInt8((sample >> 8) & 0xff))
+    }
+    try data.write(to: url)
+
+    var reader = try YUV4MPEGReader(url: url)
+    #expect(reader.bitDepth == 12)
+    #expect(reader.chroma == .yuv444)
+    let frame = try #require(try reader.readFrame())
+    #expect(frame.videoSignal.yCbCrRange == .full)
+    #expect(frame.y.data == [255])
+    #expect(frame.cb.data == [128])
+    #expect(frame.cr.data == [0])
+}
+
 @Test func metalBackendCompilesKernelsWhenDeviceExists() throws {
     #if canImport(Metal)
     do {
