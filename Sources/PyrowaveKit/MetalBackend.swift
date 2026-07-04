@@ -138,59 +138,77 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     }
 
     func padTexturePlaneBuffer(_ texture: MTLTexture, channel: Int = 0, paddedWidth: Int, paddedHeight: Int) throws -> MTLBuffer {
-        let validChannel: Bool
-        switch texture.pixelFormat {
-        case .r8Unorm:
-            validChannel = channel == 0
-        case .rg8Unorm:
-            validChannel = channel == 0 || channel == 1
-        default:
-            validChannel = false
-        }
-        guard validChannel else {
-            throw PyrowaveError.unsupportedFormat("Metal texture padding expects r8Unorm channel 0 or rg8Unorm channel 0/1")
-        }
-        guard texture.width > 0,
-              texture.height > 0,
-              paddedWidth > 0,
-              paddedHeight > 0,
-              texture.width <= Int(UInt32.max),
-              texture.height <= Int(UInt32.max),
-              paddedWidth <= Int(UInt32.max),
-              paddedHeight <= Int(UInt32.max) else {
-            throw PyrowaveError.invalidDimensions
-        }
-        let sampleCount = paddedWidth * paddedHeight
-        guard sampleCount > 0, sampleCount <= Int(UInt32.max) else {
-            throw PyrowaveError.invalidDimensions
+        try padTexturePlaneBuffers([(texture: texture, channel: channel, paddedWidth: paddedWidth, paddedHeight: paddedHeight)])[0]
+    }
+
+    func padTexturePlaneBuffers(
+        _ planes: [(texture: MTLTexture, channel: Int, paddedWidth: Int, paddedHeight: Int)]
+    ) throws -> [MTLBuffer] {
+        guard !planes.isEmpty else {
+            return []
         }
 
-        guard let output = device.makeBuffer(length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal texture padding buffer")
+        var outputs = [MTLBuffer]()
+        outputs.reserveCapacity(planes.count)
+        for plane in planes {
+            let validChannel: Bool
+            switch plane.texture.pixelFormat {
+            case .r8Unorm:
+                validChannel = plane.channel == 0
+            case .rg8Unorm:
+                validChannel = plane.channel == 0 || plane.channel == 1
+            default:
+                validChannel = false
+            }
+            guard validChannel else {
+                throw PyrowaveError.unsupportedFormat("Metal texture padding expects r8Unorm channel 0 or rg8Unorm channel 0/1")
+            }
+            guard plane.texture.width > 0,
+                  plane.texture.height > 0,
+                  plane.paddedWidth > 0,
+                  plane.paddedHeight > 0,
+                  plane.texture.width <= Int(UInt32.max),
+                  plane.texture.height <= Int(UInt32.max),
+                  plane.paddedWidth <= Int(UInt32.max),
+                  plane.paddedHeight <= Int(UInt32.max) else {
+                throw PyrowaveError.invalidDimensions
+            }
+            let sampleCount = plane.paddedWidth * plane.paddedHeight
+            guard sampleCount > 0, sampleCount <= Int(UInt32.max) else {
+                throw PyrowaveError.invalidDimensions
+            }
+
+            guard let output = device.makeBuffer(length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal texture padding buffer")
+            }
+            outputs.append(output)
         }
 
-        var constants = PadPlaneConstants(
-            sourceWidth: UInt32(texture.width),
-            sourceHeight: UInt32(texture.height),
-            paddedWidth: UInt32(paddedWidth),
-            paddedHeight: UInt32(paddedHeight),
-            channel: UInt32(channel)
-        )
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw PyrowaveError.processFailed("failed to create Metal texture padding command encoder")
         }
 
         encoder.setComputePipelineState(padTexturePlanePipeline)
-        encoder.setTexture(texture, index: 0)
-        encoder.setBuffer(output, offset: 0, index: 0)
-        encoder.setBytes(&constants, length: MemoryLayout<PadPlaneConstants>.stride, index: 1)
         let width = min(16, padTexturePlanePipeline.maxTotalThreadsPerThreadgroup)
         let height = max(1, min(16, padTexturePlanePipeline.maxTotalThreadsPerThreadgroup / width))
-        encoder.dispatchThreads(
-            MTLSize(width: paddedWidth, height: paddedHeight, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: width, height: height, depth: 1)
-        )
+        let threadsPerThreadgroup = MTLSize(width: width, height: height, depth: 1)
+        for (index, plane) in planes.enumerated() {
+            var constants = PadPlaneConstants(
+                sourceWidth: UInt32(plane.texture.width),
+                sourceHeight: UInt32(plane.texture.height),
+                paddedWidth: UInt32(plane.paddedWidth),
+                paddedHeight: UInt32(plane.paddedHeight),
+                channel: UInt32(plane.channel)
+            )
+            encoder.setTexture(plane.texture, index: 0)
+            encoder.setBuffer(outputs[index], offset: 0, index: 0)
+            encoder.setBytes(&constants, length: MemoryLayout<PadPlaneConstants>.stride, index: 1)
+            encoder.dispatchThreads(
+                MTLSize(width: plane.paddedWidth, height: plane.paddedHeight, depth: 1),
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -199,7 +217,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("Metal texture padding command failed: \(error)")
         }
 
-        return output
+        return outputs
     }
 
     func cropPlane(_ samples: [Float], paddedWidth: Int, width: Int, height: Int) throws -> Plane8 {
@@ -1176,75 +1194,95 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     }
 
     func forwardWaveletBuffer(_ buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int) throws -> MTLBuffer {
-        guard sampleCount == width * height,
-              buffer.length >= sampleCount * MemoryLayout<Float>.stride else {
-            throw PyrowaveError.invalidDimensions
-        }
-        try validateWaveletShape(width: width, height: height, levels: levels)
-        guard sampleCount > 0 else { return buffer }
+        return try forwardWaveletBuffers([(buffer: buffer, sampleCount: sampleCount, width: width, height: height, levels: levels)])[0]
+    }
 
-        let byteLength = sampleCount * MemoryLayout<Float>.stride
-        guard let scratch = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal DWT scratch buffer")
+    func forwardWaveletBuffers(_ planes: [(buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int)]) throws -> [MTLBuffer] {
+        guard !planes.isEmpty else {
+            return []
         }
-        let primary = buffer
+        for plane in planes {
+            guard plane.sampleCount == plane.width * plane.height,
+                  plane.buffer.length >= plane.sampleCount * MemoryLayout<Float>.stride else {
+                throw PyrowaveError.invalidDimensions
+            }
+            try validateWaveletShape(width: plane.width, height: plane.height, levels: plane.levels)
+        }
+
+        var scratchBuffers = [MTLBuffer]()
+        scratchBuffers.reserveCapacity(planes.count)
+        for plane in planes {
+            guard plane.sampleCount > 0 else {
+                scratchBuffers.append(plane.buffer)
+                continue
+            }
+            guard let scratch = device.makeBuffer(length: plane.sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal DWT scratch buffer")
+            }
+            scratchBuffers.append(scratch)
+        }
+
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw PyrowaveError.processFailed("failed to create Metal DWT command buffer")
         }
 
-        var activeWidth = width
-        var activeHeight = height
-        for _ in 0..<levels {
-            for phase in 0...4 {
-                try encodeDWTInPlace(
+        for (planeIndex, plane) in planes.enumerated() where plane.sampleCount > 0 {
+            let primary = plane.buffer
+            let scratch = scratchBuffers[planeIndex]
+            var activeWidth = plane.width
+            var activeHeight = plane.height
+            for _ in 0..<plane.levels {
+                for phase in 0...4 {
+                    try encodeDWTInPlace(
+                        commandBuffer: commandBuffer,
+                        pipeline: dwtLiftRowsPipeline,
+                        buffer: primary,
+                        activeWidth: activeWidth,
+                        activeHeight: activeHeight,
+                        stride: plane.width,
+                        phase: phase
+                    )
+                }
+                try encodeDWTCopy(
                     commandBuffer: commandBuffer,
-                    pipeline: dwtLiftRowsPipeline,
-                    buffer: primary,
+                    pipeline: dwtPackRowsPipeline,
+                    input: primary,
+                    output: scratch,
                     activeWidth: activeWidth,
                     activeHeight: activeHeight,
-                    stride: width,
-                    phase: phase
+                    stride: plane.width,
+                    phase: 0
                 )
-            }
-            try encodeDWTCopy(
-                commandBuffer: commandBuffer,
-                pipeline: dwtPackRowsPipeline,
-                input: primary,
-                output: scratch,
-                activeWidth: activeWidth,
-                activeHeight: activeHeight,
-                stride: width,
-                phase: 0
-            )
 
-            for phase in 0...4 {
-                try encodeDWTInPlace(
+                for phase in 0...4 {
+                    try encodeDWTInPlace(
+                        commandBuffer: commandBuffer,
+                        pipeline: dwtLiftColumnsPipeline,
+                        buffer: scratch,
+                        activeWidth: activeWidth,
+                        activeHeight: activeHeight,
+                        stride: plane.width,
+                        phase: phase
+                    )
+                }
+                try encodeDWTCopy(
                     commandBuffer: commandBuffer,
-                    pipeline: dwtLiftColumnsPipeline,
-                    buffer: scratch,
+                    pipeline: dwtPackColumnsPipeline,
+                    input: scratch,
+                    output: primary,
                     activeWidth: activeWidth,
                     activeHeight: activeHeight,
-                    stride: width,
-                    phase: phase
+                    stride: plane.width,
+                    phase: 0
                 )
-            }
-            try encodeDWTCopy(
-                commandBuffer: commandBuffer,
-                pipeline: dwtPackColumnsPipeline,
-                input: scratch,
-                output: primary,
-                activeWidth: activeWidth,
-                activeHeight: activeHeight,
-                stride: width,
-                phase: 0
-            )
 
-            activeWidth /= 2
-            activeHeight /= 2
+                activeWidth /= 2
+                activeHeight /= 2
+            }
         }
 
         try finish(commandBuffer: commandBuffer, context: "Metal DWT")
-        return primary
+        return planes.map(\.buffer)
     }
 
     func inverseWavelet(_ coefficients: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {

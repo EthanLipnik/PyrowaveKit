@@ -964,6 +964,34 @@ import Metal
     #expect(maxError < 0.000001)
 }
 
+@Test func metalTexturePlanePaddingBatchMatchesSinglePlaneResultsWhenDeviceExists() throws {
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let plane = try Plane8(width: 3, height: 2, data: [
+        0, 64, 128,
+        192, 224, 255
+    ])
+    let firstTexture = try plane.makeMetalTexture(device: backend.device)
+    let secondTexture = try plane.makeMetalTexture(device: backend.device)
+    let batchedBuffers = try backend.padTexturePlaneBuffers([
+        (texture: firstTexture, channel: 0, paddedWidth: 9, paddedHeight: 7),
+        (texture: secondTexture, channel: 0, paddedWidth: 9, paddedHeight: 7)
+    ])
+    #expect(batchedBuffers.count == 2)
+
+    let single = try backend.padTexturePlane(firstTexture, paddedWidth: 9, paddedHeight: 7)
+    for buffer in batchedBuffers {
+        let pointer = buffer.contents().bindMemory(to: Float.self, capacity: single.count)
+        let batched = Array(UnsafeBufferPointer(start: pointer, count: single.count))
+        #expect(batched == single)
+    }
+}
+
 @Test func metalPlaneCropMatchesCPUReferenceWhenDeviceExists() throws {
     let backend: MetalPyrowaveBackend
     do {
@@ -1519,6 +1547,42 @@ import Metal
 
     let inverseError = zip(cpuInverse, metalInverse).map { abs($0 - $1) }.max() ?? 0
     #expect(inverseError < 0.0001)
+}
+
+@Test func metalForwardWaveletBatchMatchesSinglePlaneResultsWhenDeviceExists() throws {
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let width = 128
+    let height = 128
+    let levels = 3
+    let planes = (0..<3).map { planeIndex in
+        (0..<(width * height)).map { index in
+            Float((index * (13 + planeIndex * 5) + planeIndex * 19) % 251) / 251.0 - 0.5
+        }
+    }
+    let single = try planes.map {
+        try backend.forwardWavelet($0, width: width, height: height, levels: levels)
+    }
+    let buffers = try planes.map { samples -> MTLBuffer in
+        let byteLength = samples.count * MemoryLayout<Float>.stride
+        return try #require(backend.device.makeBuffer(bytes: samples, length: byteLength, options: .storageModeShared))
+    }
+
+    let batchedBuffers = try backend.forwardWaveletBuffers(buffers.map {
+        (buffer: $0, sampleCount: width * height, width: width, height: height, levels: levels)
+    })
+    #expect(batchedBuffers.count == buffers.count)
+    for index in batchedBuffers.indices {
+        let pointer = batchedBuffers[index].contents().bindMemory(to: Float.self, capacity: width * height)
+        let batched = Array(UnsafeBufferPointer(start: pointer, count: width * height))
+        let maxError = zip(batched, single[index]).map { abs($0 - $1) }.max() ?? 0
+        #expect(maxError < 0.0001)
+    }
 }
 
 @Test func metalInverseWaveletBatchMatchesSinglePlaneResultsWhenDeviceExists() throws {

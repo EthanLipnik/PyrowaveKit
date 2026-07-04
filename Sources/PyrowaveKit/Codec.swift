@@ -332,11 +332,18 @@ public final class PyrowaveCodec: @unchecked Sendable {
         }
 
         let layout = try PyrowaveBlockLayout(width: yTexture.width, height: yTexture.height, chroma: chroma)
-        let encodedPlanes = [
-            try encodeTexturePlane(yTexture, channel: 0, component: 0, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: chroma, layout: layout, configuration: configuration),
-            try encodeTexturePlane(cbTexture, channel: 0, component: 1, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: chroma, layout: layout, configuration: configuration),
-            try encodeTexturePlane(crTexture, channel: 0, component: 2, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: chroma, layout: layout, configuration: configuration)
-        ]
+        let encodedPlanes = try encodeTexturePlanes(
+            [
+                (texture: yTexture, channel: 0, component: 0),
+                (texture: cbTexture, channel: 0, component: 1),
+                (texture: crTexture, channel: 0, component: 2)
+            ],
+            frameWidth: yTexture.width,
+            frameHeight: yTexture.height,
+            chroma: chroma,
+            layout: layout,
+            configuration: configuration
+        )
         return try encodeFrame(
             width: yTexture.width,
             height: yTexture.height,
@@ -369,11 +376,18 @@ public final class PyrowaveCodec: @unchecked Sendable {
         }
 
         let layout = try PyrowaveBlockLayout(width: yTexture.width, height: yTexture.height, chroma: .yuv420)
-        let encodedPlanes = [
-            try encodeTexturePlane(yTexture, channel: 0, component: 0, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: .yuv420, layout: layout, configuration: configuration),
-            try encodeTexturePlane(cbCrTexture, channel: 0, component: 1, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: .yuv420, layout: layout, configuration: configuration),
-            try encodeTexturePlane(cbCrTexture, channel: 1, component: 2, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: .yuv420, layout: layout, configuration: configuration)
-        ]
+        let encodedPlanes = try encodeTexturePlanes(
+            [
+                (texture: yTexture, channel: 0, component: 0),
+                (texture: cbCrTexture, channel: 0, component: 1),
+                (texture: cbCrTexture, channel: 1, component: 2)
+            ],
+            frameWidth: yTexture.width,
+            frameHeight: yTexture.height,
+            chroma: .yuv420,
+            layout: layout,
+            configuration: configuration
+        )
         return try encodeFrame(
             width: yTexture.width,
             height: yTexture.height,
@@ -767,6 +781,80 @@ public final class PyrowaveCodec: @unchecked Sendable {
             layout: layout,
             configuration: configuration
         )
+    }
+
+    private func encodeTexturePlanes(
+        _ inputs: [(texture: MTLTexture, channel: Int, component: Int)],
+        frameWidth: Int,
+        frameHeight: Int,
+        chroma: ChromaSubsampling,
+        layout: PyrowaveBlockLayout,
+        configuration: CodecConfiguration
+    ) throws -> [EncodedPlane] {
+        let geometries = try inputs.map { input in
+            let geometry = planeGeometry(
+                component: input.component,
+                frameWidth: frameWidth,
+                frameHeight: frameHeight,
+                chroma: chroma,
+                requestedLevels: configuration.decompositionLevels
+            )
+            guard input.texture.width == geometry.visibleWidth,
+                  input.texture.height == geometry.visibleHeight else {
+                throw PyrowaveError.invalidDimensions
+            }
+            return geometry
+        }
+        let padded = try metalBackend.padTexturePlaneBuffers(inputs.indices.map { index in
+            (
+                texture: inputs[index].texture,
+                channel: inputs[index].channel,
+                paddedWidth: geometries[index].paddedWidth,
+                paddedHeight: geometries[index].paddedHeight
+            )
+        })
+        let levels = geometries.map {
+            Wavelet.usableLevels(width: $0.paddedWidth, height: $0.paddedHeight, requested: $0.requestedLevels)
+        }
+        let transformed = try metalBackend.forwardWaveletBuffers(inputs.indices.map { index in
+            (
+                buffer: padded[index],
+                sampleCount: geometries[index].paddedWidth * geometries[index].paddedHeight,
+                width: geometries[index].paddedWidth,
+                height: geometries[index].paddedHeight,
+                levels: levels[index]
+            )
+        })
+
+        return try inputs.indices.map { index in
+            let descriptors = planeBlockDescriptors(
+                component: inputs[index].component,
+                paddedWidth: geometries[index].paddedWidth,
+                paddedHeight: geometries[index].paddedHeight,
+                levels: levels[index],
+                layout: layout
+            )
+            let sampleCount = geometries[index].paddedWidth * geometries[index].paddedHeight
+            let quantized = try quantizeResidentBuffer(
+                transformed[index],
+                sampleCount: sampleCount,
+                stride: geometries[index].paddedWidth,
+                descriptors: descriptors,
+                component: inputs[index].component,
+                configuration: configuration
+            )
+            return EncodedPlane(
+                component: inputs[index].component,
+                paddedWidth: geometries[index].paddedWidth,
+                paddedHeight: geometries[index].paddedHeight,
+                levels: levels[index],
+                quantCodesByBlockIndex: quantized.quantCodesByBlockIndex,
+                qScaleCodesByBlockIndex: quantized.qScaleCodesByBlockIndex,
+                coefficients: [],
+                coefficientBuffer: quantized.coefficientBuffer,
+                coefficientCount: quantized.coefficientCount
+            )
+        }
     }
 
     private func encodePaddedPlane(
