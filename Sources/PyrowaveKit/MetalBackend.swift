@@ -96,7 +96,8 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
             sourceWidth: UInt32(plane.width),
             sourceHeight: UInt32(plane.height),
             paddedWidth: UInt32(paddedWidth),
-            paddedHeight: UInt32(paddedHeight)
+            paddedHeight: UInt32(paddedHeight),
+            channel: 0
         )
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -125,9 +126,20 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         return Array(UnsafeBufferPointer(start: pointer, count: sampleCount))
     }
 
-    func padTexturePlane(_ texture: MTLTexture, paddedWidth: Int, paddedHeight: Int) throws -> [Float] {
-        guard texture.pixelFormat == .r8Unorm,
-              texture.width > 0,
+    func padTexturePlane(_ texture: MTLTexture, channel: Int = 0, paddedWidth: Int, paddedHeight: Int) throws -> [Float] {
+        let validChannel: Bool
+        switch texture.pixelFormat {
+        case .r8Unorm:
+            validChannel = channel == 0
+        case .rg8Unorm:
+            validChannel = channel == 0 || channel == 1
+        default:
+            validChannel = false
+        }
+        guard validChannel else {
+            throw PyrowaveError.unsupportedFormat("Metal texture padding expects r8Unorm channel 0 or rg8Unorm channel 0/1")
+        }
+        guard texture.width > 0,
               texture.height > 0,
               paddedWidth > 0,
               paddedHeight > 0,
@@ -150,7 +162,8 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
             sourceWidth: UInt32(texture.width),
             sourceHeight: UInt32(texture.height),
             paddedWidth: UInt32(paddedWidth),
-            paddedHeight: UInt32(paddedHeight)
+            paddedHeight: UInt32(paddedHeight),
+            channel: UInt32(channel)
         )
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -1166,6 +1179,7 @@ private struct PadPlaneConstants {
     var sourceHeight: UInt32
     var paddedWidth: UInt32
     var paddedHeight: UInt32
+    var channel: UInt32
 }
 
 private struct CropPlaneConstants {

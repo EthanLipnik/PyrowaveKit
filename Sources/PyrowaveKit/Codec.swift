@@ -1,4 +1,5 @@
 import Foundation
+import CoreVideo
 import Metal
 
 public extension EncodedFrame {
@@ -202,14 +203,21 @@ public final class PyrowavePacketStreamDecoder {
     }
 }
 
-public final class PyrowaveCodec: Sendable {
+public final class PyrowaveCodec: @unchecked Sendable {
     private static let sparseBlockSize = 32
 
     private let metalBackend: MetalPyrowaveBackend
+    let coreVideoTextureCache: CVMetalTextureCache
     private let sequenceCounter = SequenceCounter()
 
     public init() throws {
         metalBackend = try MetalPyrowaveBackend()
+        var textureCache: CVMetalTextureCache?
+        let status = CVMetalTextureCacheCreate(nil, nil, metalBackend.device, nil, &textureCache)
+        guard status == kCVReturnSuccess, let textureCache else {
+            throw PyrowaveError.processFailed("failed to create CoreVideo Metal texture cache")
+        }
+        coreVideoTextureCache = textureCache
     }
 
     public func encode(_ frame: YUVFrame, configuration: CodecConfiguration = CodecConfiguration()) throws -> EncodedFrame {
@@ -300,14 +308,70 @@ public final class PyrowaveCodec: Sendable {
             throw PyrowaveError.invalidDimensions
         }
 
-        let sequenceNumber = sequenceCounter.next()
         let layout = try PyrowaveBlockLayout(width: yTexture.width, height: yTexture.height, chroma: chroma)
         let encodedPlanes = [
-            try encodeTexturePlane(yTexture, component: 0, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: chroma, layout: layout, configuration: configuration),
-            try encodeTexturePlane(cbTexture, component: 1, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: chroma, layout: layout, configuration: configuration),
-            try encodeTexturePlane(crTexture, component: 2, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: chroma, layout: layout, configuration: configuration)
+            try encodeTexturePlane(yTexture, channel: 0, component: 0, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: chroma, layout: layout, configuration: configuration),
+            try encodeTexturePlane(cbTexture, channel: 0, component: 1, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: chroma, layout: layout, configuration: configuration),
+            try encodeTexturePlane(crTexture, channel: 0, component: 2, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: chroma, layout: layout, configuration: configuration)
         ]
+        return try encodeFrame(
+            width: yTexture.width,
+            height: yTexture.height,
+            chroma: chroma,
+            videoSignal: videoSignal,
+            encodedPlanes: encodedPlanes,
+            layout: layout,
+            configuration: configuration
+        )
+    }
 
+    public func encode(
+        yTexture: MTLTexture,
+        cbCrTexture: MTLTexture,
+        configuration: CodecConfiguration = CodecConfiguration(),
+        videoSignal: VideoSignalMetadata = .default
+    ) throws -> EncodedFrame {
+        guard configuration.decompositionLevels == PyrowaveBitstream.decompositionLevels,
+              configuration.quantizationStep > 0,
+              configuration.maximumEncodedBytes == nil || configuration.maximumEncodedBytes! > 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard yTexture.pixelFormat == .r8Unorm,
+              cbCrTexture.pixelFormat == .rg8Unorm,
+              yTexture.width > 0,
+              yTexture.height > 0,
+              cbCrTexture.width == yTexture.width / 2,
+              cbCrTexture.height == yTexture.height / 2 else {
+            throw PyrowaveError.unsupportedFormat("Metal NV12 encode expects r8Unorm luma and rg8Unorm chroma planes")
+        }
+
+        let layout = try PyrowaveBlockLayout(width: yTexture.width, height: yTexture.height, chroma: .yuv420)
+        let encodedPlanes = [
+            try encodeTexturePlane(yTexture, channel: 0, component: 0, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: .yuv420, layout: layout, configuration: configuration),
+            try encodeTexturePlane(cbCrTexture, channel: 0, component: 1, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: .yuv420, layout: layout, configuration: configuration),
+            try encodeTexturePlane(cbCrTexture, channel: 1, component: 2, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: .yuv420, layout: layout, configuration: configuration)
+        ]
+        return try encodeFrame(
+            width: yTexture.width,
+            height: yTexture.height,
+            chroma: .yuv420,
+            videoSignal: videoSignal,
+            encodedPlanes: encodedPlanes,
+            layout: layout,
+            configuration: configuration
+        )
+    }
+
+    private func encodeFrame(
+        width: Int,
+        height: Int,
+        chroma: ChromaSubsampling,
+        videoSignal: VideoSignalMetadata,
+        encodedPlanes: [EncodedPlane],
+        layout: PyrowaveBlockLayout,
+        configuration: CodecConfiguration
+    ) throws -> EncodedFrame {
+        let sequenceNumber = sequenceCounter.next()
         let rateControlPlan = try selectSparseRateControlPlan(
             planes: encodedPlanes,
             layout: layout,
@@ -327,8 +391,8 @@ public final class PyrowaveCodec: Sendable {
 
         var writer = BinaryWriter()
         let sequence = try PyrowaveSequenceHeader(
-            width: yTexture.width,
-            height: yTexture.height,
+            width: width,
+            height: height,
             sequence: sequenceNumber,
             totalBlocks: sortedBlocks.count,
             chroma: chroma,
@@ -501,6 +565,7 @@ public final class PyrowaveCodec: Sendable {
 
     private func encodeTexturePlane(
         _ texture: MTLTexture,
+        channel: Int,
         component: Int,
         frameWidth: Int,
         frameHeight: Int,
@@ -514,7 +579,7 @@ public final class PyrowaveCodec: Sendable {
             throw PyrowaveError.invalidDimensions
         }
         return try encodePaddedPlane(
-            samples: try metalBackend.padTexturePlane(texture, paddedWidth: geometry.paddedWidth, paddedHeight: geometry.paddedHeight),
+            samples: try metalBackend.padTexturePlane(texture, channel: channel, paddedWidth: geometry.paddedWidth, paddedHeight: geometry.paddedHeight),
             paddedWidth: geometry.paddedWidth,
             paddedHeight: geometry.paddedHeight,
             requestedLevels: geometry.requestedLevels,

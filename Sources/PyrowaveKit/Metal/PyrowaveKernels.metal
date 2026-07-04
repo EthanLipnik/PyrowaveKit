@@ -11,6 +11,7 @@ struct PadPlaneConstants {
     uint sourceHeight;
     uint paddedWidth;
     uint paddedHeight;
+    uint channel;
 };
 
 struct CropPlaneConstants {
@@ -160,7 +161,9 @@ kernel void pyrowave_pad_texture_plane(
 
     uint sourceX = min(x, constants.sourceWidth - 1u);
     uint sourceY = min(y, constants.sourceHeight - 1u);
-    output[y * constants.paddedWidth + x] = input.read(uint2(sourceX, sourceY)).r - 0.5f;
+    float4 value = input.read(uint2(sourceX, sourceY));
+    float sample = constants.channel == 1u ? value.g : value.r;
+    output[y * constants.paddedWidth + x] = sample - 0.5f;
 }
 
 kernel void pyrowave_crop_plane(

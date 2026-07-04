@@ -208,8 +208,8 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
 
 public enum PyrowaveBenchmarkRunner {
     public static let pyrowaveCodecName = "pyrowavekit-swift-metal"
-    public static let timedBenchmarkScopeNote = "Timed encode/decode excludes input loading, pixel-buffer preparation, artifact writes, report serialization, and quality metric generation."
-    public static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane and texture pad, crop, DWT/iDWT, block quantization, sparse packet byte-cost prefiltering, sparse packet emission, sparse decode apply, rate-control stats, bucket resolve, and savings prefix, 32x32 sparse packets, and optional frame-size cap. \(timedBenchmarkScopeNote)"
+    public static let timedBenchmarkScopeNote = "Timed encode/decode excludes input loading, pixel-buffer preparation, artifact writes, report serialization, and quality metric generation; encode starts from reusable CoreVideo-backed Metal texture views."
+    public static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane, texture, and NV12 texture-channel pad, crop, DWT/iDWT, block quantization, sparse packet byte-cost prefiltering, sparse packet emission, sparse decode apply, rate-control stats, bucket resolve, and savings prefix, 32x32 sparse packets, and optional frame-size cap. \(timedBenchmarkScopeNote)"
 
     public static func loadFrames(arguments: PyrowaveBenchmarkArguments) throws -> PyrowaveBenchmarkFrames {
         if let input = arguments.input {
@@ -242,12 +242,15 @@ public enum PyrowaveBenchmarkRunner {
     ) throws -> CodecBenchmarkResult {
         let codec = try PyrowaveCodec()
         let frames = loaded.frames
+        let inputPixelBuffers = try frames.map {
+            try $0.makeCVPixelBuffer(pixelFormat: YUVFrame.cvPixelFormat(for: $0.videoSignal))
+        }
         var encodedFrames = [EncodedFrame]()
         encodedFrames.reserveCapacity(frames.count)
 
         var stopwatch = Stopwatch()
-        for frame in frames {
-            encodedFrames.append(try codec.encode(frame, configuration: configuration))
+        for pixelBuffer in inputPixelBuffers {
+            encodedFrames.append(try codec.encode(pixelBuffer, configuration: configuration))
         }
         let encodeSeconds = stopwatch.lapSeconds()
 

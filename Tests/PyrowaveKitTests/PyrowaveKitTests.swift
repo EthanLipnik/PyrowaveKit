@@ -3,6 +3,7 @@ import Testing
 @testable import PyrowaveKit
 
 import CoreVideo
+import Metal
 
 @Test func hardCutoverSourceTreeContainsOnlySwiftAndMetalSources() throws {
     let packageRoot = URL(fileURLWithPath: #filePath)
@@ -827,6 +828,54 @@ import CoreVideo
             videoSignal: source.videoSignal
         )
         #expect(try Metrics.compare(source, streamed).weightedPSNR > 44.0)
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+}
+
+@Test func codecEncodesNV12MetalChromaTextureLikeSeparatePlanes() throws {
+    do {
+        let backend = try MetalPyrowaveBackend()
+        let source = try TestFrames.synthetic420(width: 64, height: 64)
+        let sourceTextures = try source.makeMetalTextures(device: backend.device)
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rg8Unorm,
+            width: source.cb.width,
+            height: source.cb.height,
+            mipmapped: false
+        )
+        descriptor.usage = [.shaderRead]
+        descriptor.storageMode = .shared
+        let cbCrTexture = try #require(backend.device.makeTexture(descriptor: descriptor))
+        var cbCr = Array(repeating: UInt8(0), count: source.cb.data.count * 2)
+        for index in source.cb.data.indices {
+            cbCr[index * 2] = source.cb.data[index]
+            cbCr[index * 2 + 1] = source.cr.data[index]
+        }
+        cbCr.withUnsafeBytes { bytes in
+            cbCrTexture.replace(
+                region: MTLRegionMake2D(0, 0, source.cb.width, source.cb.height),
+                mipmapLevel: 0,
+                withBytes: bytes.baseAddress!,
+                bytesPerRow: source.cb.width * 2
+            )
+        }
+
+        let configuration = CodecConfiguration(quantizationStep: 1.0 / 2048.0)
+        let separate = try PyrowaveCodec().encode(
+            yTexture: sourceTextures.y,
+            cbTexture: sourceTextures.cb,
+            crTexture: sourceTextures.cr,
+            configuration: configuration,
+            videoSignal: source.videoSignal
+        )
+        let nv12 = try PyrowaveCodec().encode(
+            yTexture: sourceTextures.y,
+            cbCrTexture: cbCrTexture,
+            configuration: configuration,
+            videoSignal: source.videoSignal
+        )
+        #expect(nv12.data == separate.data)
     } catch PyrowaveError.externalToolUnavailable {
         return
     }

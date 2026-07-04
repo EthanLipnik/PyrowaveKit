@@ -1,5 +1,6 @@
 import Foundation
 import CoreVideo
+import Metal
 
 extension YUVFrame {
     public init(
@@ -128,10 +129,77 @@ extension PyrowaveCodec {
         configuration: CodecConfiguration = CodecConfiguration(),
         videoSignal: VideoSignalMetadata? = nil
     ) throws -> EncodedFrame {
-        try encode(
-            YUVFrame(cvPixelBuffer: cvPixelBuffer, videoSignal: videoSignal),
-            configuration: configuration
+        let pixelFormat = CVPixelBufferGetPixelFormatType(cvPixelBuffer)
+        let supportedFormats: Set<OSType> = [
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        ]
+        guard supportedFormats.contains(pixelFormat),
+              CVPixelBufferGetPlaneCount(cvPixelBuffer) >= 2 else {
+            throw PyrowaveError.unsupportedFormat("CVPixelBuffer encode expects 8-bit NV12")
+        }
+
+        let width = CVPixelBufferGetWidthOfPlane(cvPixelBuffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(cvPixelBuffer, 0)
+        let chromaWidth = CVPixelBufferGetWidthOfPlane(cvPixelBuffer, 1)
+        let chromaHeight = CVPixelBufferGetHeightOfPlane(cvPixelBuffer, 1)
+        guard width > 0,
+              height > 0,
+              chromaWidth == width / 2,
+              chromaHeight == height / 2 else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        let yTexture = try makeMetalTexture(
+            from: cvPixelBuffer,
+            pixelFormat: .r8Unorm,
+            width: width,
+            height: height,
+            planeIndex: 0
         )
+        let cbCrTexture = try makeMetalTexture(
+            from: cvPixelBuffer,
+            pixelFormat: .rg8Unorm,
+            width: chromaWidth,
+            height: chromaHeight,
+            planeIndex: 1
+        )
+        let inferredSignal = VideoSignalMetadata(
+            yCbCrRange: pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ? .limited : .full
+        )
+        return try encode(
+            yTexture: yTexture.texture,
+            cbCrTexture: cbCrTexture.texture,
+            configuration: configuration,
+            videoSignal: videoSignal ?? inferredSignal
+        )
+    }
+
+    private func makeMetalTexture(
+        from cvPixelBuffer: CVPixelBuffer,
+        pixelFormat: MTLPixelFormat,
+        width: Int,
+        height: Int,
+        planeIndex: Int
+    ) throws -> (texture: MTLTexture, reference: CVMetalTexture) {
+        var textureReference: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            nil,
+            coreVideoTextureCache,
+            cvPixelBuffer,
+            nil,
+            pixelFormat,
+            width,
+            height,
+            planeIndex,
+            &textureReference
+        )
+        guard status == kCVReturnSuccess,
+              let textureReference,
+              let texture = CVMetalTextureGetTexture(textureReference) else {
+            throw PyrowaveError.processFailed("failed to create CVMetalTexture for plane \(planeIndex)")
+        }
+        return (texture, textureReference)
     }
 
     public func decodeToCVPixelBuffer(
