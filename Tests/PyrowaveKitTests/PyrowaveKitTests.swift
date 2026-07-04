@@ -224,6 +224,7 @@ import Testing
     #expect(decoded.blockIndex == 42)
     #expect(decoded.quantCode == 11)
     #expect(decoded.qScaleCodes == [PyrowaveQuantization.identityQScaleCode, PyrowaveQuantization.identityQScaleCode, PyrowaveQuantization.identityQScaleCode])
+    #expect(decoded.coefficients.allSatisfy { $0.qScaleCode == PyrowaveQuantization.identityQScaleCode })
     #expect(decodedMap[0] == 1)
     #expect(decodedMap[1] == -2)
     #expect(decodedMap[2] == 3)

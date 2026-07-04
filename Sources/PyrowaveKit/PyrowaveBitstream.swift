@@ -258,11 +258,17 @@ struct PyrowaveCoefficientBlockCodec {
     private static let subblockCount = 8
     private static let pixelsPerSubblock = 8
 
+    struct DecodedCoefficient {
+        var offset: UInt16
+        var value: Int16
+        var qScaleCode: UInt8
+    }
+
     struct DecodedBlock {
         var blockIndex: Int
         var quantCode: UInt8
         var qScaleCodes: [UInt8]
-        var coefficients: [(offset: UInt16, value: Int16)]
+        var coefficients: [DecodedCoefficient]
     }
 
     static func encodeBlock(
@@ -424,6 +430,7 @@ struct PyrowaveCoefficientBlockCodec {
         }
 
         var coefficients = Array(repeating: Int16(0), count: PyrowaveBitstream.coefficientBlockSize * PyrowaveBitstream.coefficientBlockSize)
+        var coefficientQScales = Array(repeating: UInt8(0), count: PyrowaveBitstream.coefficientBlockSize * PyrowaveBitstream.coefficientBlockSize)
         var signOffsets = [UInt16]()
         signOffsets.reserveCapacity(PyrowaveBitstream.coefficientBlockSize * PyrowaveBitstream.coefficientBlockSize)
 
@@ -433,6 +440,7 @@ struct PyrowaveCoefficientBlockCodec {
             let smallOriginY = (smallBlock / 4) * PyrowaveBitstream.smallBlockSize
             let codeWord = codeWords[compactIndex]
             let basePlanes = Int(qScales[compactIndex] & 0x0f)
+            let qScaleCode = qScales[compactIndex] >> 4
 
             for subblock in 0..<subblockCount {
                 let encodedPlanes = Int((codeWord >> UInt16(2 * subblock)) & 0x3) + basePlanes
@@ -455,6 +463,7 @@ struct PyrowaveCoefficientBlockCodec {
                     let y = smallOriginY + coord.y
                     let offset = UInt16(y * PyrowaveBitstream.coefficientBlockSize + x)
                     coefficients[Int(offset)] = Int16(magnitudes[pixel])
+                    coefficientQScales[Int(offset)] = qScaleCode
                     signOffsets.append(offset)
                 }
             }
@@ -479,8 +488,8 @@ struct PyrowaveCoefficientBlockCodec {
         }
 
         try reader.seek(to: payloadEnd)
-        let entries = coefficients.enumerated().compactMap { index, value -> (offset: UInt16, value: Int16)? in
-            value == 0 ? nil : (UInt16(index), value)
+        let entries = coefficients.enumerated().compactMap { index, value -> DecodedCoefficient? in
+            value == 0 ? nil : DecodedCoefficient(offset: UInt16(index), value: value, qScaleCode: coefficientQScales[index])
         }
         return DecodedBlock(blockIndex: header.blockIndex, quantCode: header.quantCode, qScaleCodes: qScaleCodes, coefficients: entries)
     }

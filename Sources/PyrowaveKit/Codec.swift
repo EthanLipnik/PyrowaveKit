@@ -203,22 +203,22 @@ public final class PyrowaveCodec: Sendable {
             throw PyrowaveError.invalidBitstream("bad plane dimensions")
         }
 
-        let coefficients: [Int16]
+        let samples: [Float]
         switch coding {
         case Self.densePlaneCoding:
             guard blockCount == 0 else {
                 throw PyrowaveError.invalidBitstream("dense plane cannot declare sparse blocks")
             }
-            coefficients = try reader.readInt16Array(count: count)
+            let coefficients = try reader.readInt16Array(count: count)
+            samples = try dequantize(coefficients, quantizationStep: quantizationStep)
         case Self.sparsePlaneCoding:
-            coefficients = try readSparseCoefficients(reader: &reader, count: count, width: paddedWidth, height: paddedHeight, levels: levels, blockCount: blockCount)
+            samples = try readSparseSamples(reader: &reader, count: count, width: paddedWidth, height: paddedHeight, levels: levels, blockCount: blockCount)
         default:
             throw PyrowaveError.invalidBitstream("unknown plane coding \(coding)")
         }
 
-        var samples = try dequantize(coefficients, quantizationStep: quantizationStep)
-        samples = try inverseWavelet(samples, width: paddedWidth, height: paddedHeight, levels: levels)
-        return try Wavelet.cropPlane(samples, paddedWidth: paddedWidth, width: visibleWidth, height: visibleHeight)
+        let reconstructed = try inverseWavelet(samples, width: paddedWidth, height: paddedHeight, levels: levels)
+        return try Wavelet.cropPlane(reconstructed, paddedWidth: paddedWidth, width: visibleWidth, height: visibleHeight)
     }
 
     private func selectSparseThreshold(
@@ -356,21 +356,21 @@ public final class PyrowaveCodec: Sendable {
         return blocks
     }
 
-    private func readSparseCoefficients(
+    private func readSparseSamples(
         reader: inout BinaryReader,
         count: Int,
         width: Int,
         height: Int,
         levels: Int,
         blockCount: Int
-    ) throws -> [Int16] {
+    ) throws -> [Float] {
         guard blockCount >= 0 else {
             throw PyrowaveError.invalidBitstream("negative sparse block count")
         }
 
         let blockSize = Self.sparseBlockSize
         let descriptors = planeBlockDescriptors(width: width, height: height, levels: levels)
-        var coefficients = Array(repeating: Int16(0), count: count)
+        var samples = Array(repeating: Float(0), count: count)
         var seenBlocks = Set<Int>()
 
         for _ in 0..<blockCount {
@@ -384,7 +384,6 @@ public final class PyrowaveCodec: Sendable {
             let descriptor = descriptors[blockIndex]
             for entry in block.coefficients {
                 let localOffset = Int(entry.offset)
-                let value = entry.value
                 let localX = localOffset % blockSize
                 let localY = localOffset / blockSize
                 let x = descriptor.originX + localX
@@ -396,11 +395,15 @@ public final class PyrowaveCodec: Sendable {
                       y < height else {
                     throw PyrowaveError.invalidBitstream("sparse coefficient out of range")
                 }
-                coefficients[y * width + x] = value
+                samples[y * width + x] = PyrowaveQuantization.dequantize(
+                    coefficient: entry.value,
+                    quantCode: block.quantCode,
+                    qScaleCode: entry.qScaleCode
+                )
             }
         }
 
-        return coefficients
+        return samples
     }
 
     private func planeBlockDescriptors(width: Int, height: Int, levels: Int) -> [PlaneBlockDescriptor] {
