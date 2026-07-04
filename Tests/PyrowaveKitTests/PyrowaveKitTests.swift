@@ -2,6 +2,43 @@ import Foundation
 import Testing
 @testable import PyrowaveKit
 
+@Test func hardCutoverSourceTreeContainsOnlySwiftAndMetalSources() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let ignoredDirectories = Set([".build", ".git", ".swiftpm", ".pyrowave-results"])
+    let originalSourceExtensions = Set(["c", "cc", "cpp", "cxx", "h", "hpp", "hxx", "m", "mm"])
+    let originalShaderExtensions = Set(["glsl", "vert", "frag", "comp", "spv", "spirv"])
+    let originalBuildFiles = Set(["CMakeLists.txt", "Makefile"])
+    var forbiddenFiles = [String]()
+
+    let enumerator = try #require(FileManager.default.enumerator(
+        at: packageRoot,
+        includingPropertiesForKeys: [.isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    ))
+    for case let fileURL as URL in enumerator {
+        let resourceValues = try fileURL.resourceValues(forKeys: [.isDirectoryKey])
+        if resourceValues.isDirectory == true {
+            if ignoredDirectories.contains(fileURL.lastPathComponent) {
+                enumerator.skipDescendants()
+            }
+            continue
+        }
+
+        let fileName = fileURL.lastPathComponent
+        let fileExtension = fileURL.pathExtension.lowercased()
+        if originalSourceExtensions.contains(fileExtension)
+            || originalShaderExtensions.contains(fileExtension)
+            || originalBuildFiles.contains(fileName) {
+            forbiddenFiles.append(fileURL.path.replacingOccurrences(of: packageRoot.path + "/", with: ""))
+        }
+    }
+
+    #expect(forbiddenFiles.isEmpty, "Original-language or Vulkan-era files remain: \(forbiddenFiles.sorted())")
+}
+
 @Test func roundTripSynthetic420() throws {
     let frame = try TestFrames.synthetic420(width: 160, height: 96)
     let codec = try PyrowaveCodec(useMetalAcceleration: false)
