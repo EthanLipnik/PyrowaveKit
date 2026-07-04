@@ -564,17 +564,13 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             }
 
             let descriptorByteLength = plane.descriptors.count * MemoryLayout<MetalPlaneQuantizationDescriptor>.stride
-            let qScaleCodes = Array(repeating: PyrowaveQuantization.identityQScaleCode, count: plane.descriptors.count * 16)
+            let qScaleByteLength = plane.descriptors.count * 16 * MemoryLayout<UInt8>.stride
             guard let descriptorBuffer = device.makeBuffer(
                 bytes: plane.descriptors,
                 length: descriptorByteLength,
                 options: .storageModeShared
             ),
-                  let qScaleBuffer = device.makeBuffer(
-                    bytes: qScaleCodes,
-                    length: qScaleCodes.count * MemoryLayout<UInt8>.stride,
-                    options: .storageModeShared
-                  ) else {
+                  let qScaleBuffer = device.makeBuffer(length: qScaleByteLength, options: .storageModeShared) else {
                 throw PyrowaveError.processFailed("failed to allocate Metal plane quantization buffers")
             }
 
@@ -781,14 +777,11 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 continue
             }
 
-            let numPlanes = Array(repeating: UInt32(0), count: plane.descriptors.count)
-            let stats = Array(
-                repeating: MetalRateControlQuantStats(squareError: 0, encodeCostBits: 0),
-                count: plane.descriptors.count * PyrowaveBlockStats.candidateCount
-            )
+            let numPlanesByteLength = plane.descriptors.count * MemoryLayout<UInt32>.stride
+            let statsByteLength = plane.descriptors.count * PyrowaveBlockStats.candidateCount * MemoryLayout<MetalRateControlQuantStats>.stride
             guard let descriptorBuffer = device.makeBuffer(bytes: plane.descriptors, length: plane.descriptors.count * MemoryLayout<MetalRateControlStatsDescriptor>.stride, options: .storageModeShared),
-                  let numPlanesBuffer = device.makeBuffer(bytes: numPlanes, length: numPlanes.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-                  let statsBuffer = device.makeBuffer(bytes: stats, length: stats.count * MemoryLayout<MetalRateControlQuantStats>.stride, options: .storageModeShared) else {
+                  let numPlanesBuffer = device.makeBuffer(length: numPlanesByteLength, options: .storageModeShared),
+                  let statsBuffer = device.makeBuffer(length: statsByteLength, options: .storageModeShared) else {
                 throw PyrowaveError.processFailed("failed to allocate Metal rate-control buffers")
             }
             work.append((
@@ -901,9 +894,9 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 continue
             }
 
-            let byteCosts = Array(repeating: UInt32(0), count: plane.descriptors.count * PyrowaveBlockStats.candidateCount)
+            let byteCostByteLength = plane.descriptors.count * PyrowaveBlockStats.candidateCount * MemoryLayout<UInt32>.stride
             guard let descriptorBuffer = device.makeBuffer(bytes: plane.descriptors, length: plane.descriptors.count * MemoryLayout<MetalPacketByteCostDescriptor>.stride, options: .storageModeShared),
-                  let byteCostBuffer = device.makeBuffer(bytes: byteCosts, length: byteCosts.count * MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
+                  let byteCostBuffer = device.makeBuffer(length: byteCostByteLength, options: .storageModeShared) else {
                 throw PyrowaveError.processFailed("failed to allocate Metal packet byte-cost buffers")
             }
             work.append((
@@ -1084,6 +1077,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             let outputByteCount = item.descriptorCount * maxPacketBytes
             let bytesPointer = item.outputBuffer.contents().bindMemory(to: UInt8.self, capacity: outputByteCount)
             let sizePointer = item.sizeBuffer.contents().bindMemory(to: UInt32.self, capacity: item.descriptorCount)
+            let retainedOutputBuffer = item.outputBuffer
             results[item.planeIndex] = (0..<item.descriptorCount).map { index in
                 let size = Int(sizePointer[index])
                 guard size > 0 else {
@@ -1093,7 +1087,10 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                     return nil
                 }
                 let start = index * maxPacketBytes
-                return Data(bytes: bytesPointer.advanced(by: start), count: size)
+                let packetPointer = UnsafeMutableRawPointer(bytesPointer.advanced(by: start))
+                return Data(bytesNoCopy: packetPointer, count: size, deallocator: .custom { _, _ in
+                    _ = retainedOutputBuffer
+                })
             }
         }
         return results
