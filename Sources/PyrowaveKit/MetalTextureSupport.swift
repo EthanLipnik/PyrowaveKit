@@ -112,29 +112,3 @@ extension YUVFrame {
         try cr.copy(to: crTexture)
     }
 }
-
-extension PyrowaveCodec {
-    public func decodeToMetalTextures(
-        _ frame: EncodedFrame,
-        device: MTLDevice? = MTLCreateSystemDefaultDevice(),
-        usage: MTLTextureUsage = [.shaderRead, .shaderWrite]
-    ) throws -> (y: MTLTexture, cb: MTLTexture, cr: MTLTexture) {
-        guard let device else {
-            throw PyrowaveError.externalToolUnavailable("Metal device")
-        }
-        return try decode(frame).makeMetalTextures(device: device, usage: usage)
-    }
-}
-
-extension PyrowavePacketStreamDecoder {
-    public func decodeToMetalTextures(
-        allowPartialFrame: Bool = false,
-        device: MTLDevice? = MTLCreateSystemDefaultDevice(),
-        usage: MTLTextureUsage = [.shaderRead, .shaderWrite]
-    ) throws -> (y: MTLTexture, cb: MTLTexture, cr: MTLTexture) {
-        guard let device else {
-            throw PyrowaveError.externalToolUnavailable("Metal device")
-        }
-        return try decode(allowPartialFrame: allowPartialFrame).makeMetalTextures(device: device, usage: usage)
-    }
-}

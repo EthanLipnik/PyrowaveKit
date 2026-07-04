@@ -748,6 +748,8 @@ import Metal
         _ = try backend.makeFunction(named: "pyrowave_pad_plane")
         _ = try backend.makeFunction(named: "pyrowave_pad_texture_plane")
         _ = try backend.makeFunction(named: "pyrowave_crop_plane")
+        _ = try backend.makeFunction(named: "pyrowave_crop_texture_plane")
+        _ = try backend.makeFunction(named: "pyrowave_crop_nv12_textures")
         _ = try backend.makeFunction(named: "pyrowave_quantize")
         _ = try backend.makeFunction(named: "pyrowave_dequantize")
         _ = try backend.makeFunction(named: "pyrowave_quantize_plane_tiles")

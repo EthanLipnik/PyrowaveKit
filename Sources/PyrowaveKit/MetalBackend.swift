@@ -8,6 +8,8 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     private let padPlanePipeline: MTLComputePipelineState
     private let padTexturePlanePipeline: MTLComputePipelineState
     private let cropPlanePipeline: MTLComputePipelineState
+    private let cropTexturePlanePipeline: MTLComputePipelineState
+    private let cropNV12TexturesPipeline: MTLComputePipelineState
     private let quantizePipeline: MTLComputePipelineState
     private let dequantizePipeline: MTLComputePipelineState
     private let quantizePlaneTilesPipeline: MTLComputePipelineState
@@ -49,6 +51,8 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         padPlanePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_pad_plane", library: library))
         padTexturePlanePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_pad_texture_plane", library: library))
         cropPlanePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_crop_plane", library: library))
+        cropTexturePlanePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_crop_texture_plane", library: library))
+        cropNV12TexturesPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_crop_nv12_textures", library: library))
         quantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize", library: library))
         dequantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dequantize", library: library))
         quantizePlaneTilesPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize_plane_tiles", library: library))
@@ -242,6 +246,123 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
 
         let pointer = output.contents().bindMemory(to: UInt8.self, capacity: outputCount)
         return try Plane8(width: width, height: height, data: Array(UnsafeBufferPointer(start: pointer, count: outputCount)))
+    }
+
+    func cropPlaneToTexture(_ samples: [Float], paddedWidth: Int, width: Int, height: Int, texture: MTLTexture) throws {
+        guard texture.pixelFormat == .r8Unorm,
+              texture.width == width,
+              texture.height == height,
+              paddedWidth > 0,
+              width > 0,
+              height > 0,
+              paddedWidth <= Int(UInt32.max),
+              width <= Int(UInt32.max),
+              height <= Int(UInt32.max),
+              samples.count >= paddedWidth * height else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard let input = device.makeBuffer(bytes: samples, length: samples.count * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal texture crop buffer")
+        }
+
+        var constants = CropPlaneConstants(
+            paddedWidth: UInt32(paddedWidth),
+            outputWidth: UInt32(width),
+            outputHeight: UInt32(height)
+        )
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal texture crop command encoder")
+        }
+
+        encoder.setComputePipelineState(cropTexturePlanePipeline)
+        encoder.setBuffer(input, offset: 0, index: 0)
+        encoder.setTexture(texture, index: 0)
+        encoder.setBytes(&constants, length: MemoryLayout<CropPlaneConstants>.stride, index: 1)
+        let threadWidth = min(16, cropTexturePlanePipeline.maxTotalThreadsPerThreadgroup)
+        let threadHeight = max(1, min(16, cropTexturePlanePipeline.maxTotalThreadsPerThreadgroup / threadWidth))
+        encoder.dispatchThreads(
+            MTLSize(width: width, height: height, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threadWidth, height: threadHeight, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal texture crop command failed: \(error)")
+        }
+    }
+
+    func cropPlanesToNV12Textures(
+        ySamples: [Float],
+        yPaddedWidth: Int,
+        cbSamples: [Float],
+        crSamples: [Float],
+        chromaPaddedWidth: Int,
+        width: Int,
+        height: Int,
+        yTexture: MTLTexture,
+        cbCrTexture: MTLTexture
+    ) throws {
+        let chromaWidth = width / 2
+        let chromaHeight = height / 2
+        guard yTexture.pixelFormat == .r8Unorm,
+              cbCrTexture.pixelFormat == .rg8Unorm,
+              yTexture.width == width,
+              yTexture.height == height,
+              cbCrTexture.width == chromaWidth,
+              cbCrTexture.height == chromaHeight,
+              yPaddedWidth > 0,
+              chromaPaddedWidth > 0,
+              width > 0,
+              height > 0,
+              yPaddedWidth <= Int(UInt32.max),
+              chromaPaddedWidth <= Int(UInt32.max),
+              width <= Int(UInt32.max),
+              height <= Int(UInt32.max),
+              ySamples.count >= yPaddedWidth * height,
+              cbSamples.count >= chromaPaddedWidth * chromaHeight,
+              crSamples.count >= chromaPaddedWidth * chromaHeight else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard let yInput = device.makeBuffer(bytes: ySamples, length: ySamples.count * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let cbInput = device.makeBuffer(bytes: cbSamples, length: cbSamples.count * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let crInput = device.makeBuffer(bytes: crSamples, length: crSamples.count * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal NV12 crop buffers")
+        }
+
+        var constants = CropNV12Constants(
+            yPaddedWidth: UInt32(yPaddedWidth),
+            chromaPaddedWidth: UInt32(chromaPaddedWidth),
+            outputWidth: UInt32(width),
+            outputHeight: UInt32(height)
+        )
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal NV12 crop command encoder")
+        }
+
+        encoder.setComputePipelineState(cropNV12TexturesPipeline)
+        encoder.setBuffer(yInput, offset: 0, index: 0)
+        encoder.setBuffer(cbInput, offset: 0, index: 1)
+        encoder.setBuffer(crInput, offset: 0, index: 2)
+        encoder.setTexture(yTexture, index: 0)
+        encoder.setTexture(cbCrTexture, index: 1)
+        encoder.setBytes(&constants, length: MemoryLayout<CropNV12Constants>.stride, index: 3)
+        let threadWidth = min(16, cropNV12TexturesPipeline.maxTotalThreadsPerThreadgroup)
+        let threadHeight = max(1, min(16, cropNV12TexturesPipeline.maxTotalThreadsPerThreadgroup / threadWidth))
+        encoder.dispatchThreads(
+            MTLSize(width: width, height: height, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threadWidth, height: threadHeight, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal NV12 texture crop command failed: \(error)")
+        }
     }
 
     public func quantize(_ samples: [Float], quantizationStep: Float) throws -> [Int16] {
@@ -1184,6 +1305,13 @@ private struct PadPlaneConstants {
 
 private struct CropPlaneConstants {
     var paddedWidth: UInt32
+    var outputWidth: UInt32
+    var outputHeight: UInt32
+}
+
+private struct CropNV12Constants {
+    var yPaddedWidth: UInt32
+    var chromaPaddedWidth: UInt32
     var outputWidth: UInt32
     var outputHeight: UInt32
 }

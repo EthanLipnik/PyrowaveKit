@@ -1,4 +1,5 @@
 import Foundation
+import CoreVideo
 
 public enum PyrowaveBenchmarkArtifactNames {
     public static let referenceY4M = "reference.y4m"
@@ -208,7 +209,7 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
 
 public enum PyrowaveBenchmarkRunner {
     public static let pyrowaveCodecName = "pyrowavekit-swift-metal"
-    public static let timedBenchmarkScopeNote = "Timed encode/decode excludes input loading, pixel-buffer preparation, artifact writes, report serialization, and quality metric generation; encode starts from reusable CoreVideo-backed Metal texture views."
+    public static let timedBenchmarkScopeNote = "Timed encode/decode excludes input loading, pixel-buffer preparation, artifact writes, report serialization, and quality metric generation; encode starts from reusable CoreVideo-backed Metal texture views and decode stops at CVPixelBuffer output."
     public static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane, texture, and NV12 texture-channel pad, crop, DWT/iDWT, block quantization, sparse packet byte-cost prefiltering, sparse packet emission, sparse decode apply, rate-control stats, bucket resolve, and savings prefix, 32x32 sparse packets, and optional frame-size cap. \(timedBenchmarkScopeNote)"
 
     public static func loadFrames(arguments: PyrowaveBenchmarkArguments) throws -> PyrowaveBenchmarkFrames {
@@ -254,12 +255,15 @@ public enum PyrowaveBenchmarkRunner {
         }
         let encodeSeconds = stopwatch.lapSeconds()
 
-        var decodedFrames = [YUVFrame]()
-        decodedFrames.reserveCapacity(frames.count)
+        var decodedPixelBuffers = [CVPixelBuffer]()
+        decodedPixelBuffers.reserveCapacity(frames.count)
         for frame in encodedFrames {
-            decodedFrames.append(try codec.decode(frame))
+            decodedPixelBuffers.append(try codec.decodeToCVPixelBuffer(frame))
         }
         let decodeSeconds = stopwatch.lapSeconds()
+        let decodedFrames = try decodedPixelBuffers.map {
+            try YUVFrame(cvPixelBuffer: $0, videoSignal: frames[0].videoSignal)
+        }
 
         let encodedBytes = encodedFrames.reduce(0) { $0 + $1.data.count }
         let streamURL = outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.pyrowaveStream)

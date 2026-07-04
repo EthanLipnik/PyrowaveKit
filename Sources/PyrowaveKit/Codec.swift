@@ -140,6 +140,32 @@ public final class PyrowavePacketStreamDecoder {
     }
 
     public func decode(allowPartialFrame: Bool = false) throws -> YUVFrame {
+        try codec.decode(try assembledFrame(allowPartialFrame: allowPartialFrame), allowPartialFrame: allowPartialFrame)
+    }
+
+    public func decodeToMetalTextures(
+        allowPartialFrame: Bool = false,
+        device: MTLDevice? = nil,
+        usage: MTLTextureUsage = [.shaderRead, .shaderWrite]
+    ) throws -> (y: MTLTexture, cb: MTLTexture, cr: MTLTexture) {
+        try codec.decodeToMetalTextures(
+            try assembledFrame(allowPartialFrame: allowPartialFrame),
+            device: device,
+            usage: usage
+        )
+    }
+
+    public func decodeToCVPixelBuffer(
+        allowPartialFrame: Bool = false,
+        pixelFormat: OSType? = nil
+    ) throws -> CVPixelBuffer {
+        try codec.decodeToCVPixelBuffer(
+            try assembledFrame(allowPartialFrame: allowPartialFrame),
+            pixelFormat: pixelFormat
+        )
+    }
+
+    private func assembledFrame(allowPartialFrame: Bool) throws -> EncodedFrame {
         guard decodeIsReady(allowPartialFrame: allowPartialFrame), let sequenceHeader else {
             throw PyrowaveError.invalidBitstream("packet stream is not ready to decode")
         }
@@ -152,9 +178,8 @@ public final class PyrowavePacketStreamDecoder {
             }
         }
 
-        let frame = try codec.decode(EncodedFrame(data: writer.data), allowPartialFrame: allowPartialFrame)
         decodedFrameForCurrentSequence = true
-        return frame
+        return EncodedFrame(data: writer.data)
     }
 
     private func beginSequence(_ sequence: PyrowaveSequenceHeader) {
@@ -415,6 +440,57 @@ public final class PyrowaveCodec: @unchecked Sendable {
     }
 
     fileprivate func decode(_ frame: EncodedFrame, allowPartialFrame: Bool) throws -> YUVFrame {
+        try makeYUVFrame(from: decodePlanes(frame, allowPartialFrame: allowPartialFrame))
+    }
+
+    public func decodeToMetalTextures(
+        _ frame: EncodedFrame,
+        device: MTLDevice? = nil,
+        usage: MTLTextureUsage = [.shaderRead, .shaderWrite]
+    ) throws -> (y: MTLTexture, cb: MTLTexture, cr: MTLTexture) {
+        let decoded = try decodePlanes(frame, allowPartialFrame: false)
+        let outputDevice = device ?? metalBackend.device
+        guard outputDevice.registryID == metalBackend.device.registryID else {
+            throw PyrowaveError.invalidDimensions
+        }
+        var textureUsage = usage
+        textureUsage.insert(.shaderWrite)
+        let yTexture = try makeOutputTexture(width: decoded.planes[0].visibleWidth, height: decoded.planes[0].visibleHeight, device: outputDevice, usage: textureUsage)
+        let cbTexture = try makeOutputTexture(width: decoded.planes[1].visibleWidth, height: decoded.planes[1].visibleHeight, device: outputDevice, usage: textureUsage)
+        let crTexture = try makeOutputTexture(width: decoded.planes[2].visibleWidth, height: decoded.planes[2].visibleHeight, device: outputDevice, usage: textureUsage)
+        try finishDecodedPlane(decoded.planes[0], to: yTexture)
+        try finishDecodedPlane(decoded.planes[1], to: cbTexture)
+        try finishDecodedPlane(decoded.planes[2], to: crTexture)
+        return (yTexture, cbTexture, crTexture)
+    }
+
+    func decodeToNV12Textures(_ frame: EncodedFrame, yTexture: MTLTexture, cbCrTexture: MTLTexture) throws {
+        let decoded = try decodePlanes(frame, allowPartialFrame: false)
+        guard decoded.sequence.chroma == .yuv420,
+              yTexture.width == decoded.sequence.width,
+              yTexture.height == decoded.sequence.height,
+              cbCrTexture.width == decoded.sequence.width / 2,
+              cbCrTexture.height == decoded.sequence.height / 2 else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        let y = try inverseWavelet(decoded.planes[0].samples, width: decoded.planes[0].paddedWidth, height: decoded.planes[0].paddedHeight, levels: decoded.planes[0].levels)
+        let cb = try inverseWavelet(decoded.planes[1].samples, width: decoded.planes[1].paddedWidth, height: decoded.planes[1].paddedHeight, levels: decoded.planes[1].levels)
+        let cr = try inverseWavelet(decoded.planes[2].samples, width: decoded.planes[2].paddedWidth, height: decoded.planes[2].paddedHeight, levels: decoded.planes[2].levels)
+        try metalBackend.cropPlanesToNV12Textures(
+            ySamples: y,
+            yPaddedWidth: decoded.planes[0].paddedWidth,
+            cbSamples: cb,
+            crSamples: cr,
+            chromaPaddedWidth: decoded.planes[1].paddedWidth,
+            width: decoded.sequence.width,
+            height: decoded.sequence.height,
+            yTexture: yTexture,
+            cbCrTexture: cbCrTexture
+        )
+    }
+
+    private func decodePlanes(_ frame: EncodedFrame, allowPartialFrame: Bool) throws -> DecodedFramePlanes {
         var reader = BinaryReader(frame.data)
         let sequence = try PyrowaveSequenceHeader(reader: &reader)
         let layout = try PyrowaveBlockLayout(width: sequence.width, height: sequence.height, chroma: sequence.chroma)
@@ -455,19 +531,38 @@ public final class PyrowaveCodec: @unchecked Sendable {
             try applySparseBlocks(pendingSparseBlocks[index], decodedPlane: &decodedPlanes[index])
         }
 
-        let y = try finishDecodedPlane(decodedPlanes[0])
-        let cb = try finishDecodedPlane(decodedPlanes[1])
-        let cr = try finishDecodedPlane(decodedPlanes[2])
+        return DecodedFramePlanes(sequence: sequence, planes: decodedPlanes)
+    }
+
+    private func makeYUVFrame(from decoded: DecodedFramePlanes) throws -> YUVFrame {
+        let y = try finishDecodedPlane(decoded.planes[0])
+        let cb = try finishDecodedPlane(decoded.planes[1])
+        let cr = try finishDecodedPlane(decoded.planes[2])
 
         return try YUVFrame(
-            width: sequence.width,
-            height: sequence.height,
-            chroma: sequence.chroma,
+            width: decoded.sequence.width,
+            height: decoded.sequence.height,
+            chroma: decoded.sequence.chroma,
             y: y,
             cb: cb,
             cr: cr,
-            videoSignal: sequence.videoSignal
+            videoSignal: decoded.sequence.videoSignal
         )
+    }
+
+    private func makeOutputTexture(width: Int, height: Int, device: MTLDevice, usage: MTLTextureUsage) throws -> MTLTexture {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        descriptor.usage = usage
+        descriptor.storageMode = .shared
+        guard let texture = device.makeTexture(descriptor: descriptor) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal decode texture")
+        }
+        return texture
     }
 
     private struct EncodedPlane {
@@ -520,6 +615,11 @@ public final class PyrowaveCodec: @unchecked Sendable {
         var levels: Int
         var samples: [Float]
         var descriptorsByBlockIndex: [Int: PlaneBlockDescriptor]
+    }
+
+    private struct DecodedFramePlanes {
+        var sequence: PyrowaveSequenceHeader
+        var planes: [DecodedPlane]
     }
 
     private struct PlaneGeometry {
@@ -993,6 +1093,17 @@ public final class PyrowaveCodec: @unchecked Sendable {
     private func finishDecodedPlane(_ plane: DecodedPlane) throws -> Plane8 {
         let reconstructed = try inverseWavelet(plane.samples, width: plane.paddedWidth, height: plane.paddedHeight, levels: plane.levels)
         return try cropPlane(reconstructed, paddedWidth: plane.paddedWidth, width: plane.visibleWidth, height: plane.visibleHeight)
+    }
+
+    private func finishDecodedPlane(_ plane: DecodedPlane, to texture: MTLTexture) throws {
+        let reconstructed = try inverseWavelet(plane.samples, width: plane.paddedWidth, height: plane.paddedHeight, levels: plane.levels)
+        try metalBackend.cropPlaneToTexture(
+            reconstructed,
+            paddedWidth: plane.paddedWidth,
+            width: plane.visibleWidth,
+            height: plane.visibleHeight,
+            texture: texture
+        )
     }
 
     private func planeBlockDescriptors(plane: EncodedPlane, layout: PyrowaveBlockLayout) -> [PlaneBlockDescriptor] {

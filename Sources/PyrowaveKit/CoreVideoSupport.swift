@@ -206,15 +206,52 @@ extension PyrowaveCodec {
         _ frame: EncodedFrame,
         pixelFormat: OSType? = nil
     ) throws -> CVPixelBuffer {
-        try decode(frame).makeCVPixelBuffer(pixelFormat: pixelFormat)
-    }
-}
+        var reader = BinaryReader(frame.data)
+        let sequence = try PyrowaveSequenceHeader(reader: &reader)
+        guard sequence.chroma == .yuv420 else {
+            throw PyrowaveError.unsupportedFormat("CVPixelBuffer decode expects yuv420 frames")
+        }
+        let format = pixelFormat ?? YUVFrame.cvPixelFormat(for: sequence.videoSignal)
+        let supportedFormats: Set<OSType> = [
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        ]
+        guard supportedFormats.contains(format) else {
+            throw PyrowaveError.unsupportedFormat("CVPixelBuffer pixel format \(format)")
+        }
 
-extension PyrowavePacketStreamDecoder {
-    public func decodeToCVPixelBuffer(
-        allowPartialFrame: Bool = false,
-        pixelFormat: OSType? = nil
-    ) throws -> CVPixelBuffer {
-        try decode(allowPartialFrame: allowPartialFrame).makeCVPixelBuffer(pixelFormat: pixelFormat)
+        var pixelBuffer: CVPixelBuffer?
+        let attributes = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            kCVPixelBufferMetalCompatibilityKey as String: true
+        ] as CFDictionary
+        let status = CVPixelBufferCreate(
+            nil,
+            sequence.width,
+            sequence.height,
+            format,
+            attributes,
+            &pixelBuffer
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer else {
+            throw PyrowaveError.processFailed("failed to allocate decode CVPixelBuffer")
+        }
+
+        let yTexture = try makeMetalTexture(
+            from: pixelBuffer,
+            pixelFormat: .r8Unorm,
+            width: sequence.width,
+            height: sequence.height,
+            planeIndex: 0
+        )
+        let cbCrTexture = try makeMetalTexture(
+            from: pixelBuffer,
+            pixelFormat: .rg8Unorm,
+            width: sequence.width / 2,
+            height: sequence.height / 2,
+            planeIndex: 1
+        )
+        try decodeToNV12Textures(frame, yTexture: yTexture.texture, cbCrTexture: cbCrTexture.texture)
+        return pixelBuffer
     }
 }

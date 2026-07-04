@@ -20,6 +20,13 @@ struct CropPlaneConstants {
     uint outputHeight;
 };
 
+struct CropNV12Constants {
+    uint yPaddedWidth;
+    uint chromaPaddedWidth;
+    uint outputWidth;
+    uint outputHeight;
+};
+
 struct PlaneQuantizationDescriptor {
     uint originX;
     uint originY;
@@ -180,6 +187,48 @@ kernel void pyrowave_crop_plane(
 
     float normalized = clamp(input[y * constants.paddedWidth + x] + 0.5f, 0.0f, 1.0f);
     output[y * constants.outputWidth + x] = uchar(round(normalized * 255.0f));
+}
+
+kernel void pyrowave_crop_texture_plane(
+    device const float *input [[buffer(0)]],
+    texture2d<float, access::write> output [[texture(0)]],
+    constant CropPlaneConstants &constants [[buffer(1)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    uint x = position.x;
+    uint y = position.y;
+    if (x >= constants.outputWidth || y >= constants.outputHeight) {
+        return;
+    }
+
+    float normalized = clamp(input[y * constants.paddedWidth + x] + 0.5f, 0.0f, 1.0f);
+    output.write(float4(normalized, 0.0f, 0.0f, 1.0f), uint2(x, y));
+}
+
+kernel void pyrowave_crop_nv12_textures(
+    device const float *yInput [[buffer(0)]],
+    device const float *cbInput [[buffer(1)]],
+    device const float *crInput [[buffer(2)]],
+    texture2d<float, access::write> yOutput [[texture(0)]],
+    texture2d<float, access::write> cbCrOutput [[texture(1)]],
+    constant CropNV12Constants &constants [[buffer(3)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    uint x = position.x;
+    uint y = position.y;
+    if (x < constants.outputWidth && y < constants.outputHeight) {
+        float luma = clamp(yInput[y * constants.yPaddedWidth + x] + 0.5f, 0.0f, 1.0f);
+        yOutput.write(float4(luma, 0.0f, 0.0f, 1.0f), uint2(x, y));
+    }
+
+    uint chromaWidth = constants.outputWidth / 2u;
+    uint chromaHeight = constants.outputHeight / 2u;
+    if (x < chromaWidth && y < chromaHeight) {
+        uint index = y * constants.chromaPaddedWidth + x;
+        float cb = clamp(cbInput[index] + 0.5f, 0.0f, 1.0f);
+        float cr = clamp(crInput[index] + 0.5f, 0.0f, 1.0f);
+        cbCrOutput.write(float4(cb, cr, 0.0f, 1.0f), uint2(x, y));
+    }
 }
 
 kernel void pyrowave_quantize(
