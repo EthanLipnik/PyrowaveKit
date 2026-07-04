@@ -651,6 +651,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
 
         var outputs = [MTLBuffer]()
         outputs.reserveCapacity(planes.count)
+        var zeroFills = [(buffer: MTLBuffer, byteLength: Int)]()
+        zeroFills.reserveCapacity(planes.count)
         var dispatches = [(planeIndex: Int, entryBuffer: MTLBuffer, entryCount: Int, sampleCount: Int)]()
         dispatches.reserveCapacity(planes.count)
 
@@ -671,8 +673,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             guard let output = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
                 throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient output")
             }
-            memset(output.contents(), 0, byteLength)
             outputs.append(output)
+            zeroFills.append((buffer: output, byteLength: byteLength))
 
             guard !plane.entries.isEmpty else {
                 continue
@@ -688,32 +690,43 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             ))
         }
 
-        guard !dispatches.isEmpty else {
-            return outputs
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw PyrowaveError.processFailed("failed to create Metal sparse coefficient command buffer")
         }
 
-        guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
-            throw PyrowaveError.processFailed("failed to create Metal sparse coefficient command encoder")
+        if !zeroFills.isEmpty {
+            guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
+                throw PyrowaveError.processFailed("failed to create Metal sparse coefficient fill encoder")
+            }
+            for fill in zeroFills {
+                blitEncoder.fill(buffer: fill.buffer, range: 0..<fill.byteLength, value: 0)
+            }
+            blitEncoder.endEncoding()
         }
 
-        encoder.setComputePipelineState(sparseApplyPipeline)
-        let width = min(sparseApplyPipeline.maxTotalThreadsPerThreadgroup, 256)
-        let threadsPerThreadgroup = MTLSize(width: width, height: 1, depth: 1)
-        for dispatch in dispatches {
-            var constants = SparseApplyConstants(
-                entryCount: UInt32(dispatch.entryCount),
-                sampleCount: UInt32(dispatch.sampleCount)
-            )
-            encoder.setBuffer(outputs[dispatch.planeIndex], offset: 0, index: 0)
-            encoder.setBuffer(dispatch.entryBuffer, offset: 0, index: 1)
-            encoder.setBytes(&constants, length: MemoryLayout<SparseApplyConstants>.stride, index: 2)
-            encoder.dispatchThreads(
-                MTLSize(width: dispatch.entryCount, height: 1, depth: 1),
-                threadsPerThreadgroup: threadsPerThreadgroup
-            )
+        if !dispatches.isEmpty {
+            guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                throw PyrowaveError.processFailed("failed to create Metal sparse coefficient command encoder")
+            }
+
+            encoder.setComputePipelineState(sparseApplyPipeline)
+            let width = min(sparseApplyPipeline.maxTotalThreadsPerThreadgroup, 256)
+            let threadsPerThreadgroup = MTLSize(width: width, height: 1, depth: 1)
+            for dispatch in dispatches {
+                var constants = SparseApplyConstants(
+                    entryCount: UInt32(dispatch.entryCount),
+                    sampleCount: UInt32(dispatch.sampleCount)
+                )
+                encoder.setBuffer(outputs[dispatch.planeIndex], offset: 0, index: 0)
+                encoder.setBuffer(dispatch.entryBuffer, offset: 0, index: 1)
+                encoder.setBytes(&constants, length: MemoryLayout<SparseApplyConstants>.stride, index: 2)
+                encoder.dispatchThreads(
+                    MTLSize(width: dispatch.entryCount, height: 1, depth: 1),
+                    threadsPerThreadgroup: threadsPerThreadgroup
+                )
+            }
+            encoder.endEncoding()
         }
-        encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
