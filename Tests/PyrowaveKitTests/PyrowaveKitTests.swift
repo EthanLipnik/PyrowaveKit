@@ -48,10 +48,18 @@ import Metal
         .deletingLastPathComponent()
         .deletingLastPathComponent()
     let codecSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Codec.swift"), encoding: .utf8)
+    let coreVideoSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/CoreVideoSupport.swift"), encoding: .utf8)
+    let metalTextureSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/MetalTextureSupport.swift"), encoding: .utf8)
 
     #expect(!codecSource.contains("public func encode(_ frame: YUVFrame"))
     #expect(!codecSource.contains("public func decode(_ frame: EncodedFrame) throws -> YUVFrame"))
     #expect(!codecSource.contains("public func decode(allowPartialFrame: Bool = false) throws -> YUVFrame"))
+    #expect(!coreVideoSource.contains("public init(\n        cvPixelBuffer: CVPixelBuffer"))
+    #expect(!coreVideoSource.contains("public func makeCVPixelBuffer"))
+    #expect(!coreVideoSource.contains("public func copy(to cvPixelBuffer: CVPixelBuffer)"))
+    #expect(!metalTextureSource.contains("public init(texture: MTLTexture)"))
+    #expect(!metalTextureSource.contains("public func makeMetalTexture"))
+    #expect(!metalTextureSource.contains("public func makeMetalTextures"))
 }
 
 @Test func yuvFrameImportsCoreVideoNV12PixelBuffer() throws {

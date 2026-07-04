@@ -2,7 +2,7 @@ import Foundation
 import Metal
 
 extension Plane8 {
-    public init(texture: MTLTexture) throws {
+    init(texture: MTLTexture) throws {
         guard texture.pixelFormat == .r8Unorm,
               texture.width > 0,
               texture.height > 0 else {
@@ -21,7 +21,7 @@ extension Plane8 {
         try self.init(width: texture.width, height: texture.height, data: data)
     }
 
-    public func makeMetalTexture(device: MTLDevice, usage: MTLTextureUsage = [.shaderRead, .shaderWrite]) throws -> MTLTexture {
+    func makeMetalTexture(device: MTLDevice, usage: MTLTextureUsage = [.shaderRead, .shaderWrite]) throws -> MTLTexture {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .r8Unorm,
             width: width,
@@ -37,7 +37,7 @@ extension Plane8 {
         return texture
     }
 
-    public func copy(to texture: MTLTexture) throws {
+    func copy(to texture: MTLTexture) throws {
         guard texture.pixelFormat == .r8Unorm,
               texture.width == width,
               texture.height == height else {
@@ -56,7 +56,7 @@ extension Plane8 {
 }
 
 extension YUVFrame {
-    public init(
+    init(
         yTexture: MTLTexture,
         cbTexture: MTLTexture,
         crTexture: MTLTexture,
@@ -91,7 +91,7 @@ extension YUVFrame {
         )
     }
 
-    public func makeMetalTextures(
+    func makeMetalTextures(
         device: MTLDevice,
         usage: MTLTextureUsage = [.shaderRead, .shaderWrite]
     ) throws -> (y: MTLTexture, cb: MTLTexture, cr: MTLTexture) {
@@ -102,7 +102,7 @@ extension YUVFrame {
         )
     }
 
-    public func copy(
+    func copy(
         toYTexture yTexture: MTLTexture,
         cbTexture: MTLTexture,
         crTexture: MTLTexture

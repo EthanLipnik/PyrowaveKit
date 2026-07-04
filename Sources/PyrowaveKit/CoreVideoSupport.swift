@@ -3,7 +3,7 @@ import CoreVideo
 import Metal
 
 extension YUVFrame {
-    public init(
+    init(
         cvPixelBuffer: CVPixelBuffer,
         videoSignal: VideoSignalMetadata? = nil
     ) throws {
@@ -51,7 +51,7 @@ extension YUVFrame {
         )
     }
 
-    public func makeCVPixelBuffer(pixelFormat: OSType? = nil) throws -> CVPixelBuffer {
+    func makeCVPixelBuffer(pixelFormat: OSType? = nil) throws -> CVPixelBuffer {
         let format = pixelFormat ?? Self.cvPixelFormat(for: videoSignal)
         var pixelBuffer: CVPixelBuffer?
         let attributes = [
@@ -72,7 +72,7 @@ extension YUVFrame {
         return pixelBuffer
     }
 
-    public func copy(to cvPixelBuffer: CVPixelBuffer) throws {
+    func copy(to cvPixelBuffer: CVPixelBuffer) throws {
         let pixelFormat = CVPixelBufferGetPixelFormatType(cvPixelBuffer)
         let supportedFormats: Set<OSType> = [
             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
@@ -118,7 +118,7 @@ extension YUVFrame {
         }
     }
 
-    public static func cvPixelFormat(for videoSignal: VideoSignalMetadata) -> OSType {
+    static func cvPixelFormat(for videoSignal: VideoSignalMetadata) -> OSType {
         videoSignal.yCbCrRange == .limited ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
     }
 }
