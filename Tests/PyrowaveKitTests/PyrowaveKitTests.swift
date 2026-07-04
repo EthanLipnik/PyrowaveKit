@@ -141,6 +141,21 @@ import Testing
     #expect(metrics.weightedPSNR > 20.0)
 }
 
+@Test func codecUsesHardCutoverV3StreamOnly() throws {
+    let frame = try TestFrames.synthetic420(width: 64, height: 64)
+    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    var encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)).data
+
+    #expect(encoded[0..<4].elementsEqual([0x50, 0x57, 0x4b, 0x53]))
+    #expect(encoded[4] == 3)
+    #expect(encoded[5] == 0)
+
+    encoded[4] = 2
+    #expect(throws: PyrowaveError.invalidBitstream("unsupported version 2")) {
+        _ = try codec.decode(EncodedFrame(data: encoded))
+    }
+}
+
 @Test func pyrowavePacketHeadersRoundTripPackedFields() throws {
     var writer = BinaryWriter()
     let packet = try PyrowavePacketHeader(
