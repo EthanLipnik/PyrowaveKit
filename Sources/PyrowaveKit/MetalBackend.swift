@@ -9,6 +9,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     public let library: MTLLibrary
     private let quantizePipeline: MTLComputePipelineState
     private let dequantizePipeline: MTLComputePipelineState
+    private let quantizePlaneTilesPipeline: MTLComputePipelineState
     private let dwtLiftRowsPipeline: MTLComputePipelineState
     private let dwtLiftColumnsPipeline: MTLComputePipelineState
     private let dwtPackRowsPipeline: MTLComputePipelineState
@@ -39,6 +40,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
 
         quantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize", library: library))
         dequantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dequantize", library: library))
+        quantizePlaneTilesPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize_plane_tiles", library: library))
         dwtLiftRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_rows", library: library))
         dwtLiftColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_columns", library: library))
         dwtPackRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_pack_rows", library: library))
@@ -97,6 +99,52 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
 
         let pointer = output.contents().bindMemory(to: Float.self, capacity: coefficients.count)
         return Array(UnsafeBufferPointer(start: pointer, count: coefficients.count))
+    }
+
+    func quantizePlane(
+        _ samples: [Float],
+        stride: Int,
+        descriptors: [MetalPlaneQuantizationDescriptor]
+    ) throws -> MetalPlaneQuantizationResult {
+        guard stride > 0, !samples.isEmpty else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard !descriptors.isEmpty else {
+            return MetalPlaneQuantizationResult(coefficients: Array(repeating: 0, count: samples.count), qScaleCodesByDescriptor: [])
+        }
+
+        let coefficientByteLength = samples.count * MemoryLayout<Int16>.stride
+        let descriptorByteLength = descriptors.count * MemoryLayout<MetalPlaneQuantizationDescriptor>.stride
+        let qScaleByteLength = descriptors.count * 16 * MemoryLayout<UInt8>.stride
+        let zeroCoefficients = Array(repeating: Int16(0), count: samples.count)
+        let qScaleCodes = Array(repeating: PyrowaveQuantization.identityQScaleCode, count: descriptors.count * 16)
+        guard let input = device.makeBuffer(bytes: samples, length: samples.count * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let output = device.makeBuffer(bytes: zeroCoefficients, length: coefficientByteLength, options: .storageModeShared),
+              let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptorByteLength, options: .storageModeShared),
+              let qScaleBuffer = device.makeBuffer(bytes: qScaleCodes, length: qScaleByteLength, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal plane quantization buffers")
+        }
+
+        var constants = PlaneQuantizationConstants(descriptorCount: UInt32(descriptors.count))
+        try dispatchPlaneQuantization(
+            count: descriptors.count * 16,
+            buffers: [
+                (input, 0),
+                (output, 1),
+                (descriptorBuffer, 2),
+                (qScaleBuffer, 3)
+            ],
+            constants: &constants
+        )
+
+        let coefficientsPointer = output.contents().bindMemory(to: Int16.self, capacity: samples.count)
+        let coefficientValues = Array(UnsafeBufferPointer(start: coefficientsPointer, count: samples.count))
+        let qScalePointer = qScaleBuffer.contents().bindMemory(to: UInt8.self, capacity: descriptors.count * 16)
+        let flatQScales = Array(UnsafeBufferPointer(start: qScalePointer, count: descriptors.count * 16))
+        let perDescriptor = Swift.stride(from: 0, to: flatQScales.count, by: 16).map {
+            Array(flatQScales[$0..<$0 + 16])
+        }
+        return MetalPlaneQuantizationResult(coefficients: coefficientValues, qScaleCodesByDescriptor: perDescriptor)
     }
 
     public func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
@@ -278,6 +326,36 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         }
     }
 
+    private func dispatchPlaneQuantization(
+        count: Int,
+        buffers: [(MTLBuffer, Int)],
+        constants: inout PlaneQuantizationConstants
+    ) throws {
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal plane quantization command encoder")
+        }
+
+        encoder.setComputePipelineState(quantizePlaneTilesPipeline)
+        for (buffer, index) in buffers {
+            encoder.setBuffer(buffer, offset: 0, index: index)
+        }
+        encoder.setBytes(&constants, length: MemoryLayout<PlaneQuantizationConstants>.stride, index: 4)
+
+        let width = min(quantizePlaneTilesPipeline.maxTotalThreadsPerThreadgroup, 256)
+        encoder.dispatchThreads(
+            MTLSize(width: count, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal plane quantization command failed: \(error)")
+        }
+    }
+
     private func dispatchDWTInPlace(
         pipeline: MTLComputePipelineState,
         buffer: MTLBuffer,
@@ -445,6 +523,25 @@ private struct QuantizationConstants {
     var quantizationStep: Float
 }
 
+struct MetalPlaneQuantizationDescriptor {
+    var originX: UInt32
+    var originY: UInt32
+    var validWidth: UInt32
+    var validHeight: UInt32
+    var stride: UInt32
+    var quantCode: UInt32
+    var baseScale: Float
+}
+
+struct MetalPlaneQuantizationResult {
+    var coefficients: [Int16]
+    var qScaleCodesByDescriptor: [[UInt8]]
+}
+
+private struct PlaneQuantizationConstants {
+    var descriptorCount: UInt32
+}
+
 private struct DWTConstants {
     var activeWidth: UInt32
     var activeHeight: UInt32
@@ -465,6 +562,14 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         throw PyrowaveError.externalToolUnavailable("Metal")
     }
 
+    func quantizePlane(
+        _ samples: [Float],
+        stride: Int,
+        descriptors: [MetalPlaneQuantizationDescriptor]
+    ) throws -> MetalPlaneQuantizationResult {
+        throw PyrowaveError.externalToolUnavailable("Metal")
+    }
+
     public func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
         throw PyrowaveError.externalToolUnavailable("Metal")
     }
@@ -472,5 +577,20 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     public func inverseWavelet(_ coefficients: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
         throw PyrowaveError.externalToolUnavailable("Metal")
     }
+}
+
+struct MetalPlaneQuantizationDescriptor {
+    var originX: UInt32
+    var originY: UInt32
+    var validWidth: UInt32
+    var validHeight: UInt32
+    var stride: UInt32
+    var quantCode: UInt32
+    var baseScale: Float
+}
+
+struct MetalPlaneQuantizationResult {
+    var coefficients: [Int16]
+    var qScaleCodesByDescriptor: [[UInt8]]
 }
 #endif

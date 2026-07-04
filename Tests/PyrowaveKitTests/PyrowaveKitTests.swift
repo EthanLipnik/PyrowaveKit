@@ -167,6 +167,7 @@ import Testing
         let backend = try MetalPyrowaveBackend()
         _ = try backend.makeFunction(named: "pyrowave_quantize")
         _ = try backend.makeFunction(named: "pyrowave_dequantize")
+        _ = try backend.makeFunction(named: "pyrowave_quantize_plane_tiles")
     } catch PyrowaveError.externalToolUnavailable {
         return
     }

@@ -6,6 +6,20 @@ struct QuantizationConstants {
     float quantizationStep;
 };
 
+struct PlaneQuantizationDescriptor {
+    uint originX;
+    uint originY;
+    uint validWidth;
+    uint validHeight;
+    uint stride;
+    uint quantCode;
+    float baseScale;
+};
+
+struct PlaneQuantizationConstants {
+    uint descriptorCount;
+};
+
 struct DWTConstants {
     uint activeWidth;
     uint activeHeight;
@@ -59,6 +73,73 @@ kernel void pyrowave_dequantize(
     }
 
     output[index] = float(input[index]) * constants.quantizationStep;
+}
+
+static inline uchar pyrowave_encode_8x8_scale(float scale) {
+    float encoded = ceil((scale - 0.25f) * 8.0f);
+    encoded = clamp(encoded, 0.0f, 15.0f);
+    return uchar(encoded);
+}
+
+static inline uchar pyrowave_encode_8x8_scale_code(float maxScaledCoefficient) {
+    if (maxScaledCoefficient < 1.0f) {
+        return 6;
+    }
+
+    int exponent = int(floor(log2(maxScaledCoefficient - 0.25f))) + 1;
+    float targetMax = exp2(float(exponent)) - 0.25f;
+    return pyrowave_encode_8x8_scale(maxScaledCoefficient / targetMax);
+}
+
+kernel void pyrowave_quantize_plane_tiles(
+    device const float *samples [[buffer(0)]],
+    device short *coefficients [[buffer(1)]],
+    device const PlaneQuantizationDescriptor *descriptors [[buffer(2)]],
+    device uchar *qScaleCodes [[buffer(3)]],
+    constant PlaneQuantizationConstants &constants [[buffer(4)]],
+    uint index [[thread_position_in_grid]]
+) {
+    uint descriptorIndex = index >> 4u;
+    uint smallBlock = index & 15u;
+    if (descriptorIndex >= constants.descriptorCount) {
+        return;
+    }
+
+    PlaneQuantizationDescriptor descriptor = descriptors[descriptorIndex];
+    uint smallBlockX = smallBlock & 3u;
+    uint smallBlockY = smallBlock >> 2u;
+    uint localX0 = smallBlockX * 8u;
+    uint localY0 = smallBlockY * 8u;
+    uint validWidth = descriptor.validWidth > localX0 ? min(8u, descriptor.validWidth - localX0) : 0u;
+    uint validHeight = descriptor.validHeight > localY0 ? min(8u, descriptor.validHeight - localY0) : 0u;
+    if (validWidth == 0u || validHeight == 0u) {
+        qScaleCodes[descriptorIndex * 16u + smallBlock] = 6;
+        return;
+    }
+
+    uint originX = descriptor.originX + localX0;
+    uint originY = descriptor.originY + localY0;
+    float maxScaledCoefficient = 0.0f;
+    for (uint y = 0; y < validHeight; ++y) {
+        uint row = (originY + y) * descriptor.stride + originX;
+        for (uint x = 0; x < validWidth; ++x) {
+            maxScaledCoefficient = max(maxScaledCoefficient, fabs(samples[row + x] * descriptor.baseScale));
+        }
+    }
+
+    uchar qScaleCode = pyrowave_encode_8x8_scale_code(maxScaledCoefficient);
+    qScaleCodes[descriptorIndex * 16u + smallBlock] = qScaleCode;
+    float decoded8x8Scale = float(qScaleCode) / 8.0f + 0.25f;
+    float quantScale = 1.0f / decoded8x8Scale;
+
+    for (uint y = 0; y < validHeight; ++y) {
+        uint row = (originY + y) * descriptor.stride + originX;
+        for (uint x = 0; x < validWidth; ++x) {
+            float scaled = trunc(samples[row + x] * descriptor.baseScale * quantScale);
+            scaled = clamp(scaled, -32768.0f, 32767.0f);
+            coefficients[row + x] = short(scaled);
+        }
+    }
 }
 
 kernel void pyrowave_dwt_lift_rows(
