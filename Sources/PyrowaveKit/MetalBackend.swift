@@ -131,6 +131,13 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     }
 
     func padTexturePlane(_ texture: MTLTexture, channel: Int = 0, paddedWidth: Int, paddedHeight: Int) throws -> [Float] {
+        let output = try padTexturePlaneBuffer(texture, channel: channel, paddedWidth: paddedWidth, paddedHeight: paddedHeight)
+        let sampleCount = paddedWidth * paddedHeight
+        let pointer = output.contents().bindMemory(to: Float.self, capacity: sampleCount)
+        return Array(UnsafeBufferPointer(start: pointer, count: sampleCount))
+    }
+
+    func padTexturePlaneBuffer(_ texture: MTLTexture, channel: Int = 0, paddedWidth: Int, paddedHeight: Int) throws -> MTLBuffer {
         let validChannel: Bool
         switch texture.pixelFormat {
         case .r8Unorm:
@@ -192,8 +199,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("Metal texture padding command failed: \(error)")
         }
 
-        let pointer = output.contents().bindMemory(to: Float.self, capacity: sampleCount)
-        return Array(UnsafeBufferPointer(start: pointer, count: sampleCount))
+        return output
     }
 
     func cropPlane(_ samples: [Float], paddedWidth: Int, width: Int, height: Int) throws -> Plane8 {
@@ -461,13 +467,31 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
             return MetalPlaneQuantizationResult(coefficients: Array(repeating: 0, count: samples.count), qScaleCodesByDescriptor: [])
         }
 
-        let coefficientByteLength = samples.count * MemoryLayout<Int16>.stride
+        guard let input = device.makeBuffer(bytes: samples, length: samples.count * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal plane quantization input buffer")
+        }
+        return try quantizePlaneBuffer(input, sampleCount: samples.count, stride: stride, descriptors: descriptors)
+    }
+
+    func quantizePlaneBuffer(
+        _ samples: MTLBuffer,
+        sampleCount: Int,
+        stride: Int,
+        descriptors: [MetalPlaneQuantizationDescriptor]
+    ) throws -> MetalPlaneQuantizationResult {
+        guard stride > 0, sampleCount > 0, samples.length >= sampleCount * MemoryLayout<Float>.stride else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard !descriptors.isEmpty else {
+            return MetalPlaneQuantizationResult(coefficients: Array(repeating: 0, count: sampleCount), qScaleCodesByDescriptor: [])
+        }
+
+        let coefficientByteLength = sampleCount * MemoryLayout<Int16>.stride
         let descriptorByteLength = descriptors.count * MemoryLayout<MetalPlaneQuantizationDescriptor>.stride
         let qScaleByteLength = descriptors.count * 16 * MemoryLayout<UInt8>.stride
-        let zeroCoefficients = Array(repeating: Int16(0), count: samples.count)
+        let zeroCoefficients = Array(repeating: Int16(0), count: sampleCount)
         let qScaleCodes = Array(repeating: PyrowaveQuantization.identityQScaleCode, count: descriptors.count * 16)
-        guard let input = device.makeBuffer(bytes: samples, length: samples.count * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let output = device.makeBuffer(bytes: zeroCoefficients, length: coefficientByteLength, options: .storageModeShared),
+        guard let output = device.makeBuffer(bytes: zeroCoefficients, length: coefficientByteLength, options: .storageModeShared),
               let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptorByteLength, options: .storageModeShared),
               let qScaleBuffer = device.makeBuffer(bytes: qScaleCodes, length: qScaleByteLength, options: .storageModeShared) else {
             throw PyrowaveError.processFailed("failed to allocate Metal plane quantization buffers")
@@ -477,7 +501,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         try dispatchPlaneQuantization(
             count: descriptors.count * 16,
             buffers: [
-                (input, 0),
+                (samples, 0),
                 (output, 1),
                 (descriptorBuffer, 2),
                 (qScaleBuffer, 3)
@@ -485,8 +509,8 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
             constants: &constants
         )
 
-        let coefficientsPointer = output.contents().bindMemory(to: Int16.self, capacity: samples.count)
-        let coefficientValues = Array(UnsafeBufferPointer(start: coefficientsPointer, count: samples.count))
+        let coefficientsPointer = output.contents().bindMemory(to: Int16.self, capacity: sampleCount)
+        let coefficientValues = Array(UnsafeBufferPointer(start: coefficientsPointer, count: sampleCount))
         let qScalePointer = qScaleBuffer.contents().bindMemory(to: UInt8.self, capacity: descriptors.count * 16)
         let flatQScales = Array(UnsafeBufferPointer(start: qScalePointer, count: descriptors.count * 16))
         let perDescriptor = Swift.stride(from: 0, to: flatQScales.count, by: 16).map {
@@ -919,10 +943,27 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         guard !samples.isEmpty else { return [] }
 
         let byteLength = samples.count * MemoryLayout<Float>.stride
-        guard let primary = device.makeBuffer(bytes: samples, length: byteLength, options: .storageModeShared),
-              let scratch = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal DWT buffers")
+        guard let primary = device.makeBuffer(bytes: samples, length: byteLength, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal DWT input buffer")
         }
+        let output = try forwardWaveletBuffer(primary, sampleCount: samples.count, width: width, height: height, levels: levels)
+        let pointer = output.contents().bindMemory(to: Float.self, capacity: samples.count)
+        return Array(UnsafeBufferPointer(start: pointer, count: samples.count))
+    }
+
+    func forwardWaveletBuffer(_ buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int) throws -> MTLBuffer {
+        guard sampleCount == width * height,
+              buffer.length >= sampleCount * MemoryLayout<Float>.stride else {
+            throw PyrowaveError.invalidDimensions
+        }
+        try validateWaveletShape(width: width, height: height, levels: levels)
+        guard sampleCount > 0 else { return buffer }
+
+        let byteLength = sampleCount * MemoryLayout<Float>.stride
+        guard let scratch = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal DWT scratch buffer")
+        }
+        let primary = buffer
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw PyrowaveError.processFailed("failed to create Metal DWT command buffer")
         }
@@ -979,8 +1020,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         }
 
         try finish(commandBuffer: commandBuffer, context: "Metal DWT")
-        let pointer = primary.contents().bindMemory(to: Float.self, capacity: samples.count)
-        return Array(UnsafeBufferPointer(start: pointer, count: samples.count))
+        return primary
     }
 
     public func inverseWavelet(_ coefficients: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
