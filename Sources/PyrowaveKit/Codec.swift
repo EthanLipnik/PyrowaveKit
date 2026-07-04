@@ -448,7 +448,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         device: MTLDevice? = nil,
         usage: MTLTextureUsage = [.shaderRead, .shaderWrite]
     ) throws -> (y: MTLTexture, cb: MTLTexture, cr: MTLTexture) {
-        let decoded = try decodePlanes(frame, allowPartialFrame: false)
+        let decoded = try decodeGPUPlanes(frame, allowPartialFrame: false)
         let outputDevice = device ?? metalBackend.device
         guard outputDevice.registryID == metalBackend.device.registryID else {
             throw PyrowaveError.invalidDimensions
@@ -458,14 +458,14 @@ public final class PyrowaveCodec: @unchecked Sendable {
         let yTexture = try makeOutputTexture(width: decoded.planes[0].visibleWidth, height: decoded.planes[0].visibleHeight, device: outputDevice, usage: textureUsage)
         let cbTexture = try makeOutputTexture(width: decoded.planes[1].visibleWidth, height: decoded.planes[1].visibleHeight, device: outputDevice, usage: textureUsage)
         let crTexture = try makeOutputTexture(width: decoded.planes[2].visibleWidth, height: decoded.planes[2].visibleHeight, device: outputDevice, usage: textureUsage)
-        try finishDecodedPlane(decoded.planes[0], to: yTexture)
-        try finishDecodedPlane(decoded.planes[1], to: cbTexture)
-        try finishDecodedPlane(decoded.planes[2], to: crTexture)
+        try finishGPUDecodedPlane(decoded.planes[0], to: yTexture)
+        try finishGPUDecodedPlane(decoded.planes[1], to: cbTexture)
+        try finishGPUDecodedPlane(decoded.planes[2], to: crTexture)
         return (yTexture, cbTexture, crTexture)
     }
 
     func decodeToNV12Textures(_ frame: EncodedFrame, yTexture: MTLTexture, cbCrTexture: MTLTexture) throws {
-        let decoded = try decodePlanes(frame, allowPartialFrame: false)
+        let decoded = try decodeGPUPlanes(frame, allowPartialFrame: false)
         guard decoded.sequence.chroma == .yuv420,
               yTexture.width == decoded.sequence.width,
               yTexture.height == decoded.sequence.height,
@@ -474,14 +474,17 @@ public final class PyrowaveCodec: @unchecked Sendable {
             throw PyrowaveError.invalidDimensions
         }
 
-        let y = try inverseWavelet(decoded.planes[0].samples, width: decoded.planes[0].paddedWidth, height: decoded.planes[0].paddedHeight, levels: decoded.planes[0].levels)
-        let cb = try inverseWavelet(decoded.planes[1].samples, width: decoded.planes[1].paddedWidth, height: decoded.planes[1].paddedHeight, levels: decoded.planes[1].levels)
-        let cr = try inverseWavelet(decoded.planes[2].samples, width: decoded.planes[2].paddedWidth, height: decoded.planes[2].paddedHeight, levels: decoded.planes[2].levels)
+        let y = try inverseWaveletBuffer(decoded.planes[0])
+        let cb = try inverseWaveletBuffer(decoded.planes[1])
+        let cr = try inverseWaveletBuffer(decoded.planes[2])
         try metalBackend.cropPlanesToNV12Textures(
-            ySamples: y,
+            yBuffer: y,
+            ySampleCount: decoded.planes[0].sampleCount,
             yPaddedWidth: decoded.planes[0].paddedWidth,
-            cbSamples: cb,
-            crSamples: cr,
+            cbBuffer: cb,
+            cbSampleCount: decoded.planes[1].sampleCount,
+            crBuffer: cr,
+            crSampleCount: decoded.planes[2].sampleCount,
             chromaPaddedWidth: decoded.planes[1].paddedWidth,
             width: decoded.sequence.width,
             height: decoded.sequence.height,
@@ -532,6 +535,50 @@ public final class PyrowaveCodec: @unchecked Sendable {
         }
 
         return DecodedFramePlanes(sequence: sequence, planes: decodedPlanes)
+    }
+
+    private func decodeGPUPlanes(_ frame: EncodedFrame, allowPartialFrame: Bool) throws -> GPUDecodedFramePlanes {
+        var reader = BinaryReader(frame.data)
+        let sequence = try PyrowaveSequenceHeader(reader: &reader)
+        let layout = try PyrowaveBlockLayout(width: sequence.width, height: sequence.height, chroma: sequence.chroma)
+        var decodedPlanes = try (0..<PyrowaveBitstream.componentCount).map { component in
+            try makeGPUDecodedPlane(component: component, width: sequence.width, height: sequence.height, chroma: sequence.chroma, layout: layout)
+        }
+        var pendingSparseBlocks = Array(repeating: [PendingSparseBlock](), count: PyrowaveBitstream.componentCount)
+        var seenBlocks = Set<Int>()
+
+        while reader.offset < frame.data.count {
+            let block = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
+            guard block.sequence == sequence.sequence else {
+                throw PyrowaveError.invalidBitstream("coefficient packet sequence mismatch")
+            }
+            guard block.blockIndex >= 0, block.blockIndex < layout.descriptors.count, seenBlocks.insert(block.blockIndex).inserted else {
+                throw PyrowaveError.invalidBitstream("bad sparse block index")
+            }
+            guard let target = decodedPlanes.indices.first(where: { decodedPlanes[$0].descriptorsByBlockIndex[block.blockIndex] != nil }),
+                  let descriptor = decodedPlanes[target].descriptorsByBlockIndex[block.blockIndex] else {
+                throw PyrowaveError.invalidBitstream("sparse block index has no plane mapping")
+            }
+            pendingSparseBlocks[target].append(PendingSparseBlock(block: block, descriptor: descriptor))
+        }
+
+        if seenBlocks.count < sequence.totalBlocks {
+            guard allowPartialFrame, seenBlocks.count > sequence.totalBlocks / 2 else {
+                throw PyrowaveError.invalidBitstream("expected \(sequence.totalBlocks) blocks, decoded \(seenBlocks.count)")
+            }
+        } else if seenBlocks.count > sequence.totalBlocks {
+            throw PyrowaveError.invalidBitstream("expected \(sequence.totalBlocks) blocks, decoded \(seenBlocks.count)")
+        }
+
+        guard reader.offset == frame.data.count else {
+            throw PyrowaveError.invalidBitstream("trailing bytes")
+        }
+
+        for index in decodedPlanes.indices {
+            try applySparseBlocksToBuffer(pendingSparseBlocks[index], decodedPlane: &decodedPlanes[index])
+        }
+
+        return GPUDecodedFramePlanes(sequence: sequence, planes: decodedPlanes)
     }
 
     private func makeYUVFrame(from decoded: DecodedFramePlanes) throws -> YUVFrame {
@@ -620,6 +667,22 @@ public final class PyrowaveCodec: @unchecked Sendable {
     private struct DecodedFramePlanes {
         var sequence: PyrowaveSequenceHeader
         var planes: [DecodedPlane]
+    }
+
+    private struct GPUDecodedPlane {
+        var visibleWidth: Int
+        var visibleHeight: Int
+        var paddedWidth: Int
+        var paddedHeight: Int
+        var levels: Int
+        var sampleCount: Int
+        var samples: MTLBuffer
+        var descriptorsByBlockIndex: [Int: PlaneBlockDescriptor]
+    }
+
+    private struct GPUDecodedFramePlanes {
+        var sequence: PyrowaveSequenceHeader
+        var planes: [GPUDecodedPlane]
     }
 
     private struct PlaneGeometry {
@@ -1031,6 +1094,36 @@ public final class PyrowaveCodec: @unchecked Sendable {
         )
     }
 
+    private func makeGPUDecodedPlane(component: Int, width: Int, height: Int, chroma: ChromaSubsampling, layout: PyrowaveBlockLayout) throws -> GPUDecodedPlane {
+        let geometry = planeGeometry(component: component, frameWidth: width, frameHeight: height, chroma: chroma, requestedLevels: PyrowaveBitstream.decompositionLevels)
+        let levels = Wavelet.usableLevels(width: geometry.paddedWidth, height: geometry.paddedHeight, requested: geometry.requestedLevels)
+        let scratchPlane = EncodedPlane(
+            component: component,
+            paddedWidth: geometry.paddedWidth,
+            paddedHeight: geometry.paddedHeight,
+            levels: levels,
+            quantCodesByBlockIndex: [:],
+            qScaleCodesByBlockIndex: [:],
+            coefficients: []
+        )
+        let descriptors = planeBlockDescriptors(plane: scratchPlane, layout: layout)
+        let sampleCount = geometry.paddedWidth * geometry.paddedHeight
+        guard let samples = metalBackend.device.makeBuffer(length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate GPU decoded plane")
+        }
+        memset(samples.contents(), 0, sampleCount * MemoryLayout<Float>.stride)
+        return GPUDecodedPlane(
+            visibleWidth: geometry.visibleWidth,
+            visibleHeight: geometry.visibleHeight,
+            paddedWidth: geometry.paddedWidth,
+            paddedHeight: geometry.paddedHeight,
+            levels: levels,
+            sampleCount: sampleCount,
+            samples: samples,
+            descriptorsByBlockIndex: Dictionary(uniqueKeysWithValues: descriptors.map { ($0.blockIndex, $0) })
+        )
+    }
+
     private func applySparseBlocks(
         _ blocks: [PendingSparseBlock],
         decodedPlane: inout DecodedPlane
@@ -1042,9 +1135,28 @@ public final class PyrowaveCodec: @unchecked Sendable {
         )
     }
 
+    private func applySparseBlocksToBuffer(
+        _ blocks: [PendingSparseBlock],
+        decodedPlane: inout GPUDecodedPlane
+    ) throws {
+        let entries = try metalSparseCoefficientEntries(blocks, paddedWidth: decodedPlane.paddedWidth, paddedHeight: decodedPlane.paddedHeight)
+        decodedPlane.samples = try metalBackend.applySparseCoefficientBuffer(
+            sampleCount: decodedPlane.sampleCount,
+            entries: entries
+        )
+    }
+
     private func metalSparseCoefficientEntries(
         _ blocks: [PendingSparseBlock],
         decodedPlane: DecodedPlane
+    ) throws -> [MetalSparseCoefficientEntry] {
+        try metalSparseCoefficientEntries(blocks, paddedWidth: decodedPlane.paddedWidth, paddedHeight: decodedPlane.paddedHeight)
+    }
+
+    private func metalSparseCoefficientEntries(
+        _ blocks: [PendingSparseBlock],
+        paddedWidth: Int,
+        paddedHeight: Int
     ) throws -> [MetalSparseCoefficientEntry] {
         let capacity = blocks.reduce(0) { $0 + $1.block.coefficients.count }
         var entries = [MetalSparseCoefficientEntry]()
@@ -1055,7 +1167,8 @@ public final class PyrowaveCodec: @unchecked Sendable {
                 let destinationOffset = try sparseDestinationOffset(
                     entryOffset: entry.offset,
                     descriptor: pending.descriptor,
-                    decodedPlane: decodedPlane
+                    paddedWidth: paddedWidth,
+                    paddedHeight: paddedHeight
                 )
                 entries.append(MetalSparseCoefficientEntry(
                     destinationOffset: UInt32(destinationOffset),
@@ -1074,6 +1187,20 @@ public final class PyrowaveCodec: @unchecked Sendable {
         descriptor: PlaneBlockDescriptor,
         decodedPlane: DecodedPlane
     ) throws -> Int {
+        try sparseDestinationOffset(
+            entryOffset: entryOffset,
+            descriptor: descriptor,
+            paddedWidth: decodedPlane.paddedWidth,
+            paddedHeight: decodedPlane.paddedHeight
+        )
+    }
+
+    private func sparseDestinationOffset(
+        entryOffset: UInt16,
+        descriptor: PlaneBlockDescriptor,
+        paddedWidth: Int,
+        paddedHeight: Int
+    ) throws -> Int {
         let blockSize = Self.sparseBlockSize
         let localOffset = Int(entryOffset)
         let localX = localOffset % blockSize
@@ -1083,11 +1210,11 @@ public final class PyrowaveCodec: @unchecked Sendable {
         guard localOffset < blockSize * blockSize,
               localX < descriptor.validWidth,
               localY < descriptor.validHeight,
-              x < decodedPlane.paddedWidth,
-              y < decodedPlane.paddedHeight else {
+              x < paddedWidth,
+              y < paddedHeight else {
             throw PyrowaveError.invalidBitstream("sparse coefficient out of range")
         }
-        return y * decodedPlane.paddedWidth + x
+        return y * paddedWidth + x
     }
 
     private func finishDecodedPlane(_ plane: DecodedPlane) throws -> Plane8 {
@@ -1103,6 +1230,28 @@ public final class PyrowaveCodec: @unchecked Sendable {
             width: plane.visibleWidth,
             height: plane.visibleHeight,
             texture: texture
+        )
+    }
+
+    private func finishGPUDecodedPlane(_ plane: GPUDecodedPlane, to texture: MTLTexture) throws {
+        let reconstructed = try inverseWaveletBuffer(plane)
+        try metalBackend.cropPlaneToTexture(
+            reconstructed,
+            sampleCount: plane.sampleCount,
+            paddedWidth: plane.paddedWidth,
+            width: plane.visibleWidth,
+            height: plane.visibleHeight,
+            texture: texture
+        )
+    }
+
+    private func inverseWaveletBuffer(_ plane: GPUDecodedPlane) throws -> MTLBuffer {
+        try metalBackend.inverseWaveletBuffer(
+            plane.samples,
+            sampleCount: plane.sampleCount,
+            width: plane.paddedWidth,
+            height: plane.paddedHeight,
+            levels: plane.levels
         )
     }
 

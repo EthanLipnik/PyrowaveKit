@@ -249,6 +249,13 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     }
 
     func cropPlaneToTexture(_ samples: [Float], paddedWidth: Int, width: Int, height: Int, texture: MTLTexture) throws {
+        guard let input = device.makeBuffer(bytes: samples, length: samples.count * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal texture crop buffer")
+        }
+        try cropPlaneToTexture(input, sampleCount: samples.count, paddedWidth: paddedWidth, width: width, height: height, texture: texture)
+    }
+
+    func cropPlaneToTexture(_ buffer: MTLBuffer, sampleCount: Int, paddedWidth: Int, width: Int, height: Int, texture: MTLTexture) throws {
         guard texture.pixelFormat == .r8Unorm,
               texture.width == width,
               texture.height == height,
@@ -258,11 +265,9 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
               paddedWidth <= Int(UInt32.max),
               width <= Int(UInt32.max),
               height <= Int(UInt32.max),
-              samples.count >= paddedWidth * height else {
+              sampleCount >= paddedWidth * height,
+              buffer.length >= sampleCount * MemoryLayout<Float>.stride else {
             throw PyrowaveError.invalidDimensions
-        }
-        guard let input = device.makeBuffer(bytes: samples, length: samples.count * MemoryLayout<Float>.stride, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal texture crop buffer")
         }
 
         var constants = CropPlaneConstants(
@@ -276,7 +281,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         }
 
         encoder.setComputePipelineState(cropTexturePlanePipeline)
-        encoder.setBuffer(input, offset: 0, index: 0)
+        encoder.setBuffer(buffer, offset: 0, index: 0)
         encoder.setTexture(texture, index: 0)
         encoder.setBytes(&constants, length: MemoryLayout<CropPlaneConstants>.stride, index: 1)
         let threadWidth = min(16, cropTexturePlanePipeline.maxTotalThreadsPerThreadgroup)
@@ -305,6 +310,41 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         yTexture: MTLTexture,
         cbCrTexture: MTLTexture
     ) throws {
+        guard let yInput = device.makeBuffer(bytes: ySamples, length: ySamples.count * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let cbInput = device.makeBuffer(bytes: cbSamples, length: cbSamples.count * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let crInput = device.makeBuffer(bytes: crSamples, length: crSamples.count * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal NV12 crop buffers")
+        }
+        try cropPlanesToNV12Textures(
+            yBuffer: yInput,
+            ySampleCount: ySamples.count,
+            yPaddedWidth: yPaddedWidth,
+            cbBuffer: cbInput,
+            cbSampleCount: cbSamples.count,
+            crBuffer: crInput,
+            crSampleCount: crSamples.count,
+            chromaPaddedWidth: chromaPaddedWidth,
+            width: width,
+            height: height,
+            yTexture: yTexture,
+            cbCrTexture: cbCrTexture
+        )
+    }
+
+    func cropPlanesToNV12Textures(
+        yBuffer: MTLBuffer,
+        ySampleCount: Int,
+        yPaddedWidth: Int,
+        cbBuffer: MTLBuffer,
+        cbSampleCount: Int,
+        crBuffer: MTLBuffer,
+        crSampleCount: Int,
+        chromaPaddedWidth: Int,
+        width: Int,
+        height: Int,
+        yTexture: MTLTexture,
+        cbCrTexture: MTLTexture
+    ) throws {
         let chromaWidth = width / 2
         let chromaHeight = height / 2
         guard yTexture.pixelFormat == .r8Unorm,
@@ -321,15 +361,13 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
               chromaPaddedWidth <= Int(UInt32.max),
               width <= Int(UInt32.max),
               height <= Int(UInt32.max),
-              ySamples.count >= yPaddedWidth * height,
-              cbSamples.count >= chromaPaddedWidth * chromaHeight,
-              crSamples.count >= chromaPaddedWidth * chromaHeight else {
+              ySampleCount >= yPaddedWidth * height,
+              cbSampleCount >= chromaPaddedWidth * chromaHeight,
+              crSampleCount >= chromaPaddedWidth * chromaHeight,
+              yBuffer.length >= ySampleCount * MemoryLayout<Float>.stride,
+              cbBuffer.length >= cbSampleCount * MemoryLayout<Float>.stride,
+              crBuffer.length >= crSampleCount * MemoryLayout<Float>.stride else {
             throw PyrowaveError.invalidDimensions
-        }
-        guard let yInput = device.makeBuffer(bytes: ySamples, length: ySamples.count * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let cbInput = device.makeBuffer(bytes: cbSamples, length: cbSamples.count * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let crInput = device.makeBuffer(bytes: crSamples, length: crSamples.count * MemoryLayout<Float>.stride, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal NV12 crop buffers")
         }
 
         var constants = CropNV12Constants(
@@ -344,9 +382,9 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         }
 
         encoder.setComputePipelineState(cropNV12TexturesPipeline)
-        encoder.setBuffer(yInput, offset: 0, index: 0)
-        encoder.setBuffer(cbInput, offset: 0, index: 1)
-        encoder.setBuffer(crInput, offset: 0, index: 2)
+        encoder.setBuffer(yBuffer, offset: 0, index: 0)
+        encoder.setBuffer(cbBuffer, offset: 0, index: 1)
+        encoder.setBuffer(crBuffer, offset: 0, index: 2)
         encoder.setTexture(yTexture, index: 0)
         encoder.setTexture(cbCrTexture, index: 1)
         encoder.setBytes(&constants, length: MemoryLayout<CropNV12Constants>.stride, index: 3)
@@ -458,19 +496,40 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     }
 
     func applySparseCoefficients(sampleCount: Int, entries: [MetalSparseCoefficientEntry]) throws -> [Float] {
+        let output = try applySparseCoefficientBuffer(sampleCount: sampleCount, entries: entries)
+        guard sampleCount > 0 else {
+            return []
+        }
+        let pointer = output.contents().bindMemory(to: Float.self, capacity: sampleCount)
+        return Array(UnsafeBufferPointer(start: pointer, count: sampleCount))
+    }
+
+    func applySparseCoefficientBuffer(sampleCount: Int, entries: [MetalSparseCoefficientEntry]) throws -> MTLBuffer {
         guard sampleCount >= 0 else {
             throw PyrowaveError.invalidDimensions
         }
         guard sampleCount <= Int(UInt32.max), entries.count <= Int(UInt32.max) else {
             throw PyrowaveError.invalidDimensions
         }
-        guard !entries.isEmpty else {
-            return Array(repeating: 0, count: sampleCount)
+        if sampleCount == 0 {
+            guard entries.isEmpty else {
+                throw PyrowaveError.invalidDimensions
+            }
+            guard let output = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient output")
+            }
+            output.contents().storeBytes(of: Float(0), as: Float.self)
+            return output
         }
-
-        let samples = Array(repeating: Float(0), count: sampleCount)
-        guard let output = device.makeBuffer(bytes: samples, length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let entryBuffer = device.makeBuffer(bytes: entries, length: entries.count * MemoryLayout<MetalSparseCoefficientEntry>.stride, options: .storageModeShared) else {
+        let byteLength = sampleCount * MemoryLayout<Float>.stride
+        guard let output = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient output")
+        }
+        memset(output.contents(), 0, byteLength)
+        guard !entries.isEmpty else {
+            return output
+        }
+        guard let entryBuffer = device.makeBuffer(bytes: entries, length: entries.count * MemoryLayout<MetalSparseCoefficientEntry>.stride, options: .storageModeShared) else {
             throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient buffers")
         }
 
@@ -497,8 +556,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("Metal sparse coefficient command failed: \(error)")
         }
 
-        let pointer = output.contents().bindMemory(to: Float.self, capacity: sampleCount)
-        return Array(UnsafeBufferPointer(start: pointer, count: sampleCount))
+        return output
     }
 
     func rateControlTileStats(
@@ -930,10 +988,27 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         guard !coefficients.isEmpty else { return [] }
 
         let byteLength = coefficients.count * MemoryLayout<Float>.stride
-        guard let primary = device.makeBuffer(bytes: coefficients, length: byteLength, options: .storageModeShared),
-              let scratch = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal iDWT buffers")
+        guard let primary = device.makeBuffer(bytes: coefficients, length: byteLength, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal iDWT input buffer")
         }
+        let output = try inverseWaveletBuffer(primary, sampleCount: coefficients.count, width: width, height: height, levels: levels)
+        let pointer = output.contents().bindMemory(to: Float.self, capacity: coefficients.count)
+        return Array(UnsafeBufferPointer(start: pointer, count: coefficients.count))
+    }
+
+    func inverseWaveletBuffer(_ buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int) throws -> MTLBuffer {
+        guard sampleCount == width * height,
+              buffer.length >= sampleCount * MemoryLayout<Float>.stride else {
+            throw PyrowaveError.invalidDimensions
+        }
+        try validateWaveletShape(width: width, height: height, levels: levels)
+        guard sampleCount > 0 else { return buffer }
+
+        let byteLength = sampleCount * MemoryLayout<Float>.stride
+        guard let scratch = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal iDWT scratch buffer")
+        }
+        let primary = buffer
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw PyrowaveError.processFailed("failed to create Metal iDWT command buffer")
         }
@@ -994,8 +1069,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         }
 
         try finish(commandBuffer: commandBuffer, context: "Metal iDWT")
-        let pointer = primary.contents().bindMemory(to: Float.self, capacity: coefficients.count)
-        return Array(UnsafeBufferPointer(start: pointer, count: coefficients.count))
+        return primary
     }
 
     private static func makeFunction(named name: String, library: MTLLibrary) throws -> MTLFunction {
@@ -1214,7 +1288,13 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         guard width > 0, height > 0, levels >= 0, samples.count == width * height else {
             throw PyrowaveError.invalidDimensions
         }
+        try validateWaveletShape(width: width, height: height, levels: levels)
+    }
 
+    private func validateWaveletShape(width: Int, height: Int, levels: Int) throws {
+        guard width > 0, height > 0, levels >= 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
         var activeWidth = width
         var activeHeight = height
         for _ in 0..<levels {
