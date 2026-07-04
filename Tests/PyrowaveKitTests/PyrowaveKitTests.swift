@@ -134,15 +134,22 @@ import Testing
         return
     }
 
-    let frame = try TestFrames.synthetic420(width: 160, height: 96)
     let configuration = CodecConfiguration(quantizationStep: 1.0 / 2048.0)
-    let cpu = try PyrowaveCodec(useMetalAcceleration: false).encode(frame, configuration: configuration)
-    let metal = try PyrowaveCodec(useMetalAcceleration: true).encode(frame, configuration: configuration)
-    #expect(metal.data == cpu.data)
+    let frames = [
+        try TestFrames.synthetic420(width: 160, height: 96),
+        try TestFrames.synthetic420(width: 130, height: 74),
+        try TestFrames.synthetic444(width: 128, height: 96)
+    ]
 
-    let decodedCPU = try PyrowaveCodec(useMetalAcceleration: false).decode(cpu)
-    let decodedMetal = try PyrowaveCodec(useMetalAcceleration: true).decode(metal)
-    #expect(decodedMetal == decodedCPU)
+    for frame in frames {
+        let cpu = try PyrowaveCodec(useMetalAcceleration: false).encode(frame, configuration: configuration)
+        let metal = try PyrowaveCodec(useMetalAcceleration: true).encode(frame, configuration: configuration)
+        #expect(metal.data == cpu.data)
+
+        let decodedCPU = try PyrowaveCodec(useMetalAcceleration: false).decode(cpu)
+        let decodedMetal = try PyrowaveCodec(useMetalAcceleration: true).decode(metal)
+        #expect(decodedMetal == decodedCPU)
+    }
     #endif
 }
 

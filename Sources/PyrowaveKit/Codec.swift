@@ -672,8 +672,8 @@ public final class PyrowaveCodec: Sendable {
     }
 
     private func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
-        if let metalBackend, let accelerated = try? metalBackend.forwardWavelet(samples, width: width, height: height, levels: levels) {
-            return accelerated
+        if let metalBackend {
+            return try metalBackend.forwardWavelet(samples, width: width, height: height, levels: levels)
         }
 
         var transformed = samples
@@ -682,8 +682,8 @@ public final class PyrowaveCodec: Sendable {
     }
 
     private func inverseWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
-        if let metalBackend, let accelerated = try? metalBackend.inverseWavelet(samples, width: width, height: height, levels: levels) {
-            return accelerated
+        if let metalBackend {
+            return try metalBackend.inverseWavelet(samples, width: width, height: height, levels: levels)
         }
 
         var transformed = samples
