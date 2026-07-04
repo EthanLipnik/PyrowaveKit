@@ -34,7 +34,7 @@ The benchmark executable compares PyrowaveKit against a multi-frame HEVC encode/
 swift run -c release pyrowave-swift-bench --frames 60 --preset 6k --output-dir .pyrowave-results
 ```
 
-Outputs are written to `.pyrowave-results/`, which is git ignored. The benchmark report is saved as `.pyrowave-results/benchmark-report.json` alongside the generated reference, Pyrowave, HEVC, and decoded sample artifacts.
+Outputs are written to `.pyrowave-results/`, which is git ignored. The benchmark report is saved as `.pyrowave-results/benchmark-report.json` alongside `reference.y4m`, `pyrowave-sample.pwks`, `pyrowave-decoded.y4m`, `hevc-avkit.mov`, and `hevc-decoded.y4m`.
 When Pyrowave is matched to the HEVC bitrate, its per-frame cap uses the same 60 Hz quality-reference rule as Mirage: high-refresh streams above 60 Hz do not halve per-frame quality.
 
 Do not treat benchmark numbers as final until the Swift/Metal port is complete. The current benchmark harness exists so quality and performance deltas can be measured repeatedly during the port.

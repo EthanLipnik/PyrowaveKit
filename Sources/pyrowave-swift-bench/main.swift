@@ -10,8 +10,17 @@ struct BenchmarkReport: Codable {
     var frameRateDenominator: Int
     var bitrate: Int
     var pyrowaveFrameBudgetBytes: Int?
+    var artifacts: BenchmarkArtifacts
     var pyrowave: CodecBenchmarkResult
     var hevc: CodecBenchmarkResult
+}
+
+struct BenchmarkArtifacts: Codable {
+    var referenceY4M: String
+    var pyrowaveStream: String
+    var pyrowaveDecodedY4M: String
+    var hevcMovie: String
+    var hevcDecodedY4M: String
 }
 
 struct Arguments {
@@ -142,7 +151,7 @@ func runPyrowave(loaded: LoadedFrames, configuration: CodecConfiguration, output
     let encodedBytes = encodedFrames.reduce(0) { $0 + $1.data.count }
     if let firstFrame = frames.first {
         var stream = try PyrowaveStreamWriter(
-            url: outputDirectory.appendingPathComponent("pyrowave-sample.pwks"),
+            url: outputDirectory.appendingPathComponent(BenchmarkArtifactNames.pyrowaveStream),
             header: PyrowaveStreamHeader(
                 frame: firstFrame,
                 frameRateNumerator: loaded.frameRateNumerator,
@@ -154,6 +163,12 @@ func runPyrowave(loaded: LoadedFrames, configuration: CodecConfiguration, output
             try stream.writeFrame(frame)
         }
     }
+    try YUV4MPEGWriter.write(
+        frames: decodedFrames,
+        to: outputDirectory.appendingPathComponent(BenchmarkArtifactNames.pyrowaveDecodedY4M),
+        frameRateNumerator: loaded.frameRateNumerator,
+        frameRateDenominator: loaded.frameRateDenominator
+    )
 
     let metric = try Metrics.compare(frames, decodedFrames)
     return CodecBenchmarkResult(
@@ -166,11 +181,25 @@ func runPyrowave(loaded: LoadedFrames, configuration: CodecConfiguration, output
     )
 }
 
+enum BenchmarkArtifactNames {
+    static let referenceY4M = "reference.y4m"
+    static let pyrowaveStream = "pyrowave-sample.pwks"
+    static let pyrowaveDecodedY4M = "pyrowave-decoded.y4m"
+    static let hevcMovie = "hevc-avkit.mov"
+    static let hevcDecodedY4M = "hevc-decoded.y4m"
+}
+
 do {
     let arguments = try Arguments()
     try FileManager.default.createDirectory(at: arguments.outputDirectory, withIntermediateDirectories: true)
     let loaded = try loadFrames(arguments: arguments)
     let frames = loaded.frames
+    try YUV4MPEGWriter.write(
+        frames: frames,
+        to: arguments.outputDirectory.appendingPathComponent(BenchmarkArtifactNames.referenceY4M),
+        frameRateNumerator: loaded.frameRateNumerator,
+        frameRateDenominator: loaded.frameRateDenominator
+    )
     let pyrowaveBudget: Int?
     if let maximumPyrowaveBytes = arguments.maximumPyrowaveBytes {
         pyrowaveBudget = maximumPyrowaveBytes
@@ -205,6 +234,13 @@ do {
         frameRateDenominator: loaded.frameRateDenominator,
         bitrate: arguments.bitrate,
         pyrowaveFrameBudgetBytes: pyrowaveBudget,
+        artifacts: BenchmarkArtifacts(
+            referenceY4M: BenchmarkArtifactNames.referenceY4M,
+            pyrowaveStream: BenchmarkArtifactNames.pyrowaveStream,
+            pyrowaveDecodedY4M: BenchmarkArtifactNames.pyrowaveDecodedY4M,
+            hevcMovie: BenchmarkArtifactNames.hevcMovie,
+            hevcDecodedY4M: BenchmarkArtifactNames.hevcDecodedY4M
+        ),
         pyrowave: pyrowave,
         hevc: hevc
     )

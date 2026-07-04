@@ -64,8 +64,12 @@ public enum HEVCComparison {
         let frameDuration = try Self.frameDuration(numerator: frameRateNumerator, denominator: frameRateDenominator)
         try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
         let hevcURL = workingDirectory.appendingPathComponent("hevc-avkit.mov")
+        let decodedURL = workingDirectory.appendingPathComponent("hevc-decoded.y4m")
         if FileManager.default.fileExists(atPath: hevcURL.path) {
             try FileManager.default.removeItem(at: hevcURL)
+        }
+        if FileManager.default.fileExists(atPath: decodedURL.path) {
+            try FileManager.default.removeItem(at: decodedURL)
         }
 
         var stopwatch = Stopwatch()
@@ -83,6 +87,12 @@ public enum HEVCComparison {
             videoSignal: firstFrame.videoSignal
         )
         let decodeSeconds = stopwatch.lapSeconds()
+        try YUV4MPEGWriter.write(
+            frames: decodedFrames,
+            to: decodedURL,
+            frameRateNumerator: frameRateNumerator,
+            frameRateDenominator: frameRateDenominator
+        )
         let encodedBytes = (try FileManager.default.attributesOfItem(atPath: hevcURL.path)[.size] as? NSNumber)?.intValue ?? 0
         let comparedCount = min(referenceFrames.count, decodedFrames.count)
         let metrics = try Metrics.compare(

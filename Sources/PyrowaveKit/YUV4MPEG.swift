@@ -139,6 +139,9 @@ public struct YUV4MPEGWriter {
         self.width = width
         self.height = height
         self.chroma = chroma
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
         FileManager.default.createFile(atPath: url.path, contents: nil)
         handle = try FileHandle(forWritingTo: url)
         let chromaTag = chroma == .yuv444 ? "C444" : "C420jpeg"
@@ -153,6 +156,30 @@ public struct YUV4MPEGWriter {
         try handle.write(contentsOf: Data(frame.y.data))
         try handle.write(contentsOf: Data(frame.cb.data))
         try handle.write(contentsOf: Data(frame.cr.data))
+    }
+
+    public static func write(
+        frames: [YUVFrame],
+        to url: URL,
+        frameRateNumerator: Int = 60,
+        frameRateDenominator: Int = 1
+    ) throws {
+        guard let firstFrame = frames.first,
+              frameRateNumerator > 0,
+              frameRateDenominator > 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        var writer = try YUV4MPEGWriter(
+            url: url,
+            width: firstFrame.width,
+            height: firstFrame.height,
+            chroma: firstFrame.chroma,
+            frameRate: "\(frameRateNumerator):\(frameRateDenominator)"
+        )
+        for frame in frames {
+            try writer.writeFrame(frame)
+        }
     }
 }
 

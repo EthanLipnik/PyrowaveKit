@@ -124,6 +124,33 @@ import Testing
     }
 }
 
+@Test func yuv4mpegSequenceWriterPreservesFrameRateAndTruncatesExistingFile() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("sequence.y4m")
+    let first = try TestFrames.synthetic420(width: 32, height: 32, frameIndex: 0)
+    let second = try TestFrames.synthetic420(width: 32, height: 32, frameIndex: 1)
+
+    try YUV4MPEGWriter.write(
+        frames: [first, second],
+        to: url,
+        frameRateNumerator: 30000,
+        frameRateDenominator: 1001
+    )
+    try YUV4MPEGWriter.write(
+        frames: [second],
+        to: url,
+        frameRateNumerator: 30000,
+        frameRateDenominator: 1001
+    )
+
+    var reader = try YUV4MPEGReader(url: url)
+    #expect(reader.frameRateNumerator == 30000)
+    #expect(reader.frameRateDenominator == 1001)
+    #expect(try reader.readFrame() == second)
+    #expect(try reader.readFrame() == nil)
+}
+
 @Test func yuv4mpegReadsHighBitDepth420AndRangeMetadata() throws {
     let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
