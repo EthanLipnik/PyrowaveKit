@@ -1,6 +1,11 @@
 import Foundation
 import Metal
 
+private struct SparseCoefficientOutputKey: Hashable {
+    var planeIndex: Int
+    var sampleCount: Int
+}
+
 final class MetalPyrowaveBackend: @unchecked Sendable {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
@@ -30,6 +35,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     private let idwtUnpackColumnsScaledPipeline: MTLComputePipelineState
     private let idwtLiftRowsPipeline: MTLComputePipelineState
     private let idwtLiftColumnsPipeline: MTLComputePipelineState
+    private var sparseCoefficientOutputs: [SparseCoefficientOutputKey: MTLBuffer] = [:]
 
     init(device: MTLDevice? = MTLCreateSystemDefaultDevice()) throws {
         guard let device else {
@@ -665,18 +671,14 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 guard plane.entries.isEmpty else {
                     throw PyrowaveError.invalidDimensions
                 }
-                guard let output = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared) else {
-                    throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient output")
-                }
+                let output = try sparseCoefficientOutput(planeIndex: planeIndex, sampleCount: 0)
                 output.contents().storeBytes(of: Float(0), as: Float.self)
                 outputs.append(output)
                 continue
             }
 
             let byteLength = plane.sampleCount * MemoryLayout<Float>.stride
-            guard let output = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
-                throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient output")
-            }
+            let output = try sparseCoefficientOutput(planeIndex: planeIndex, sampleCount: plane.sampleCount)
             outputs.append(output)
             zeroFills.append((buffer: output, byteLength: byteLength))
 
@@ -739,6 +741,19 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         }
 
         return outputs
+    }
+
+    private func sparseCoefficientOutput(planeIndex: Int, sampleCount: Int) throws -> MTLBuffer {
+        let key = SparseCoefficientOutputKey(planeIndex: planeIndex, sampleCount: sampleCount)
+        let byteLength = max(sampleCount, 1) * MemoryLayout<Float>.stride
+        if let output = sparseCoefficientOutputs[key], output.length >= byteLength {
+            return output
+        }
+        guard let output = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient output")
+        }
+        sparseCoefficientOutputs[key] = output
+        return output
     }
 
     func rateControlTileStats(
