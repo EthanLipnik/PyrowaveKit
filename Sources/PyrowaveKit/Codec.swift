@@ -233,11 +233,16 @@ public final class PyrowaveCodec: @unchecked Sendable {
     private static let sparseBlockSize = 32
 
     private let metalBackend: MetalPyrowaveBackend
+    private let gpuDecodedPlanePlaceholder: MTLBuffer
     let coreVideoTextureCache: CVMetalTextureCache
     private let sequenceCounter = SequenceCounter()
 
     public init() throws {
         metalBackend = try MetalPyrowaveBackend()
+        guard let placeholder = metalBackend.device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate GPU decoded plane placeholder")
+        }
+        gpuDecodedPlanePlaceholder = placeholder
         var textureCache: CVMetalTextureCache?
         let status = CVMetalTextureCacheCreate(nil, nil, metalBackend.device, nil, &textureCache)
         guard status == kCVReturnSuccess, let textureCache else {
@@ -1984,10 +1989,6 @@ public final class PyrowaveCodec: @unchecked Sendable {
         )
         let descriptors = planeBlockDescriptors(plane: scratchPlane, layout: layout)
         let sampleCount = geometry.paddedWidth * geometry.paddedHeight
-        guard let samples = metalBackend.device.makeBuffer(length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate GPU decoded plane")
-        }
-        memset(samples.contents(), 0, sampleCount * MemoryLayout<Float>.stride)
         return GPUDecodedPlane(
             visibleWidth: geometry.visibleWidth,
             visibleHeight: geometry.visibleHeight,
@@ -1995,7 +1996,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
             paddedHeight: geometry.paddedHeight,
             levels: levels,
             sampleCount: sampleCount,
-            samples: samples,
+            samples: gpuDecodedPlanePlaceholder,
             descriptorsByBlockIndex: Dictionary(uniqueKeysWithValues: descriptors.map { ($0.blockIndex, $0) })
         )
     }
