@@ -355,6 +355,11 @@ public final class PyrowaveCodec: Sendable {
         var packetByteCostsByPlane: [[[Int]]]?
     }
 
+    private struct MetalRateControlBucketData {
+        var indicesByPlane: [[[Int]]]
+        var cumulativeSavings: [Int]
+    }
+
     private struct PlaneBlockDescriptor {
         var blockIndex: Int
         var globalLevel: Int
@@ -447,12 +452,13 @@ public final class PyrowaveCodec: Sendable {
         let fixedHeaderBytes = frameHeaderSize
         let rateBlocksByPlane = try planes.map { try makeRateControlBlocks($0, layout: layout) }
         let packetByteCostsByPlane = rateBlocksByPlane.map { $0.map(\.packetByteCosts) }
-        let bucketIndicesByPlane = try metalRateControlBucketIndices(blocksByPlane: rateBlocksByPlane)
+        let metalBucketData = try metalRateControlBucketData(blocksByPlane: rateBlocksByPlane)
         if let thresholdsByPlane = PyrowaveRateController.selectThresholds(
             blocksByPlane: rateBlocksByPlane,
             fixedHeaderBytes: fixedHeaderBytes,
             maximumEncodedBytes: maximumEncodedBytes,
-            bucketIndicesByPlane: bucketIndicesByPlane
+            bucketIndicesByPlane: metalBucketData?.indicesByPlane,
+            cumulativeBucketSavings: metalBucketData?.cumulativeSavings
         ) {
             return SparseRateControlPlan(
                 defaultQuantLevel: 0,
@@ -485,13 +491,15 @@ public final class PyrowaveCodec: Sendable {
         )
     }
 
-    private func metalRateControlBucketIndices(blocksByPlane: [[PyrowaveRateControlBlock]]) throws -> [[[Int]]]? {
+    private func metalRateControlBucketData(blocksByPlane: [[PyrowaveRateControlBlock]]) throws -> MetalRateControlBucketData? {
         guard let metalBackend else {
             return nil
         }
 
         var bucketsByPlane = [[[Int]]]()
         bucketsByPlane.reserveCapacity(blocksByPlane.count)
+        var flatBuckets = [[Int]]()
+        var flatPacketByteCosts = [[Int]]()
         for blocks in blocksByPlane {
             let distortions = blocks.map { block in
                 (0..<PyrowaveBlockStats.candidateCount).map { block.distortion(quantLevel: $0) }
@@ -505,8 +513,14 @@ public final class PyrowaveCodec: Sendable {
                 throw PyrowaveError.processFailed("Metal rate-control bucket pass returned \(buckets.count) blocks for \(blocks.count) inputs")
             }
             bucketsByPlane.append(buckets)
+            flatBuckets.append(contentsOf: buckets)
+            flatPacketByteCosts.append(contentsOf: packetByteCosts)
         }
-        return bucketsByPlane
+        let cumulativeSavings = try metalBackend.rateControlCumulativeBucketSavings(
+            bucketIndices: flatBuckets,
+            packetByteCosts: flatPacketByteCosts
+        )
+        return MetalRateControlBucketData(indicesByPlane: bucketsByPlane, cumulativeSavings: cumulativeSavings)
     }
 
     private var frameHeaderSize: Int {

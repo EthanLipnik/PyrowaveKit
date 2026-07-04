@@ -165,7 +165,8 @@ enum PyrowaveRateController {
         blocksByPlane: [[PyrowaveRateControlBlock]],
         fixedHeaderBytes: Int,
         maximumEncodedBytes: Int,
-        bucketIndicesByPlane: [[[Int]]]? = nil
+        bucketIndicesByPlane: [[[Int]]]? = nil,
+        cumulativeBucketSavings: [Int]? = nil
     ) -> [[Int]]? {
         var thresholds = blocksByPlane.map { Array(repeating: 0, count: $0.count) }
         var currentBytes = estimateFrameBytes(
@@ -176,6 +177,10 @@ enum PyrowaveRateController {
         var requiredSavings = currentBytes - maximumEncodedBytes
         guard requiredSavings > 0 else {
             return thresholds
+        }
+        if let cumulativeBucketSavings,
+           (cumulativeBucketSavings.last ?? 0) < requiredSavings {
+            return nil
         }
 
         let operations = makeRDOperations(
@@ -204,6 +209,40 @@ enum PyrowaveRateController {
         }
 
         return currentBytes <= maximumEncodedBytes ? thresholds : nil
+    }
+
+    static func cumulativeBucketSavings(
+        blocksByPlane: [[PyrowaveRateControlBlock]],
+        bucketIndicesByPlane: [[[Int]]]? = nil
+    ) -> [Int] {
+        var savings = Array(repeating: 0, count: bucketCount)
+        for (planeIndex, blocks) in blocksByPlane.enumerated() {
+            for (blockIndex, block) in blocks.enumerated() {
+                let bucketIndices: [Int]
+                if let bucketIndicesByPlane,
+                   planeIndex < bucketIndicesByPlane.count,
+                   blockIndex < bucketIndicesByPlane[planeIndex].count,
+                   bucketIndicesByPlane[planeIndex][blockIndex].count == PyrowaveRateControlBlock.candidateCount {
+                    bucketIndices = bucketIndicesByPlane[planeIndex][blockIndex]
+                } else {
+                    bucketIndices = inclusiveBucketIndices(for: block)
+                }
+
+                for quantLevel in 1..<PyrowaveRateControlBlock.candidateCount {
+                    let saving = block.packetByteCost(quantLevel: quantLevel - 1) - block.packetByteCost(quantLevel: quantLevel)
+                    guard saving > 0 else {
+                        continue
+                    }
+                    savings[bucketIndices[quantLevel]] += saving
+                }
+            }
+        }
+
+        var running = 0
+        return savings.map {
+            running += $0
+            return running
+        }
     }
 
     static func estimateFrameBytes(

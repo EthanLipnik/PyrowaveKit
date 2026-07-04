@@ -759,6 +759,8 @@ import CoreVideo
         _ = try backend.makeFunction(named: "pyrowave_rate_control_tile_stats")
         _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_indices")
+        _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_savings")
+        _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_savings_prefix")
     } catch PyrowaveError.externalToolUnavailable {
         return
     }
@@ -1120,6 +1122,20 @@ import CoreVideo
     )
     let cpuOperations = PyrowaveRateController.makeRDOperations(blocksByPlane: [blocks])
     #expect(metalOperations == cpuOperations)
+
+    let metalSavings = try backend.rateControlCumulativeBucketSavings(
+        bucketIndices: metal,
+        packetByteCosts: packetByteCosts
+    )
+    let cpuSavings = PyrowaveRateController.cumulativeBucketSavings(
+        blocksByPlane: [blocks],
+        bucketIndicesByPlane: [metal]
+    )
+    #expect(metalSavings == cpuSavings)
+    #expect(metalSavings.count == 128)
+    for index in 1..<metalSavings.count {
+        #expect(metalSavings[index] >= metalSavings[index - 1])
+    }
     #endif
 }
 

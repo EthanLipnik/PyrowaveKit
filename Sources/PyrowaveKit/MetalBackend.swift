@@ -16,6 +16,8 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     private let rateControlStatsPipeline: MTLComputePipelineState
     private let packetByteCostsPipeline: MTLComputePipelineState
     private let rateControlBucketPipeline: MTLComputePipelineState
+    private let rateControlBucketSavingsPipeline: MTLComputePipelineState
+    private let rateControlBucketSavingsPrefixPipeline: MTLComputePipelineState
     private let dwtLiftRowsPipeline: MTLComputePipelineState
     private let dwtLiftColumnsPipeline: MTLComputePipelineState
     private let dwtPackRowsPipeline: MTLComputePipelineState
@@ -53,6 +55,8 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         rateControlStatsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_tile_stats", library: library))
         packetByteCostsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_packet_byte_costs", library: library))
         rateControlBucketPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_bucket_indices", library: library))
+        rateControlBucketSavingsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_bucket_savings", library: library))
+        rateControlBucketSavingsPrefixPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_bucket_savings_prefix", library: library))
         dwtLiftRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_rows", library: library))
         dwtLiftColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_columns", library: library))
         dwtPackRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_pack_rows", library: library))
@@ -490,6 +494,92 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         return Swift.stride(from: 0, to: flatBuckets.count, by: PyrowaveBlockStats.candidateCount).map {
             flatBuckets[$0..<$0 + PyrowaveBlockStats.candidateCount].map(Int.init)
         }
+    }
+
+    func rateControlCumulativeBucketSavings(
+        bucketIndices: [[Int]],
+        packetByteCosts: [[Int]]
+    ) throws -> [Int] {
+        guard bucketIndices.count == packetByteCosts.count else {
+            throw PyrowaveError.processFailed("rate-control bucket and packet-cost counts differ")
+        }
+        guard !bucketIndices.isEmpty else {
+            return Array(repeating: 0, count: 128)
+        }
+        guard bucketIndices.count <= Int(UInt32.max) else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        var flatBuckets = [UInt32]()
+        var flatPacketByteCosts = [UInt32]()
+        flatBuckets.reserveCapacity(bucketIndices.count * PyrowaveBlockStats.candidateCount)
+        flatPacketByteCosts.reserveCapacity(packetByteCosts.count * PyrowaveBlockStats.candidateCount)
+        for index in bucketIndices.indices {
+            guard bucketIndices[index].count == PyrowaveBlockStats.candidateCount,
+                  packetByteCosts[index].count == PyrowaveBlockStats.candidateCount else {
+                throw PyrowaveError.processFailed("rate-control savings input must contain \(PyrowaveBlockStats.candidateCount) candidates per block")
+            }
+            for bucket in bucketIndices[index] {
+                guard bucket >= 0, bucket < 128 else {
+                    throw PyrowaveError.invalidDimensions
+                }
+                flatBuckets.append(UInt32(bucket))
+            }
+            for cost in packetByteCosts[index] {
+                guard cost >= 0, cost <= Int(UInt32.max) else {
+                    throw PyrowaveError.invalidDimensions
+                }
+                flatPacketByteCosts.append(UInt32(cost))
+            }
+        }
+
+        let bucketSavings = Array(repeating: UInt32(0), count: 128)
+        let cumulativeSavings = Array(repeating: UInt32(0), count: 128)
+        guard let bucketBuffer = device.makeBuffer(bytes: flatBuckets, length: flatBuckets.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let packetByteCostBuffer = device.makeBuffer(bytes: flatPacketByteCosts, length: flatPacketByteCosts.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let bucketSavingsBuffer = device.makeBuffer(bytes: bucketSavings, length: bucketSavings.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let cumulativeSavingsBuffer = device.makeBuffer(bytes: cumulativeSavings, length: cumulativeSavings.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw PyrowaveError.processFailed("failed to allocate Metal rate-control savings buffers")
+        }
+
+        var constants = RateControlBucketSavingsConstants(blockCount: UInt32(bucketIndices.count))
+        guard let savingsEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal rate-control savings command encoder")
+        }
+        savingsEncoder.setComputePipelineState(rateControlBucketSavingsPipeline)
+        savingsEncoder.setBuffer(bucketBuffer, offset: 0, index: 0)
+        savingsEncoder.setBuffer(packetByteCostBuffer, offset: 0, index: 1)
+        savingsEncoder.setBuffer(bucketSavingsBuffer, offset: 0, index: 2)
+        savingsEncoder.setBytes(&constants, length: MemoryLayout<RateControlBucketSavingsConstants>.stride, index: 3)
+        let savingsWidth = min(rateControlBucketSavingsPipeline.maxTotalThreadsPerThreadgroup, 256)
+        savingsEncoder.dispatchThreads(
+            MTLSize(width: bucketIndices.count, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: savingsWidth, height: 1, depth: 1)
+        )
+        savingsEncoder.endEncoding()
+
+        guard let prefixEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal rate-control savings prefix command encoder")
+        }
+        prefixEncoder.setComputePipelineState(rateControlBucketSavingsPrefixPipeline)
+        prefixEncoder.setBuffer(bucketSavingsBuffer, offset: 0, index: 0)
+        prefixEncoder.setBuffer(cumulativeSavingsBuffer, offset: 0, index: 1)
+        let prefixWidth = min(rateControlBucketSavingsPrefixPipeline.maxTotalThreadsPerThreadgroup, 128)
+        prefixEncoder.dispatchThreads(
+            MTLSize(width: 128, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: prefixWidth, height: 1, depth: 1)
+        )
+        prefixEncoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal rate-control savings command failed: \(error)")
+        }
+
+        let pointer = cumulativeSavingsBuffer.contents().bindMemory(to: UInt32.self, capacity: cumulativeSavings.count)
+        return Array(UnsafeBufferPointer(start: pointer, count: cumulativeSavings.count)).map(Int.init)
     }
 
     public func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
@@ -953,6 +1043,10 @@ private struct RateControlBucketConstants {
     var blockCount: UInt32
 }
 
+private struct RateControlBucketSavingsConstants {
+    var blockCount: UInt32
+}
+
 private struct DWTConstants {
     var activeWidth: UInt32
     var activeHeight: UInt32
@@ -1011,6 +1105,13 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         distortions: [[Float]],
         packetByteCosts: [[Int]]
     ) throws -> [[Int]] {
+        throw PyrowaveError.externalToolUnavailable("Metal")
+    }
+
+    func rateControlCumulativeBucketSavings(
+        bucketIndices: [[Int]],
+        packetByteCosts: [[Int]]
+    ) throws -> [Int] {
         throw PyrowaveError.externalToolUnavailable("Metal")
     }
 

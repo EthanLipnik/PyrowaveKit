@@ -81,6 +81,10 @@ struct RateControlBucketConstants {
     uint blockCount;
 };
 
+struct RateControlBucketSavingsConstants {
+    uint blockCount;
+};
+
 struct DWTConstants {
     uint activeWidth;
     uint activeHeight;
@@ -481,6 +485,47 @@ kernel void pyrowave_rate_control_bucket_indices(
         }
         bucketIndices[offset + quantLevel] = min(bucketCount - 1u, bucket);
     }
+}
+
+kernel void pyrowave_rate_control_bucket_savings(
+    device const uint *bucketIndices [[buffer(0)]],
+    device const uint *packetByteCosts [[buffer(1)]],
+    device atomic_uint *bucketSavings [[buffer(2)]],
+    constant RateControlBucketSavingsConstants &constants [[buffer(3)]],
+    uint blockIndex [[thread_position_in_grid]]
+) {
+    if (blockIndex >= constants.blockCount) {
+        return;
+    }
+
+    constexpr uint candidateCount = 15u;
+    uint offset = blockIndex * candidateCount;
+    for (uint quantLevel = 1u; quantLevel < candidateCount; ++quantLevel) {
+        uint previousCost = packetByteCosts[offset + quantLevel - 1u];
+        uint currentCost = packetByteCosts[offset + quantLevel];
+        if (previousCost > currentCost) {
+            uint bucket = bucketIndices[offset + quantLevel];
+            if (bucket < 128u) {
+                atomic_fetch_add_explicit(&bucketSavings[bucket], previousCost - currentCost, memory_order_relaxed);
+            }
+        }
+    }
+}
+
+kernel void pyrowave_rate_control_bucket_savings_prefix(
+    device const uint *bucketSavings [[buffer(0)]],
+    device uint *cumulativeSavings [[buffer(1)]],
+    uint bucket [[thread_position_in_grid]]
+) {
+    if (bucket >= 128u) {
+        return;
+    }
+
+    uint running = 0u;
+    for (uint index = 0u; index <= bucket; ++index) {
+        running += bucketSavings[index];
+    }
+    cumulativeSavings[bucket] = running;
 }
 
 kernel void pyrowave_dwt_lift_rows(
