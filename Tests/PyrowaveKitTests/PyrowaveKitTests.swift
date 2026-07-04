@@ -261,6 +261,36 @@ import Testing
     }
 }
 
+@Test func codecBenchmarkResultReportsPerFrameNormalization() throws {
+    let result = CodecBenchmarkResult(
+        codec: "sample",
+        frameCount: 4,
+        encodedBytes: 100,
+        encodeSeconds: 0.020,
+        decodeSeconds: 0.012,
+        metrics: nil,
+        note: nil
+    )
+
+    #expect(result.frameCount == 4)
+    #expect(result.encodedBytesPerFrame == 25.0)
+    #expect(abs(result.encodeMillisecondsPerFrame - 5.0) < 0.0001)
+    #expect(abs(result.decodeMillisecondsPerFrame - 3.0) < 0.0001)
+
+    let empty = CodecBenchmarkResult(
+        codec: "empty",
+        frameCount: 0,
+        encodedBytes: 100,
+        encodeSeconds: 0.020,
+        decodeSeconds: 0.012,
+        metrics: nil,
+        note: nil
+    )
+    #expect(empty.encodedBytesPerFrame == 0)
+    #expect(empty.encodeMillisecondsPerFrame == 0)
+    #expect(empty.decodeMillisecondsPerFrame == 0)
+}
+
 @Test func metalBackendCompilesKernelsWhenDeviceExists() throws {
     #if canImport(Metal)
     do {

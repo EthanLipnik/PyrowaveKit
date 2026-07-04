@@ -10,24 +10,34 @@ import AVKit
 
 public struct CodecBenchmarkResult: Codable, Equatable, Sendable {
     public var codec: String
+    public var frameCount: Int
     public var encodedBytes: Int
+    public var encodedBytesPerFrame: Double
     public var encodeSeconds: Double
+    public var encodeMillisecondsPerFrame: Double
     public var decodeSeconds: Double
+    public var decodeMillisecondsPerFrame: Double
     public var metrics: FrameMetrics?
     public var note: String?
 
     public init(
         codec: String,
+        frameCount: Int,
         encodedBytes: Int,
         encodeSeconds: Double,
         decodeSeconds: Double,
         metrics: FrameMetrics?,
         note: String?
     ) {
+        let normalizedFrameCount = max(0, frameCount)
         self.codec = codec
+        self.frameCount = normalizedFrameCount
         self.encodedBytes = encodedBytes
+        self.encodedBytesPerFrame = normalizedFrameCount > 0 ? Double(encodedBytes) / Double(normalizedFrameCount) : 0
         self.encodeSeconds = encodeSeconds
+        self.encodeMillisecondsPerFrame = normalizedFrameCount > 0 ? encodeSeconds * 1000.0 / Double(normalizedFrameCount) : 0
         self.decodeSeconds = decodeSeconds
+        self.decodeMillisecondsPerFrame = normalizedFrameCount > 0 ? decodeSeconds * 1000.0 / Double(normalizedFrameCount) : 0
         self.metrics = metrics
         self.note = note
     }
@@ -102,6 +112,7 @@ public enum HEVCComparison {
 
         return CodecBenchmarkResult(
             codec: "hevc_avkit",
+            frameCount: referenceFrames.count,
             encodedBytes: encodedBytes,
             encodeSeconds: encodeSeconds,
             decodeSeconds: decodeSeconds,
@@ -111,6 +122,7 @@ public enum HEVCComparison {
         #else
         return CodecBenchmarkResult(
             codec: "hevc_avkit",
+            frameCount: 0,
             encodedBytes: 0,
             encodeSeconds: 0,
             decodeSeconds: 0,

@@ -173,6 +173,7 @@ func runPyrowave(loaded: LoadedFrames, configuration: CodecConfiguration, output
     let metric = try Metrics.compare(frames, decodedFrames)
     return CodecBenchmarkResult(
         codec: "pyrowavekit-swift-metal-hybrid",
+        frameCount: frames.count,
         encodedBytes: encodedBytes,
         encodeSeconds: encodeSeconds,
         decodeSeconds: decodeSeconds,
