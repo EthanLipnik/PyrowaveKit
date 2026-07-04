@@ -122,8 +122,14 @@ func runPyrowave(frames: [YUVFrame], configuration: CodecConfiguration, outputDi
     let decodeSeconds = stopwatch.lapSeconds()
 
     let encodedBytes = encodedFrames.reduce(0) { $0 + $1.data.count }
-    if let first = encodedFrames.first {
-        try first.data.write(to: outputDirectory.appendingPathComponent("pyrowave-sample.pwks"))
+    if let firstFrame = frames.first {
+        var stream = try PyrowaveStreamWriter(
+            url: outputDirectory.appendingPathComponent("pyrowave-sample.pwks"),
+            header: PyrowaveStreamHeader(frame: firstFrame)
+        )
+        for frame in encodedFrames {
+            try stream.writeFrame(frame)
+        }
     }
 
     let metric = try Metrics.compare(frames[0], decodedFrames[0])

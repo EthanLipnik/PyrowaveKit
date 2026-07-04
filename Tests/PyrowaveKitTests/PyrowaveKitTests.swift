@@ -345,6 +345,58 @@ import Testing
     #expect(try stream.decode() == expected)
 }
 
+@Test func pyrowaveStreamFileRoundTripsMultipleEncodedFrames() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("sample.pwks")
+    let frames = [
+        try TestFrames.synthetic420(width: 96, height: 64, frameIndex: 0),
+        try TestFrames.synthetic420(width: 96, height: 64, frameIndex: 1)
+    ]
+    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let encoded = try frames.map { try codec.encode($0, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)) }
+
+    var writer = try PyrowaveStreamWriter(
+        url: url,
+        header: PyrowaveStreamHeader(
+            frame: frames[0],
+            frameRateNumerator: 120,
+            frameRateDenominator: 1
+        )
+    )
+    for frame in encoded {
+        try writer.writeFrame(frame)
+    }
+
+    var reader = try PyrowaveStreamReader(url: url)
+    #expect(reader.header.width == 96)
+    #expect(reader.header.height == 64)
+    #expect(reader.header.chroma == .yuv420)
+    #expect(reader.header.frameRateNumerator == 120)
+    #expect(reader.header.frameRateDenominator == 1)
+
+    let first = try #require(try reader.readFrame())
+    let second = try #require(try reader.readFrame())
+    #expect(try reader.readFrame() == nil)
+    let decodedFirst = try codec.decode(first)
+    let expectedFirst = try codec.decode(encoded[0])
+    let decodedSecond = try codec.decode(second)
+    let expectedSecond = try codec.decode(encoded[1])
+    #expect(decodedFirst == expectedFirst)
+    #expect(decodedSecond == expectedSecond)
+}
+
+@Test func pyrowaveStreamFileRejectsMissingMagic() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("bad.pwks")
+    try Data("NOTWAVE!".utf8).write(to: url)
+
+    #expect(throws: PyrowaveError.unsupportedFormat("missing PYROWAVE stream magic")) {
+        _ = try PyrowaveStreamReader(url: url)
+    }
+}
+
 @Test func packetStreamDecoderAllowsPartialFrameAfterHalfTheBlocks() throws {
     let frame = try TestFrames.synthetic420(width: 96, height: 64)
     let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
