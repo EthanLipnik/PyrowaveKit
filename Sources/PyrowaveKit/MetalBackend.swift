@@ -21,6 +21,8 @@ private enum ReusableBufferPurpose: Hashable {
     case sparsePacketDescriptor
     case sparsePacketQScale
     case sparsePacketSize
+    case dwtScratch
+    case idwtScratch
 }
 
 private struct ReusableBufferKey: Hashable {
@@ -63,6 +65,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     private let idwtLiftColumnsPipeline: MTLComputePipelineState
     private var sparseCoefficientOutputs: [SparseCoefficientOutputKey: MTLBuffer] = [:]
     private var reusableSharedBuffers: [ReusableBufferKey: MTLBuffer] = [:]
+    private var reusablePrivateBuffers: [ReusableBufferKey: MTLBuffer] = [:]
 
     init(device: MTLDevice? = MTLCreateSystemDefaultDevice()) throws {
         guard let device else {
@@ -273,7 +276,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         var scratchBuffers = [MTLBuffer]()
         scratchBuffers.reserveCapacity(planes.count)
 
-        for plane in planes {
+        for (planeIndex, plane) in planes.enumerated() {
             let validChannel = plane.texture.pixelFormat == .r8Unorm
                 ? plane.channel == 0
                 : (plane.texture.pixelFormat == .rg8Unorm && (plane.channel == 0 || plane.channel == 1))
@@ -296,10 +299,14 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             }
             try validateWaveletShape(width: plane.paddedWidth, height: plane.paddedHeight, levels: plane.levels)
 
-            guard let output = device.makeBuffer(length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared),
-                  let scratch = device.makeBuffer(length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            guard let output = device.makeBuffer(length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
                 throw PyrowaveError.processFailed("failed to allocate Metal texture padding/DWT buffers")
             }
+            let scratch = try reusablePrivateBuffer(
+                byteLength: sampleCount * MemoryLayout<Float>.stride,
+                purpose: .dwtScratch,
+                planeIndex: planeIndex
+            )
             outputs.append(output)
             scratchBuffers.append(scratch)
         }
@@ -1044,6 +1051,23 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("failed to allocate reusable Metal buffer")
         }
         reusableSharedBuffers[key] = buffer
+        return buffer
+    }
+
+    private func reusablePrivateBuffer(
+        byteLength: Int,
+        purpose: ReusableBufferPurpose,
+        planeIndex: Int
+    ) throws -> MTLBuffer {
+        let key = ReusableBufferKey(purpose: purpose, planeIndex: planeIndex)
+        let length = max(byteLength, 1)
+        if let buffer = reusablePrivateBuffers[key], buffer.length >= length {
+            return buffer
+        }
+        guard let buffer = device.makeBuffer(length: length, options: .storageModePrivate) else {
+            throw PyrowaveError.processFailed("failed to allocate reusable private Metal buffer")
+        }
+        reusablePrivateBuffers[key] = buffer
         return buffer
     }
 
@@ -2033,14 +2057,16 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
 
         var scratchBuffers = [MTLBuffer]()
         scratchBuffers.reserveCapacity(planes.count)
-        for plane in planes {
+        for (planeIndex, plane) in planes.enumerated() {
             guard plane.sampleCount > 0 else {
                 scratchBuffers.append(plane.buffer)
                 continue
             }
-            guard let scratch = device.makeBuffer(length: plane.sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
-                throw PyrowaveError.processFailed("failed to allocate Metal DWT scratch buffer")
-            }
+            let scratch = try reusablePrivateBuffer(
+                byteLength: plane.sampleCount * MemoryLayout<Float>.stride,
+                purpose: .dwtScratch,
+                planeIndex: planeIndex
+            )
             scratchBuffers.append(scratch)
         }
 
@@ -2142,14 +2168,16 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
 
         var scratchBuffers = [MTLBuffer]()
         scratchBuffers.reserveCapacity(planes.count)
-        for plane in planes {
+        for (planeIndex, plane) in planes.enumerated() {
             guard plane.sampleCount > 0 else {
                 scratchBuffers.append(plane.buffer)
                 continue
             }
-            guard let scratch = device.makeBuffer(length: plane.sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
-                throw PyrowaveError.processFailed("failed to allocate Metal iDWT scratch buffer")
-            }
+            let scratch = try reusablePrivateBuffer(
+                byteLength: plane.sampleCount * MemoryLayout<Float>.stride,
+                purpose: .idwtScratch,
+                planeIndex: planeIndex
+            )
             scratchBuffers.append(scratch)
         }
 
