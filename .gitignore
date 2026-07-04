@@ -4,3 +4,6 @@
 /Granite
 /build-steamrt
 /steamrt-output
+/.build
+/.pyrowave-results
+*.xcodeproj
