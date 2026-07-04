@@ -608,7 +608,7 @@ import CoreVideo
 
 @Test func benchmarkReportSchemaNamesReviewArtifacts() throws {
     let pyrowave = CodecBenchmarkResult(
-        codec: "pyrowavekit-swift-metal-hybrid",
+        codec: "pyrowavekit-swift-metal",
         frameCount: 60,
         encodedBytes: 240,
         encodeSeconds: 0.25,
