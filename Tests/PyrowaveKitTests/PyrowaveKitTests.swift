@@ -1195,6 +1195,79 @@ import Metal
     #expect(metal[1] == Array(repeating: 0, count: PyrowaveBlockStats.candidateCount))
 }
 
+@Test func metalRateControlBatchMatchesSinglePlaneResultsWhenDeviceExists() throws {
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let stride = 40
+    let coefficientSets: [[Int16]] = (0..<2).map { planeIndex in
+        var coefficients = Array(repeating: Int16(0), count: stride * 36)
+        for y in 0..<27 {
+            for x in 0..<29 {
+                let raw = ((x * (43 + planeIndex * 7) + y * 17 + x * y * 3) % 511) - 255
+                coefficients[(2 + y) * stride + 3 + x] = Int16(raw)
+            }
+        }
+        return coefficients
+    }
+    let statsDescriptors = [
+        MetalRateControlStatsDescriptor(
+            originX: 0,
+            originY: 0,
+            validWidth: 32,
+            validHeight: 32,
+            stride: UInt32(stride),
+            quantCode: 32,
+            qScaleCode: 6,
+            distortionScale: 1.0
+        ),
+        MetalRateControlStatsDescriptor(
+            originX: 8,
+            originY: 8,
+            validWidth: 8,
+            validHeight: 8,
+            stride: UInt32(stride),
+            quantCode: 40,
+            qScaleCode: 9,
+            distortionScale: 0.25
+        )
+    ]
+    let packetDescriptors = [
+        MetalPacketByteCostDescriptor(originX: 3, originY: 2, validWidth: 29, validHeight: 27, stride: UInt32(stride)),
+        MetalPacketByteCostDescriptor(originX: 0, originY: 32, validWidth: 32, validHeight: 4, stride: UInt32(stride))
+    ]
+    let buffers = try coefficientSets.map { coefficients -> MTLBuffer in
+        let byteLength = coefficients.count * MemoryLayout<Int16>.stride
+        return try #require(backend.device.makeBuffer(bytes: coefficients, length: byteLength, options: .storageModeShared))
+    }
+
+    let batchedStats = try backend.rateControlTileStatsBatch(buffers.indices.map {
+        (coefficientBuffer: buffers[$0], coefficientCount: coefficientSets[$0].count, descriptors: statsDescriptors)
+    })
+    let batchedCosts = try backend.packetByteCostsBatch(buffers.indices.map {
+        (coefficientBuffer: buffers[$0], coefficientCount: coefficientSets[$0].count, descriptors: packetDescriptors)
+    })
+
+    for index in coefficientSets.indices {
+        let singleStats = try backend.rateControlTileStats(coefficients: coefficientSets[index], descriptors: statsDescriptors)
+        let singleCosts = try backend.packetByteCosts(coefficients: coefficientSets[index], descriptors: packetDescriptors)
+        #expect(batchedStats[index].count == singleStats.count)
+        for statIndex in singleStats.indices {
+            #expect(batchedStats[index][statIndex].numPlanes == singleStats[statIndex].numPlanes)
+            #expect(batchedStats[index][statIndex].stats.count == singleStats[statIndex].stats.count)
+            for quantLevel in singleStats[statIndex].stats.indices {
+                #expect(batchedStats[index][statIndex].stats[quantLevel].squareError == singleStats[statIndex].stats[quantLevel].squareError)
+                #expect(batchedStats[index][statIndex].stats[quantLevel].encodeCostBits == singleStats[statIndex].stats[quantLevel].encodeCostBits)
+            }
+        }
+        #expect(batchedCosts[index] == singleCosts)
+    }
+}
+
 @Test func metalSparsePacketEncodingMatchesCPUReferenceWhenDeviceExists() throws {
     let backend: MetalPyrowaveBackend
     do {

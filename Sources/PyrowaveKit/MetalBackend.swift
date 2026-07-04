@@ -651,45 +651,85 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         coefficientCount: Int,
         descriptors: [MetalRateControlStatsDescriptor]
     ) throws -> [MetalRateControlTileStats] {
-        guard coefficientCount > 0,
-              coefficientBuffer.length >= coefficientCount * MemoryLayout<Int16>.stride else {
-            throw PyrowaveError.invalidDimensions
-        }
-        guard !descriptors.isEmpty else {
+        try rateControlTileStatsBatch([(
+            coefficientBuffer: coefficientBuffer,
+            coefficientCount: coefficientCount,
+            descriptors: descriptors
+        )])[0]
+    }
+
+    func rateControlTileStatsBatch(
+        _ planes: [(coefficientBuffer: MTLBuffer, coefficientCount: Int, descriptors: [MetalRateControlStatsDescriptor])]
+    ) throws -> [[MetalRateControlTileStats]] {
+        guard !planes.isEmpty else {
             return []
         }
-        guard descriptors.count <= Int(UInt32.max) else {
-            throw PyrowaveError.invalidDimensions
+
+        var work = [(
+            planeIndex: Int,
+            coefficientBuffer: MTLBuffer,
+            descriptorBuffer: MTLBuffer,
+            numPlanesBuffer: MTLBuffer,
+            statsBuffer: MTLBuffer,
+            descriptorCount: Int
+        )]()
+        work.reserveCapacity(planes.count)
+        var emptyResults = Array(repeating: [MetalRateControlTileStats](), count: planes.count)
+
+        for (planeIndex, plane) in planes.enumerated() {
+            guard plane.coefficientCount > 0,
+                  plane.coefficientBuffer.length >= plane.coefficientCount * MemoryLayout<Int16>.stride,
+                  plane.descriptors.count <= Int(UInt32.max) else {
+                throw PyrowaveError.invalidDimensions
+            }
+            guard !plane.descriptors.isEmpty else {
+                continue
+            }
+
+            let numPlanes = Array(repeating: UInt32(0), count: plane.descriptors.count)
+            let stats = Array(
+                repeating: MetalRateControlQuantStats(squareError: 0, encodeCostBits: 0),
+                count: plane.descriptors.count * PyrowaveBlockStats.candidateCount
+            )
+            guard let descriptorBuffer = device.makeBuffer(bytes: plane.descriptors, length: plane.descriptors.count * MemoryLayout<MetalRateControlStatsDescriptor>.stride, options: .storageModeShared),
+                  let numPlanesBuffer = device.makeBuffer(bytes: numPlanes, length: numPlanes.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+                  let statsBuffer = device.makeBuffer(bytes: stats, length: stats.count * MemoryLayout<MetalRateControlQuantStats>.stride, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal rate-control buffers")
+            }
+            work.append((
+                planeIndex: planeIndex,
+                coefficientBuffer: plane.coefficientBuffer,
+                descriptorBuffer: descriptorBuffer,
+                numPlanesBuffer: numPlanesBuffer,
+                statsBuffer: statsBuffer,
+                descriptorCount: plane.descriptors.count
+            ))
         }
 
-        let numPlanes = Array(repeating: UInt32(0), count: descriptors.count)
-        let stats = Array(
-            repeating: MetalRateControlQuantStats(squareError: 0, encodeCostBits: 0),
-            count: descriptors.count * PyrowaveBlockStats.candidateCount
-        )
-        guard let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptors.count * MemoryLayout<MetalRateControlStatsDescriptor>.stride, options: .storageModeShared),
-              let numPlanesBuffer = device.makeBuffer(bytes: numPlanes, length: numPlanes.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-              let statsBuffer = device.makeBuffer(bytes: stats, length: stats.count * MemoryLayout<MetalRateControlQuantStats>.stride, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal rate-control buffers")
+        guard !work.isEmpty else {
+            return emptyResults
         }
 
-        var constants = RateControlStatsConstants(descriptorCount: UInt32(descriptors.count))
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw PyrowaveError.processFailed("failed to create Metal rate-control command encoder")
         }
 
         encoder.setComputePipelineState(rateControlStatsPipeline)
-        encoder.setBuffer(coefficientBuffer, offset: 0, index: 0)
-        encoder.setBuffer(descriptorBuffer, offset: 0, index: 1)
-        encoder.setBuffer(numPlanesBuffer, offset: 0, index: 2)
-        encoder.setBuffer(statsBuffer, offset: 0, index: 3)
-        encoder.setBytes(&constants, length: MemoryLayout<RateControlStatsConstants>.stride, index: 4)
         let width = min(rateControlStatsPipeline.maxTotalThreadsPerThreadgroup, 256)
-        encoder.dispatchThreads(
-            MTLSize(width: descriptors.count, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
-        )
+        let threadsPerThreadgroup = MTLSize(width: width, height: 1, depth: 1)
+        for item in work {
+            var constants = RateControlStatsConstants(descriptorCount: UInt32(item.descriptorCount))
+            encoder.setBuffer(item.coefficientBuffer, offset: 0, index: 0)
+            encoder.setBuffer(item.descriptorBuffer, offset: 0, index: 1)
+            encoder.setBuffer(item.numPlanesBuffer, offset: 0, index: 2)
+            encoder.setBuffer(item.statsBuffer, offset: 0, index: 3)
+            encoder.setBytes(&constants, length: MemoryLayout<RateControlStatsConstants>.stride, index: 4)
+            encoder.dispatchThreads(
+                MTLSize(width: item.descriptorCount, height: 1, depth: 1),
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -698,16 +738,20 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("Metal rate-control command failed: \(error)")
         }
 
-        let numPlanesPointer = numPlanesBuffer.contents().bindMemory(to: UInt32.self, capacity: descriptors.count)
-        let statsPointer = statsBuffer.contents().bindMemory(to: MetalRateControlQuantStats.self, capacity: stats.count)
-        let metalNumPlanes = Array(UnsafeBufferPointer(start: numPlanesPointer, count: descriptors.count))
-        let metalStats = Array(UnsafeBufferPointer(start: statsPointer, count: stats.count))
+        for item in work {
+            let statsCount = item.descriptorCount * PyrowaveBlockStats.candidateCount
+            let numPlanesPointer = item.numPlanesBuffer.contents().bindMemory(to: UInt32.self, capacity: item.descriptorCount)
+            let statsPointer = item.statsBuffer.contents().bindMemory(to: MetalRateControlQuantStats.self, capacity: statsCount)
+            let metalNumPlanes = Array(UnsafeBufferPointer(start: numPlanesPointer, count: item.descriptorCount))
+            let metalStats = Array(UnsafeBufferPointer(start: statsPointer, count: statsCount))
 
-        return metalNumPlanes.indices.map { index in
-            let start = index * PyrowaveBlockStats.candidateCount
-            let end = start + PyrowaveBlockStats.candidateCount
-            return MetalRateControlTileStats(numPlanes: metalNumPlanes[index], stats: Array(metalStats[start..<end]))
+            emptyResults[item.planeIndex] = metalNumPlanes.indices.map { index in
+                let start = index * PyrowaveBlockStats.candidateCount
+                let end = start + PyrowaveBlockStats.candidateCount
+                return MetalRateControlTileStats(numPlanes: metalNumPlanes[index], stats: Array(metalStats[start..<end]))
+            }
         }
+        return emptyResults
     }
 
     func packetByteCosts(
@@ -728,39 +772,77 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         coefficientCount: Int,
         descriptors: [MetalPacketByteCostDescriptor]
     ) throws -> [[Int]] {
-        guard coefficientCount > 0,
-              coefficientBuffer.length >= coefficientCount * MemoryLayout<Int16>.stride else {
-            throw PyrowaveError.invalidDimensions
-        }
-        guard !descriptors.isEmpty else {
+        try packetByteCostsBatch([(
+            coefficientBuffer: coefficientBuffer,
+            coefficientCount: coefficientCount,
+            descriptors: descriptors
+        )])[0]
+    }
+
+    func packetByteCostsBatch(
+        _ planes: [(coefficientBuffer: MTLBuffer, coefficientCount: Int, descriptors: [MetalPacketByteCostDescriptor])]
+    ) throws -> [[[Int]]] {
+        guard !planes.isEmpty else {
             return []
         }
-        guard descriptors.count <= Int(UInt32.max) else {
-            throw PyrowaveError.invalidDimensions
+
+        var work = [(
+            planeIndex: Int,
+            coefficientBuffer: MTLBuffer,
+            descriptorBuffer: MTLBuffer,
+            byteCostBuffer: MTLBuffer,
+            descriptorCount: Int
+        )]()
+        work.reserveCapacity(planes.count)
+        var emptyResults = Array(repeating: [[Int]](), count: planes.count)
+
+        for (planeIndex, plane) in planes.enumerated() {
+            guard plane.coefficientCount > 0,
+                  plane.coefficientBuffer.length >= plane.coefficientCount * MemoryLayout<Int16>.stride,
+                  plane.descriptors.count <= Int(UInt32.max) else {
+                throw PyrowaveError.invalidDimensions
+            }
+            guard !plane.descriptors.isEmpty else {
+                continue
+            }
+
+            let byteCosts = Array(repeating: UInt32(0), count: plane.descriptors.count * PyrowaveBlockStats.candidateCount)
+            guard let descriptorBuffer = device.makeBuffer(bytes: plane.descriptors, length: plane.descriptors.count * MemoryLayout<MetalPacketByteCostDescriptor>.stride, options: .storageModeShared),
+                  let byteCostBuffer = device.makeBuffer(bytes: byteCosts, length: byteCosts.count * MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal packet byte-cost buffers")
+            }
+            work.append((
+                planeIndex: planeIndex,
+                coefficientBuffer: plane.coefficientBuffer,
+                descriptorBuffer: descriptorBuffer,
+                byteCostBuffer: byteCostBuffer,
+                descriptorCount: plane.descriptors.count
+            ))
         }
 
-        let byteCosts = Array(repeating: UInt32(0), count: descriptors.count * PyrowaveBlockStats.candidateCount)
-        guard let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptors.count * MemoryLayout<MetalPacketByteCostDescriptor>.stride, options: .storageModeShared),
-              let byteCostBuffer = device.makeBuffer(bytes: byteCosts, length: byteCosts.count * MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal packet byte-cost buffers")
+        guard !work.isEmpty else {
+            return emptyResults
         }
 
-        var constants = PacketByteCostConstants(descriptorCount: UInt32(descriptors.count))
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw PyrowaveError.processFailed("failed to create Metal packet byte-cost command encoder")
         }
 
         encoder.setComputePipelineState(packetByteCostsPipeline)
-        encoder.setBuffer(coefficientBuffer, offset: 0, index: 0)
-        encoder.setBuffer(descriptorBuffer, offset: 0, index: 1)
-        encoder.setBuffer(byteCostBuffer, offset: 0, index: 2)
-        encoder.setBytes(&constants, length: MemoryLayout<PacketByteCostConstants>.stride, index: 3)
         let width = min(packetByteCostsPipeline.maxTotalThreadsPerThreadgroup, 256)
-        encoder.dispatchThreads(
-            MTLSize(width: descriptors.count, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
-        )
+        let threadsPerThreadgroup = MTLSize(width: width, height: 1, depth: 1)
+        for item in work {
+            var constants = PacketByteCostConstants(descriptorCount: UInt32(item.descriptorCount))
+            encoder.setBuffer(item.coefficientBuffer, offset: 0, index: 0)
+            encoder.setBuffer(item.descriptorBuffer, offset: 0, index: 1)
+            encoder.setBuffer(item.byteCostBuffer, offset: 0, index: 2)
+            encoder.setBytes(&constants, length: MemoryLayout<PacketByteCostConstants>.stride, index: 3)
+            encoder.dispatchThreads(
+                MTLSize(width: item.descriptorCount, height: 1, depth: 1),
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -769,11 +851,15 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("Metal packet byte-cost command failed: \(error)")
         }
 
-        let pointer = byteCostBuffer.contents().bindMemory(to: UInt32.self, capacity: byteCosts.count)
-        let flatCosts = Array(UnsafeBufferPointer(start: pointer, count: byteCosts.count))
-        return Swift.stride(from: 0, to: flatCosts.count, by: PyrowaveBlockStats.candidateCount).map {
-            flatCosts[$0..<$0 + PyrowaveBlockStats.candidateCount].map(Int.init)
+        for item in work {
+            let byteCostCount = item.descriptorCount * PyrowaveBlockStats.candidateCount
+            let pointer = item.byteCostBuffer.contents().bindMemory(to: UInt32.self, capacity: byteCostCount)
+            let flatCosts = Array(UnsafeBufferPointer(start: pointer, count: byteCostCount))
+            emptyResults[item.planeIndex] = Swift.stride(from: 0, to: flatCosts.count, by: PyrowaveBlockStats.candidateCount).map {
+                flatCosts[$0..<$0 + PyrowaveBlockStats.candidateCount].map(Int.init)
+            }
         }
+        return emptyResults
     }
 
     func encodeSparsePackets(

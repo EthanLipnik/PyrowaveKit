@@ -853,7 +853,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         }
 
         let fixedHeaderBytes = frameHeaderSize
-        let rateBlocksByPlane = try planes.map { try makeRateControlBlocks($0, layout: layout) }
+        let rateBlocksByPlane = try makeRateControlBlocks(planes, layout: layout)
         let packetByteCostsByPlane = rateBlocksByPlane.map { $0.map(\.packetByteCosts) }
         let metalBucketData = try metalRateControlBucketData(blocksByPlane: rateBlocksByPlane)
         if let thresholdsByPlane = PyrowaveRateController.selectThresholds(
@@ -1040,6 +1040,100 @@ public final class PyrowaveCodec: @unchecked Sendable {
     private func makeRateControlBlocks(_ plane: EncodedPlane, layout: PyrowaveBlockLayout) throws -> [PyrowaveRateControlBlock] {
         let descriptors = planeBlockDescriptors(plane: plane, layout: layout)
         return try makeRateControlBlocksWithMetal(plane, descriptors: descriptors, layout: layout, backend: metalBackend)
+    }
+
+    private func makeRateControlBlocks(_ planes: [EncodedPlane], layout: PyrowaveBlockLayout) throws -> [[PyrowaveRateControlBlock]] {
+        guard planes.allSatisfy({ $0.coefficientBuffer != nil }) else {
+            return try planes.map { try makeRateControlBlocks($0, layout: layout) }
+        }
+
+        let descriptorsByPlane = planes.map { planeBlockDescriptors(plane: $0, layout: layout) }
+        var statsDescriptorsByPlane = [[MetalRateControlStatsDescriptor]]()
+        statsDescriptorsByPlane.reserveCapacity(planes.count)
+
+        for (planeIndex, plane) in planes.enumerated() {
+            var statsDescriptors = [MetalRateControlStatsDescriptor]()
+            statsDescriptors.reserveCapacity(descriptorsByPlane[planeIndex].count * 16)
+            for descriptor in descriptorsByPlane[planeIndex] {
+                let quantCode = try quantCode(for: descriptor, plane: plane)
+                let qScaleCodes = try qScaleCodes(for: descriptor, plane: plane)
+                let rdoDistortionScale = PyrowaveQuantization.rdoDistortionScale(
+                    level: descriptor.globalLevel,
+                    component: plane.component,
+                    band: descriptor.band,
+                    chroma: layout.chroma
+                )
+                for tileY in 0..<4 {
+                    for tileX in 0..<4 {
+                        let tileIndex = tileY * 4 + tileX
+                        statsDescriptors.append(MetalRateControlStatsDescriptor(
+                            originX: UInt32(descriptor.originX + tileX * PyrowaveBitstream.smallBlockSize),
+                            originY: UInt32(descriptor.originY + tileY * PyrowaveBitstream.smallBlockSize),
+                            validWidth: UInt32(max(0, min(PyrowaveBitstream.smallBlockSize, descriptor.validWidth - tileX * PyrowaveBitstream.smallBlockSize))),
+                            validHeight: UInt32(max(0, min(PyrowaveBitstream.smallBlockSize, descriptor.validHeight - tileY * PyrowaveBitstream.smallBlockSize))),
+                            stride: UInt32(plane.paddedWidth),
+                            quantCode: UInt32(quantCode),
+                            qScaleCode: UInt32(qScaleCodes[tileIndex]),
+                            distortionScale: rdoDistortionScale
+                        ))
+                    }
+                }
+            }
+            statsDescriptorsByPlane.append(statsDescriptors)
+        }
+
+        let tileStatsByPlane = try metalBackend.rateControlTileStatsBatch(planes.indices.map { index in
+            (
+                coefficientBuffer: planes[index].coefficientBuffer!,
+                coefficientCount: planes[index].coefficientCount,
+                descriptors: statsDescriptorsByPlane[index]
+            )
+        })
+        let packetCostDescriptorsByPlane = zip(planes, descriptorsByPlane).map { plane, descriptors in
+            metalPacketByteCostDescriptors(descriptors: descriptors, stride: plane.paddedWidth)
+        }
+        let packetByteCostsByPlane = try metalBackend.packetByteCostsBatch(planes.indices.map { index in
+            (
+                coefficientBuffer: planes[index].coefficientBuffer!,
+                coefficientCount: planes[index].coefficientCount,
+                descriptors: packetCostDescriptorsByPlane[index]
+            )
+        })
+
+        return try planes.indices.map { planeIndex in
+            let descriptors = descriptorsByPlane[planeIndex]
+            let tileStats = tileStatsByPlane[planeIndex]
+            let packetByteCosts = packetByteCostsByPlane[planeIndex]
+            guard tileStats.count == statsDescriptorsByPlane[planeIndex].count else {
+                throw PyrowaveError.processFailed("Metal rate-control returned \(tileStats.count) tile stats for \(statsDescriptorsByPlane[planeIndex].count) descriptors")
+            }
+            guard packetByteCosts.count == descriptors.count else {
+                throw PyrowaveError.processFailed("Metal packet byte-cost returned \(packetByteCosts.count) block costs for \(descriptors.count) descriptors")
+            }
+
+            var blocks = [PyrowaveRateControlBlock]()
+            blocks.reserveCapacity(descriptors.count)
+            for (descriptorIndex, descriptor) in descriptors.enumerated() {
+                let firstTile = descriptorIndex * 16
+                let eightByEightStats = try tileStats[firstTile..<(firstTile + 16)].map { tile -> PyrowaveBlockStats in
+                    guard tile.stats.count == PyrowaveBlockStats.candidateCount else {
+                        throw PyrowaveError.processFailed("Metal rate-control returned \(tile.stats.count) quant stats")
+                    }
+                    return PyrowaveBlockStats(
+                        numPlanes: Int(tile.numPlanes),
+                        stats: tile.stats.map {
+                            PyrowaveQuantStats(squareError: $0.squareError, encodeCostBits: Int($0.encodeCostBits))
+                        }
+                    )
+                }
+                blocks.append(PyrowaveRateControlBlock(
+                    blockIndex: descriptor.blockIndex,
+                    eightByEightStats: eightByEightStats,
+                    packetByteCosts: packetByteCosts[descriptorIndex]
+                ))
+            }
+            return blocks
+        }
     }
 
     private func makeRateControlBlocksWithMetal(
