@@ -53,6 +53,28 @@ enum PyrowaveQuantization {
         }
         return value * decodeBlockScale(quantCode) * decode8x8Scale(qScaleCode)
     }
+
+    static func noisePowerNormalizedResolution(level: Int, component: Int, band: Int, precision: Int = 0) -> Float {
+        var bits = precision >= 1 ? 8 : 6
+        if band == 0 {
+            bits += 2
+        } else if band < 3 {
+            bits += 1
+        }
+        bits += level
+        if component != 0 {
+            bits -= 1
+        }
+        return Float(1 << bits)
+    }
+
+    static func quantizationResolution(level: Int, component: Int, band: Int, precision: Int = 0) -> Float {
+        min(precision >= 1 ? 4096.0 : 512.0, noisePowerNormalizedResolution(level: level, component: component, band: band, precision: precision))
+    }
+
+    static func quantizationStep(level: Int, component: Int, band: Int, baseStep: Float, referenceBaseStep: Float = 1.0 / 1024.0) -> Float {
+        (baseStep / referenceBaseStep) / quantizationResolution(level: level, component: component, band: band)
+    }
 }
 
 struct PyrowavePacketHeader: Equatable, Sendable {

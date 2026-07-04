@@ -124,7 +124,7 @@ import Testing
     let frame = try TestFrames.synthetic420(width: 256, height: 144)
     let codec = PyrowaveCodec(useMetalAcceleration: false)
     let uncapped = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
-    let cap = max(4096, uncapped.data.count / 3)
+    let cap = max(512, uncapped.data.count / 2)
     let capped = try codec.encode(
         frame,
         configuration: CodecConfiguration(
@@ -185,6 +185,34 @@ import Testing
     #expect(blockIndices.contains { index in
         layout.descriptors[index].component == 1
     })
+}
+
+@Test func codecPacketsUsePerBandPyrowaveQuantCodes() throws {
+    let frame = try TestFrames.synthetic420(width: 160, height: 96)
+    let configuration = CodecConfiguration(quantizationStep: 1.0 / 1024.0)
+    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(frame, configuration: configuration)
+
+    var reader = BinaryReader(encoded.data)
+    let sequence = try PyrowaveSequenceHeader(reader: &reader)
+    let layout = try PyrowaveBlockLayout(width: sequence.width, height: sequence.height, chroma: sequence.chroma)
+    var observedQuantCodes = Set<UInt8>()
+
+    while reader.offset < encoded.data.count {
+        let packetStart = reader.offset
+        let block = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
+        let descriptor = layout.descriptors[block.blockIndex]
+        let expectedStep = PyrowaveQuantization.quantizationStep(
+            level: descriptor.level,
+            component: descriptor.component,
+            band: descriptor.band,
+            baseStep: configuration.quantizationStep
+        )
+        #expect(block.quantCode == (try PyrowaveQuantization.encodeBlockScale(expectedStep)))
+        observedQuantCodes.insert(block.quantCode)
+        #expect(reader.offset > packetStart)
+    }
+
+    #expect(observedQuantCodes.count > 1)
 }
 
 @Test func codecRequiresSpecDecompositionLevelCount() throws {
@@ -300,6 +328,11 @@ import Testing
     let negative = PyrowaveQuantization.dequantize(coefficient: -2, quantCode: code, qScaleCode: PyrowaveQuantization.identityQScaleCode)
     #expect(abs(positive - 2.5 / 1024.0) < 0.000001)
     #expect(abs(negative + 2.5 / 1024.0) < 0.000001)
+
+    #expect(PyrowaveQuantization.noisePowerNormalizedResolution(level: 0, component: 0, band: 1) == 128)
+    #expect(PyrowaveQuantization.quantizationResolution(level: 4, component: 0, band: 0) == 512)
+    #expect(PyrowaveQuantization.quantizationResolution(level: 1, component: 1, band: 1) == 128)
+    #expect(PyrowaveQuantization.quantizationStep(level: 4, component: 0, band: 0, baseStep: 1.0 / 1024.0) == 1.0 / 512.0)
 }
 
 @Test func pyrowaveBlockStatsUseOriginalPackedShape() throws {

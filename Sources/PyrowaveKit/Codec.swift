@@ -22,9 +22,9 @@ public final class PyrowaveCodec: Sendable {
 
         let layout = try PyrowaveBlockLayout(width: frame.width, height: frame.height, chroma: frame.chroma)
         let encodedPlanes = [
-            try encodePlane(frame.y, component: 0, frameWidth: frame.width, frameHeight: frame.height, chroma: frame.chroma, configuration: configuration),
-            try encodePlane(frame.cb, component: 1, frameWidth: frame.width, frameHeight: frame.height, chroma: frame.chroma, configuration: configuration),
-            try encodePlane(frame.cr, component: 2, frameWidth: frame.width, frameHeight: frame.height, chroma: frame.chroma, configuration: configuration)
+            try encodePlane(frame.y, component: 0, frameWidth: frame.width, frameHeight: frame.height, chroma: frame.chroma, layout: layout, configuration: configuration),
+            try encodePlane(frame.cb, component: 1, frameWidth: frame.width, frameHeight: frame.height, chroma: frame.chroma, layout: layout, configuration: configuration),
+            try encodePlane(frame.cr, component: 2, frameWidth: frame.width, frameHeight: frame.height, chroma: frame.chroma, layout: layout, configuration: configuration)
         ]
 
         let rateControlPlan = try selectSparseRateControlPlan(
@@ -106,8 +106,8 @@ public final class PyrowaveCodec: Sendable {
         var paddedWidth: Int
         var paddedHeight: Int
         var levels: Int
-        var quantCode: UInt8
         var qScaleCode: UInt8
+        var quantCodesByBlockIndex: [Int: UInt8]
         var coefficients: [Int16]
     }
 
@@ -123,6 +123,7 @@ public final class PyrowaveCodec: Sendable {
 
     private struct PlaneBlockDescriptor {
         var blockIndex: Int
+        var globalLevel: Int
         var level: Int
         var band: Int
         var originX: Int
@@ -155,6 +156,7 @@ public final class PyrowaveCodec: Sendable {
         frameWidth: Int,
         frameHeight: Int,
         chroma: ChromaSubsampling,
+        layout: PyrowaveBlockLayout,
         configuration: CodecConfiguration
     ) throws -> EncodedPlane {
         let geometry = planeGeometry(component: component, frameWidth: frameWidth, frameHeight: frameHeight, chroma: chroma, requestedLevels: configuration.decompositionLevels)
@@ -163,17 +165,23 @@ public final class PyrowaveCodec: Sendable {
         let levels = Wavelet.usableLevels(width: padded.width, height: padded.height, requested: requestedLevels)
         padded.samples = try forwardWavelet(padded.samples, width: padded.width, height: padded.height, levels: levels)
 
-        let coefficients = try quantize(padded.samples, quantizationStep: configuration.quantizationStep)
-        let quantCode = try PyrowaveQuantization.encodeBlockScale(configuration.quantizationStep)
+        let descriptors = planeBlockDescriptors(
+            component: component,
+            paddedWidth: padded.width,
+            paddedHeight: padded.height,
+            levels: levels,
+            layout: layout
+        )
+        let quantized = try quantize(padded.samples, stride: padded.width, descriptors: descriptors, component: component, configuration: configuration)
 
         return EncodedPlane(
             component: component,
             paddedWidth: padded.width,
             paddedHeight: padded.height,
             levels: levels,
-            quantCode: quantCode,
             qScaleCode: PyrowaveQuantization.identityQScaleCode,
-            coefficients: coefficients
+            quantCodesByBlockIndex: quantized.quantCodesByBlockIndex,
+            coefficients: quantized.coefficients
         )
     }
 
@@ -249,7 +257,7 @@ public final class PyrowaveCodec: Sendable {
                 validWidth: descriptor.validWidth,
                 validHeight: descriptor.validHeight,
                 threshold: threshold,
-                quantCode: plane.quantCode,
+                quantCode: try quantCode(for: descriptor, plane: plane),
                 qScaleCode: plane.qScaleCode
             ) {
                 blocks.append(SparseBlock(blockIndex: descriptor.blockIndex, data: data))
@@ -270,7 +278,7 @@ public final class PyrowaveCodec: Sendable {
                 originY: descriptor.originY,
                 validWidth: descriptor.validWidth,
                 validHeight: descriptor.validHeight,
-                quantCode: plane.quantCode,
+                quantCode: try quantCode(for: descriptor, plane: plane),
                 qScaleCode: plane.qScaleCode
             )
         }
@@ -284,8 +292,8 @@ public final class PyrowaveCodec: Sendable {
             paddedWidth: geometry.paddedWidth,
             paddedHeight: geometry.paddedHeight,
             levels: levels,
-            quantCode: 0,
             qScaleCode: PyrowaveQuantization.identityQScaleCode,
+            quantCodesByBlockIndex: [:],
             coefficients: []
         )
         let descriptors = planeBlockDescriptors(plane: scratchPlane, layout: layout)
@@ -333,23 +341,40 @@ public final class PyrowaveCodec: Sendable {
     }
 
     private func planeBlockDescriptors(plane: EncodedPlane, layout: PyrowaveBlockLayout) -> [PlaneBlockDescriptor] {
+        planeBlockDescriptors(
+            component: plane.component,
+            paddedWidth: plane.paddedWidth,
+            paddedHeight: plane.paddedHeight,
+            levels: plane.levels,
+            layout: layout
+        )
+    }
+
+    private func planeBlockDescriptors(
+        component: Int,
+        paddedWidth: Int,
+        paddedHeight: Int,
+        levels: Int,
+        layout: PyrowaveBlockLayout
+    ) -> [PlaneBlockDescriptor] {
         layout.descriptors.compactMap { global in
-            guard global.component == plane.component else {
+            guard global.component == component else {
                 return nil
             }
 
-            let localLevel = plane.component != 0 && layout.chroma == .yuv420 ? global.level - 1 : global.level
-            guard localLevel >= 0, localLevel < plane.levels else {
+            let localLevel = component != 0 && layout.chroma == .yuv420 ? global.level - 1 : global.level
+            guard localLevel >= 0, localLevel < levels else {
                 return nil
             }
 
-            let subbandWidth = plane.paddedWidth >> (localLevel + 1)
-            let subbandHeight = plane.paddedHeight >> (localLevel + 1)
-            let origin = planeBandOrigin(level: localLevel, finalLevel: plane.levels - 1, band: global.band, subbandWidth: subbandWidth, subbandHeight: subbandHeight)
+            let subbandWidth = paddedWidth >> (localLevel + 1)
+            let subbandHeight = paddedHeight >> (localLevel + 1)
+            let origin = planeBandOrigin(level: localLevel, finalLevel: levels - 1, band: global.band, subbandWidth: subbandWidth, subbandHeight: subbandHeight)
             let x = global.blockX * Self.sparseBlockSize
             let y = global.blockY * Self.sparseBlockSize
             return PlaneBlockDescriptor(
                 blockIndex: global.blockIndex,
+                globalLevel: global.level,
                 level: localLevel,
                 band: global.band,
                 originX: origin.x + x,
@@ -358,6 +383,13 @@ public final class PyrowaveCodec: Sendable {
                 validHeight: min(Self.sparseBlockSize, subbandHeight - y)
             )
         }
+    }
+
+    private func quantCode(for descriptor: PlaneBlockDescriptor, plane: EncodedPlane) throws -> UInt8 {
+        guard let quantCode = plane.quantCodesByBlockIndex[descriptor.blockIndex] else {
+            throw PyrowaveError.processFailed("missing quant code for block \(descriptor.blockIndex)")
+        }
+        return quantCode
     }
 
     private func planeGeometry(component: Int, frameWidth: Int, frameHeight: Int, chroma: ChromaSubsampling, requestedLevels: Int) -> PlaneGeometry {
@@ -412,16 +444,38 @@ public final class PyrowaveCodec: Sendable {
         return transformed
     }
 
-    private func quantize(_ samples: [Float], quantizationStep: Float) throws -> [Int16] {
-        if let metalBackend, let accelerated = try? metalBackend.quantize(samples, quantizationStep: quantizationStep) {
-            return accelerated
+    private func quantize(
+        _ samples: [Float],
+        stride: Int,
+        descriptors: [PlaneBlockDescriptor],
+        component: Int,
+        configuration: CodecConfiguration
+    ) throws -> (coefficients: [Int16], quantCodesByBlockIndex: [Int: UInt8]) {
+        var coefficients = Array(repeating: Int16(0), count: samples.count)
+        var quantCodes = [Int: UInt8]()
+        quantCodes.reserveCapacity(descriptors.count)
+
+        for descriptor in descriptors {
+            let step = PyrowaveQuantization.quantizationStep(
+                level: descriptor.globalLevel,
+                component: component,
+                band: descriptor.band,
+                baseStep: configuration.quantizationStep
+            )
+            let invStep = 1.0 / step
+            quantCodes[descriptor.blockIndex] = try PyrowaveQuantization.encodeBlockScale(step)
+
+            for y in 0..<descriptor.validHeight {
+                let row = (descriptor.originY + y) * stride + descriptor.originX
+                for x in 0..<descriptor.validWidth {
+                    let index = row + x
+                    let quantized = Int((samples[index] * invStep).rounded())
+                    coefficients[index] = Int16(max(Int(Int16.min), min(Int(Int16.max), quantized)))
+                }
+            }
         }
 
-        let invStep = 1.0 / quantizationStep
-        return samples.map { sample -> Int16 in
-            let quantized = Int((sample * invStep).rounded())
-            return Int16(max(Int(Int16.min), min(Int(Int16.max), quantized)))
-        }
+        return (coefficients, quantCodes)
     }
 
 }
