@@ -697,21 +697,32 @@ public final class PyrowaveCodec: @unchecked Sendable {
             try makeGPUDecodedPlane(component: component, width: sequence.width, height: sequence.height, chroma: sequence.chroma, layout: layout)
         }
         let blockTargets = try sparseBlockTargets(decodedPlanes: decodedPlanes, totalBlocks: layout.descriptors.count)
-        var pendingSparseBlocks = Array(repeating: [PendingSparseBlock](), count: PyrowaveBitstream.componentCount)
+        var entriesByPlane = Array(repeating: [MetalSparseCoefficientEntry](), count: PyrowaveBitstream.componentCount)
         var seenBlocks = Set<Int>()
 
         while reader.offset < frame.data.count {
-            let block = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
-            guard block.sequence == sequence.sequence else {
+            let blockStart = reader.offset
+            let header = try PyrowavePacketHeader(reader: &reader)
+            guard !header.extended else {
+                throw PyrowaveError.invalidBitstream("coefficient decoder received extended packet")
+            }
+            guard header.sequence == sequence.sequence else {
                 throw PyrowaveError.invalidBitstream("coefficient packet sequence mismatch")
             }
-            guard block.blockIndex >= 0, block.blockIndex < layout.descriptors.count, seenBlocks.insert(block.blockIndex).inserted else {
+            guard header.blockIndex >= 0, header.blockIndex < layout.descriptors.count, seenBlocks.insert(header.blockIndex).inserted else {
                 throw PyrowaveError.invalidBitstream("bad sparse block index")
             }
-            guard let target = blockTargets[block.blockIndex] else {
+            guard let target = blockTargets[header.blockIndex] else {
                 throw PyrowaveError.invalidBitstream("sparse block index has no plane mapping")
             }
-            pendingSparseBlocks[target.planeIndex].append(PendingSparseBlock(block: block, descriptor: target.descriptor))
+            try appendSparseEntries(
+                header: header,
+                blockStart: blockStart,
+                reader: &reader,
+                target: target,
+                decodedPlane: decodedPlanes[target.planeIndex],
+                entries: &entriesByPlane[target.planeIndex]
+            )
         }
 
         if seenBlocks.count < sequence.totalBlocks {
@@ -726,7 +737,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
             throw PyrowaveError.invalidBitstream("trailing bytes")
         }
 
-        try applySparseBlocksToBuffers(pendingSparseBlocks, decodedPlanes: &decodedPlanes)
+        try applySparseEntriesToBuffers(entriesByPlane, decodedPlanes: &decodedPlanes)
 
         return GPUDecodedFramePlanes(sequence: sequence, planes: decodedPlanes)
     }
@@ -2041,6 +2052,152 @@ public final class PyrowaveCodec: @unchecked Sendable {
             sampleCount: decodedPlane.sampleCount,
             entries: entries
         )
+    }
+
+    private func appendSparseEntries(
+        header: PyrowavePacketHeader,
+        blockStart: Int,
+        reader: inout BinaryReader,
+        target: SparseBlockTarget,
+        decodedPlane: GPUDecodedPlane,
+        entries: inout [MetalSparseCoefficientEntry]
+    ) throws {
+        let payloadEnd = blockStart + Int(header.payloadWords) * 4
+        guard payloadEnd >= reader.offset else {
+            throw PyrowaveError.invalidBitstream("payload_words is not large enough")
+        }
+        guard payloadEnd <= reader.data.count else {
+            throw PyrowaveError.truncatedInput
+        }
+        guard header.ballot != 0 else {
+            if reader.offset < payloadEnd {
+                guard reader.data[reader.offset..<payloadEnd].allSatisfy({ $0 == 0 }) else {
+                    throw PyrowaveError.invalidBitstream("non-zero coefficient packet padding")
+                }
+            }
+            try reader.seek(to: payloadEnd)
+            return
+        }
+
+        let activeBlockCount = header.ballot.nonzeroBitCount
+        var codeWords = [UInt16]()
+        codeWords.reserveCapacity(activeBlockCount)
+        for _ in 0..<activeBlockCount {
+            codeWords.append(try reader.readUInt16())
+        }
+
+        var qScales = [UInt8]()
+        qScales.reserveCapacity(activeBlockCount)
+        for _ in 0..<activeBlockCount {
+            qScales.append(try reader.readUInt8())
+        }
+
+        var signEntryIndices = [Int]()
+        signEntryIndices.reserveCapacity(activeBlockCount * PyrowaveBitstream.smallBlockSize * PyrowaveBitstream.smallBlockSize)
+
+        var compactIndex = 0
+        for smallBlock in 0..<16 where (header.ballot & (UInt16(1) << UInt16(smallBlock))) != 0 {
+            let smallOriginX = (smallBlock % 4) * PyrowaveBitstream.smallBlockSize
+            let smallOriginY = (smallBlock / 4) * PyrowaveBitstream.smallBlockSize
+            let codeWord = codeWords[compactIndex]
+            let basePlanes = Int(qScales[compactIndex] & 0x0f)
+            let qScaleCode = qScales[compactIndex] >> 4
+
+            for subblock in 0..<8 {
+                let encodedPlanes = Int((codeWord >> UInt16(2 * subblock)) & 0x3) + basePlanes
+
+                try withUnsafeTemporaryAllocation(of: Int.self, capacity: 8) { magnitudes in
+                    for pixel in 0..<8 {
+                        magnitudes[pixel] = 0
+                    }
+
+                    for _ in 0..<encodedPlanes {
+                        guard reader.offset < payloadEnd else {
+                            throw PyrowaveError.truncatedInput
+                        }
+                        let byte = try reader.readUInt8()
+                        for pixel in 0..<8 {
+                            magnitudes[pixel] <<= 1
+                            magnitudes[pixel] |= Int((byte >> UInt8(pixel)) & 1)
+                        }
+                    }
+
+                    for pixel in 0..<8 where magnitudes[pixel] != 0 {
+                        let coord = coefficientSubblockCoordinate(subblock: subblock, pixel: pixel)
+                        let x = smallOriginX + coord.x
+                        let y = smallOriginY + coord.y
+                        let localOffset = UInt16(y * PyrowaveBitstream.coefficientBlockSize + x)
+                        let destinationOffset = try sparseDestinationOffset(
+                            entryOffset: localOffset,
+                            descriptor: target.descriptor,
+                            paddedWidth: decodedPlane.paddedWidth,
+                            paddedHeight: decodedPlane.paddedHeight
+                        )
+                        signEntryIndices.append(entries.count)
+                        entries.append(MetalSparseCoefficientEntry(
+                            destinationOffset: UInt32(destinationOffset),
+                            coefficient: Int32(magnitudes[pixel]),
+                            quantCode: UInt32(header.quantCode),
+                            qScaleCode: UInt32(qScaleCode)
+                        ))
+                    }
+                }
+            }
+
+            compactIndex += 1
+        }
+
+        let signStart = reader.offset
+        let signByteCount = (signEntryIndices.count + 7) / 8
+        guard signStart + signByteCount <= payloadEnd else {
+            throw PyrowaveError.truncatedInput
+        }
+
+        for signIndex in signEntryIndices.indices {
+            let signByteOffset = signIndex / 8
+            let bit = UInt8(signIndex & 7)
+            let signByte = reader.data[signStart + signByteOffset]
+            if ((signByte >> bit) & 1) != 0 {
+                entries[signEntryIndices[signIndex]].coefficient = -entries[signEntryIndices[signIndex]].coefficient
+            }
+        }
+
+        let paddingStart = signStart + signByteCount
+        if paddingStart < payloadEnd {
+            guard reader.data[paddingStart..<payloadEnd].allSatisfy({ $0 == 0 }) else {
+                throw PyrowaveError.invalidBitstream("non-zero coefficient packet padding")
+            }
+        }
+
+        try reader.seek(to: payloadEnd)
+    }
+
+    private func coefficientSubblockCoordinate(subblock: Int, pixel: Int) -> (x: Int, y: Int) {
+        let x = (subblock / 4) * 4 + (pixel >> 1)
+        let y = (subblock % 4) * 2 + (pixel & 1)
+        return (x, y)
+    }
+
+    private func applySparseEntriesToBuffers(
+        _ entriesByPlane: [[MetalSparseCoefficientEntry]],
+        decodedPlanes: inout [GPUDecodedPlane]
+    ) throws {
+        guard entriesByPlane.count == decodedPlanes.count else {
+            throw PyrowaveError.invalidDimensions
+        }
+        let requests = decodedPlanes.indices.map { index in
+            (
+                sampleCount: decodedPlanes[index].sampleCount,
+                entries: entriesByPlane[index]
+            )
+        }
+        let buffers = try metalBackend.applySparseCoefficientBuffers(requests)
+        guard buffers.count == decodedPlanes.count else {
+            throw PyrowaveError.processFailed("Metal sparse coefficient batch returned \(buffers.count) buffers for \(decodedPlanes.count) planes")
+        }
+        for index in decodedPlanes.indices {
+            decodedPlanes[index].samples = buffers[index]
+        }
     }
 
     private func applySparseBlocksToBuffers(
