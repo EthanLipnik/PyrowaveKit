@@ -1137,72 +1137,99 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         try validateWaveletShape(width: width, height: height, levels: levels)
         guard sampleCount > 0 else { return buffer }
 
-        let byteLength = sampleCount * MemoryLayout<Float>.stride
-        guard let scratch = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal iDWT scratch buffer")
+        return try inverseWaveletBuffers([(buffer: buffer, sampleCount: sampleCount, width: width, height: height, levels: levels)])[0]
+    }
+
+    func inverseWaveletBuffers(_ planes: [(buffer: MTLBuffer, sampleCount: Int, width: Int, height: Int, levels: Int)]) throws -> [MTLBuffer] {
+        guard !planes.isEmpty else {
+            return []
         }
-        let primary = buffer
+        for plane in planes {
+            guard plane.sampleCount == plane.width * plane.height,
+                  plane.buffer.length >= plane.sampleCount * MemoryLayout<Float>.stride else {
+                throw PyrowaveError.invalidDimensions
+            }
+            try validateWaveletShape(width: plane.width, height: plane.height, levels: plane.levels)
+        }
+
+        var scratchBuffers = [MTLBuffer]()
+        scratchBuffers.reserveCapacity(planes.count)
+        for plane in planes {
+            guard plane.sampleCount > 0 else {
+                scratchBuffers.append(plane.buffer)
+                continue
+            }
+            guard let scratch = device.makeBuffer(length: plane.sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal iDWT scratch buffer")
+            }
+            scratchBuffers.append(scratch)
+        }
+
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw PyrowaveError.processFailed("failed to create Metal iDWT command buffer")
         }
 
-        var sizes = [(Int, Int)]()
-        var activeWidth = width
-        var activeHeight = height
-        for _ in 0..<levels {
-            sizes.append((activeWidth, activeHeight))
-            activeWidth /= 2
-            activeHeight /= 2
-        }
-
-        for (levelWidth, levelHeight) in sizes.reversed() {
-            try encodeDWTCopy(
-                commandBuffer: commandBuffer,
-                pipeline: dwtUnpackColumnsPipeline,
-                input: primary,
-                output: scratch,
-                activeWidth: levelWidth,
-                activeHeight: levelHeight,
-                stride: width,
-                phase: 0
-            )
-            for phase in 0...4 {
-                try encodeDWTInPlace(
-                    commandBuffer: commandBuffer,
-                    pipeline: idwtLiftColumnsPipeline,
-                    buffer: scratch,
-                    activeWidth: levelWidth,
-                    activeHeight: levelHeight,
-                    stride: width,
-                    phase: phase
-                )
+        for (planeIndex, plane) in planes.enumerated() where plane.sampleCount > 0 {
+            var sizes = [(Int, Int)]()
+            var activeWidth = plane.width
+            var activeHeight = plane.height
+            for _ in 0..<plane.levels {
+                sizes.append((activeWidth, activeHeight))
+                activeWidth /= 2
+                activeHeight /= 2
             }
 
-            try encodeDWTCopy(
-                commandBuffer: commandBuffer,
-                pipeline: dwtUnpackRowsPipeline,
-                input: scratch,
-                output: primary,
-                activeWidth: levelWidth,
-                activeHeight: levelHeight,
-                stride: width,
-                phase: 0
-            )
-            for phase in 0...4 {
-                try encodeDWTInPlace(
+            let primary = plane.buffer
+            let scratch = scratchBuffers[planeIndex]
+            for (levelWidth, levelHeight) in sizes.reversed() {
+                try encodeDWTCopy(
                     commandBuffer: commandBuffer,
-                    pipeline: idwtLiftRowsPipeline,
-                    buffer: primary,
+                    pipeline: dwtUnpackColumnsPipeline,
+                    input: primary,
+                    output: scratch,
                     activeWidth: levelWidth,
                     activeHeight: levelHeight,
-                    stride: width,
-                    phase: phase
+                    stride: plane.width,
+                    phase: 0
                 )
+                for phase in 0...4 {
+                    try encodeDWTInPlace(
+                        commandBuffer: commandBuffer,
+                        pipeline: idwtLiftColumnsPipeline,
+                        buffer: scratch,
+                        activeWidth: levelWidth,
+                        activeHeight: levelHeight,
+                        stride: plane.width,
+                        phase: phase
+                    )
+                }
+
+                try encodeDWTCopy(
+                    commandBuffer: commandBuffer,
+                    pipeline: dwtUnpackRowsPipeline,
+                    input: scratch,
+                    output: primary,
+                    activeWidth: levelWidth,
+                    activeHeight: levelHeight,
+                    stride: plane.width,
+                    phase: 0
+                )
+                for phase in 0...4 {
+                    try encodeDWTInPlace(
+                        commandBuffer: commandBuffer,
+                        pipeline: idwtLiftRowsPipeline,
+                        buffer: primary,
+                        activeWidth: levelWidth,
+                        activeHeight: levelHeight,
+                        stride: plane.width,
+                        phase: phase
+                    )
+                }
             }
         }
 
         try finish(commandBuffer: commandBuffer, context: "Metal iDWT")
-        return primary
+        return planes.map(\.buffer)
     }
 
     private static func makeFunction(named name: String, library: MTLLibrary) throws -> MTLFunction {

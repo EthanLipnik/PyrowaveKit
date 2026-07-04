@@ -1422,6 +1422,45 @@ import Metal
     #expect(inverseError < 0.0001)
 }
 
+@Test func metalInverseWaveletBatchMatchesSinglePlaneResultsWhenDeviceExists() throws {
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let width = 128
+    let height = 128
+    let levels = 3
+    let planes = (0..<3).map { planeIndex in
+        (0..<(width * height)).map { index in
+            Float((index * (11 + planeIndex * 3) + planeIndex * 17) % 257) / 257.0 - 0.5
+        }
+    }
+    let transformed = try planes.map {
+        try backend.forwardWavelet($0, width: width, height: height, levels: levels)
+    }
+    let single = try transformed.map {
+        try backend.inverseWavelet($0, width: width, height: height, levels: levels)
+    }
+    let buffers = try transformed.map { samples -> MTLBuffer in
+        let byteLength = samples.count * MemoryLayout<Float>.stride
+        return try #require(backend.device.makeBuffer(bytes: samples, length: byteLength, options: .storageModeShared))
+    }
+
+    let batchedBuffers = try backend.inverseWaveletBuffers(buffers.map {
+        (buffer: $0, sampleCount: width * height, width: width, height: height, levels: levels)
+    })
+    #expect(batchedBuffers.count == buffers.count)
+    for index in batchedBuffers.indices {
+        let pointer = batchedBuffers[index].contents().bindMemory(to: Float.self, capacity: width * height)
+        let batched = Array(UnsafeBufferPointer(start: pointer, count: width * height))
+        let maxError = zip(batched, single[index]).map { abs($0 - $1) }.max() ?? 0
+        #expect(maxError < 0.0001)
+    }
+}
+
 @Test func sparseRateControlCapsEncodedFrameSize() throws {
     let frame = try TestFrames.synthetic420(width: 256, height: 144)
     let codec = try PyrowaveCodec()

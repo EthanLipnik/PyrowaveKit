@@ -458,9 +458,31 @@ public final class PyrowaveCodec: @unchecked Sendable {
         let yTexture = try makeOutputTexture(width: decoded.planes[0].visibleWidth, height: decoded.planes[0].visibleHeight, device: outputDevice, usage: textureUsage)
         let cbTexture = try makeOutputTexture(width: decoded.planes[1].visibleWidth, height: decoded.planes[1].visibleHeight, device: outputDevice, usage: textureUsage)
         let crTexture = try makeOutputTexture(width: decoded.planes[2].visibleWidth, height: decoded.planes[2].visibleHeight, device: outputDevice, usage: textureUsage)
-        try finishGPUDecodedPlane(decoded.planes[0], to: yTexture)
-        try finishGPUDecodedPlane(decoded.planes[1], to: cbTexture)
-        try finishGPUDecodedPlane(decoded.planes[2], to: crTexture)
+        let reconstructed = try inverseWaveletBuffers(decoded.planes)
+        try metalBackend.cropPlaneToTexture(
+            reconstructed[0],
+            sampleCount: decoded.planes[0].sampleCount,
+            paddedWidth: decoded.planes[0].paddedWidth,
+            width: decoded.planes[0].visibleWidth,
+            height: decoded.planes[0].visibleHeight,
+            texture: yTexture
+        )
+        try metalBackend.cropPlaneToTexture(
+            reconstructed[1],
+            sampleCount: decoded.planes[1].sampleCount,
+            paddedWidth: decoded.planes[1].paddedWidth,
+            width: decoded.planes[1].visibleWidth,
+            height: decoded.planes[1].visibleHeight,
+            texture: cbTexture
+        )
+        try metalBackend.cropPlaneToTexture(
+            reconstructed[2],
+            sampleCount: decoded.planes[2].sampleCount,
+            paddedWidth: decoded.planes[2].paddedWidth,
+            width: decoded.planes[2].visibleWidth,
+            height: decoded.planes[2].visibleHeight,
+            texture: crTexture
+        )
         return (yTexture, cbTexture, crTexture)
     }
 
@@ -474,16 +496,14 @@ public final class PyrowaveCodec: @unchecked Sendable {
             throw PyrowaveError.invalidDimensions
         }
 
-        let y = try inverseWaveletBuffer(decoded.planes[0])
-        let cb = try inverseWaveletBuffer(decoded.planes[1])
-        let cr = try inverseWaveletBuffer(decoded.planes[2])
+        let reconstructed = try inverseWaveletBuffers(decoded.planes)
         try metalBackend.cropPlanesToNV12Textures(
-            yBuffer: y,
+            yBuffer: reconstructed[0],
             ySampleCount: decoded.planes[0].sampleCount,
             yPaddedWidth: decoded.planes[0].paddedWidth,
-            cbBuffer: cb,
+            cbBuffer: reconstructed[1],
             cbSampleCount: decoded.planes[1].sampleCount,
-            crBuffer: cr,
+            crBuffer: reconstructed[2],
             crSampleCount: decoded.planes[2].sampleCount,
             chromaPaddedWidth: decoded.planes[1].paddedWidth,
             width: decoded.sequence.width,
@@ -1370,6 +1390,18 @@ public final class PyrowaveCodec: @unchecked Sendable {
             height: plane.paddedHeight,
             levels: plane.levels
         )
+    }
+
+    private func inverseWaveletBuffers(_ planes: [GPUDecodedPlane]) throws -> [MTLBuffer] {
+        try metalBackend.inverseWaveletBuffers(planes.map {
+            (
+                buffer: $0.samples,
+                sampleCount: $0.sampleCount,
+                width: $0.paddedWidth,
+                height: $0.paddedHeight,
+                levels: $0.levels
+            )
+        })
     }
 
     private func planeBlockDescriptors(plane: EncodedPlane, layout: PyrowaveBlockLayout) -> [PlaneBlockDescriptor] {
