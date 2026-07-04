@@ -1035,6 +1035,46 @@ import Metal
     #expect(try backend.applySparseCoefficients(sampleCount: 5, entries: []) == Array(repeating: Float(0), count: 5))
 }
 
+@Test func metalSparseApplyBatchMatchesSinglePlaneResultsWhenDeviceExists() throws {
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let planes = [
+        (
+            sampleCount: 16,
+            entries: [
+                MetalSparseCoefficientEntry(destinationOffset: 7, coefficient: -9, quantCode: 32, qScaleCode: 3),
+                MetalSparseCoefficientEntry(destinationOffset: 2, coefficient: 14, quantCode: 32, qScaleCode: 6)
+            ]
+        ),
+        (
+            sampleCount: 8,
+            entries: [MetalSparseCoefficientEntry(destinationOffset: 5, coefficient: 4, quantCode: 96, qScaleCode: 9)]
+        ),
+        (
+            sampleCount: 5,
+            entries: []
+        )
+    ]
+
+    let batchedBuffers = try backend.applySparseCoefficientBuffers(planes)
+    #expect(batchedBuffers.count == planes.count)
+
+    for index in planes.indices {
+        let singlePlane = try backend.applySparseCoefficients(
+            sampleCount: planes[index].sampleCount,
+            entries: planes[index].entries
+        )
+        let pointer = batchedBuffers[index].contents().bindMemory(to: Float.self, capacity: planes[index].sampleCount)
+        let batched = Array(UnsafeBufferPointer(start: pointer, count: planes[index].sampleCount))
+        #expect(batched == singlePlane)
+    }
+}
+
 @Test func metalRateControlStatsMatchCPUReferenceWhenDeviceExists() throws {
     let backend: MetalPyrowaveBackend
     do {

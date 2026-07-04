@@ -574,9 +574,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
             throw PyrowaveError.invalidBitstream("trailing bytes")
         }
 
-        for index in decodedPlanes.indices {
-            try applySparseBlocksToBuffer(pendingSparseBlocks[index], decodedPlane: &decodedPlanes[index])
-        }
+        try applySparseBlocksToBuffers(pendingSparseBlocks, decodedPlanes: &decodedPlanes)
 
         return GPUDecodedFramePlanes(sequence: sequence, planes: decodedPlanes)
     }
@@ -1237,6 +1235,32 @@ public final class PyrowaveCodec: @unchecked Sendable {
             sampleCount: decodedPlane.sampleCount,
             entries: entries
         )
+    }
+
+    private func applySparseBlocksToBuffers(
+        _ blocksByPlane: [[PendingSparseBlock]],
+        decodedPlanes: inout [GPUDecodedPlane]
+    ) throws {
+        guard blocksByPlane.count == decodedPlanes.count else {
+            throw PyrowaveError.invalidDimensions
+        }
+        let requests = try decodedPlanes.indices.map { index in
+            (
+                sampleCount: decodedPlanes[index].sampleCount,
+                entries: try metalSparseCoefficientEntries(
+                    blocksByPlane[index],
+                    paddedWidth: decodedPlanes[index].paddedWidth,
+                    paddedHeight: decodedPlanes[index].paddedHeight
+                )
+            )
+        }
+        let buffers = try metalBackend.applySparseCoefficientBuffers(requests)
+        guard buffers.count == decodedPlanes.count else {
+            throw PyrowaveError.processFailed("Metal sparse coefficient batch returned \(buffers.count) buffers for \(decodedPlanes.count) planes")
+        }
+        for index in decodedPlanes.indices {
+            decodedPlanes[index].samples = buffers[index]
+        }
     }
 
     private func metalSparseCoefficientEntries(

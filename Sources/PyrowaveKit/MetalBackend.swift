@@ -546,49 +546,82 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     }
 
     func applySparseCoefficientBuffer(sampleCount: Int, entries: [MetalSparseCoefficientEntry]) throws -> MTLBuffer {
-        guard sampleCount >= 0 else {
+        try applySparseCoefficientBuffers([(sampleCount: sampleCount, entries: entries)])[0]
+    }
+
+    func applySparseCoefficientBuffers(_ planes: [(sampleCount: Int, entries: [MetalSparseCoefficientEntry])]) throws -> [MTLBuffer] {
+        guard !planes.isEmpty else {
+            return []
+        }
+        guard planes.allSatisfy({ $0.sampleCount >= 0 }),
+              planes.allSatisfy({ $0.sampleCount <= Int(UInt32.max) && $0.entries.count <= Int(UInt32.max) }) else {
             throw PyrowaveError.invalidDimensions
-        }
-        guard sampleCount <= Int(UInt32.max), entries.count <= Int(UInt32.max) else {
-            throw PyrowaveError.invalidDimensions
-        }
-        if sampleCount == 0 {
-            guard entries.isEmpty else {
-                throw PyrowaveError.invalidDimensions
-            }
-            guard let output = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared) else {
-                throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient output")
-            }
-            output.contents().storeBytes(of: Float(0), as: Float.self)
-            return output
-        }
-        let byteLength = sampleCount * MemoryLayout<Float>.stride
-        guard let output = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient output")
-        }
-        memset(output.contents(), 0, byteLength)
-        guard !entries.isEmpty else {
-            return output
-        }
-        guard let entryBuffer = device.makeBuffer(bytes: entries, length: entries.count * MemoryLayout<MetalSparseCoefficientEntry>.stride, options: .storageModeShared) else {
-            throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient buffers")
         }
 
-        var constants = SparseApplyConstants(entryCount: UInt32(entries.count), sampleCount: UInt32(sampleCount))
+        var outputs = [MTLBuffer]()
+        outputs.reserveCapacity(planes.count)
+        var dispatches = [(planeIndex: Int, entryBuffer: MTLBuffer, entryCount: Int, sampleCount: Int)]()
+        dispatches.reserveCapacity(planes.count)
+
+        for (planeIndex, plane) in planes.enumerated() {
+            if plane.sampleCount == 0 {
+                guard plane.entries.isEmpty else {
+                    throw PyrowaveError.invalidDimensions
+                }
+                guard let output = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared) else {
+                    throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient output")
+                }
+                output.contents().storeBytes(of: Float(0), as: Float.self)
+                outputs.append(output)
+                continue
+            }
+
+            let byteLength = plane.sampleCount * MemoryLayout<Float>.stride
+            guard let output = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient output")
+            }
+            memset(output.contents(), 0, byteLength)
+            outputs.append(output)
+
+            guard !plane.entries.isEmpty else {
+                continue
+            }
+            guard let entryBuffer = device.makeBuffer(bytes: plane.entries, length: plane.entries.count * MemoryLayout<MetalSparseCoefficientEntry>.stride, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient buffers")
+            }
+            dispatches.append((
+                planeIndex: planeIndex,
+                entryBuffer: entryBuffer,
+                entryCount: plane.entries.count,
+                sampleCount: plane.sampleCount
+            ))
+        }
+
+        guard !dispatches.isEmpty else {
+            return outputs
+        }
+
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw PyrowaveError.processFailed("failed to create Metal sparse coefficient command encoder")
         }
 
         encoder.setComputePipelineState(sparseApplyPipeline)
-        encoder.setBuffer(output, offset: 0, index: 0)
-        encoder.setBuffer(entryBuffer, offset: 0, index: 1)
-        encoder.setBytes(&constants, length: MemoryLayout<SparseApplyConstants>.stride, index: 2)
         let width = min(sparseApplyPipeline.maxTotalThreadsPerThreadgroup, 256)
-        encoder.dispatchThreads(
-            MTLSize(width: entries.count, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
-        )
+        let threadsPerThreadgroup = MTLSize(width: width, height: 1, depth: 1)
+        for dispatch in dispatches {
+            var constants = SparseApplyConstants(
+                entryCount: UInt32(dispatch.entryCount),
+                sampleCount: UInt32(dispatch.sampleCount)
+            )
+            encoder.setBuffer(outputs[dispatch.planeIndex], offset: 0, index: 0)
+            encoder.setBuffer(dispatch.entryBuffer, offset: 0, index: 1)
+            encoder.setBytes(&constants, length: MemoryLayout<SparseApplyConstants>.stride, index: 2)
+            encoder.dispatchThreads(
+                MTLSize(width: dispatch.entryCount, height: 1, depth: 1),
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -597,7 +630,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("Metal sparse coefficient command failed: \(error)")
         }
 
-        return output
+        return outputs
     }
 
     func rateControlTileStats(
