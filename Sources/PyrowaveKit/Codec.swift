@@ -447,10 +447,12 @@ public final class PyrowaveCodec: Sendable {
         let fixedHeaderBytes = frameHeaderSize
         let rateBlocksByPlane = try planes.map { try makeRateControlBlocks($0, layout: layout) }
         let packetByteCostsByPlane = rateBlocksByPlane.map { $0.map(\.packetByteCosts) }
+        let bucketIndicesByPlane = try metalRateControlBucketIndices(blocksByPlane: rateBlocksByPlane)
         if let thresholdsByPlane = PyrowaveRateController.selectThresholds(
             blocksByPlane: rateBlocksByPlane,
             fixedHeaderBytes: fixedHeaderBytes,
-            maximumEncodedBytes: maximumEncodedBytes
+            maximumEncodedBytes: maximumEncodedBytes,
+            bucketIndicesByPlane: bucketIndicesByPlane
         ) {
             return SparseRateControlPlan(
                 defaultQuantLevel: 0,
@@ -481,6 +483,30 @@ public final class PyrowaveCodec: Sendable {
             quantLevelsByPlane: nil,
             packetByteCostsByPlane: packetByteCostsByPlane
         )
+    }
+
+    private func metalRateControlBucketIndices(blocksByPlane: [[PyrowaveRateControlBlock]]) throws -> [[[Int]]]? {
+        guard let metalBackend else {
+            return nil
+        }
+
+        var bucketsByPlane = [[[Int]]]()
+        bucketsByPlane.reserveCapacity(blocksByPlane.count)
+        for blocks in blocksByPlane {
+            let distortions = blocks.map { block in
+                (0..<PyrowaveBlockStats.candidateCount).map { block.distortion(quantLevel: $0) }
+            }
+            let packetByteCosts = blocks.map(\.packetByteCosts)
+            let buckets = try metalBackend.rateControlBucketIndices(
+                distortions: distortions,
+                packetByteCosts: packetByteCosts
+            )
+            guard buckets.count == blocks.count else {
+                throw PyrowaveError.processFailed("Metal rate-control bucket pass returned \(buckets.count) blocks for \(blocks.count) inputs")
+            }
+            bucketsByPlane.append(buckets)
+        }
+        return bucketsByPlane
     }
 
     private var frameHeaderSize: Int {

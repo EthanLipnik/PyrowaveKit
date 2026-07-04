@@ -1057,6 +1057,71 @@ import CoreVideo
     #endif
 }
 
+@Test func metalRateControlBucketsMatchCPUReferenceWhenDeviceExists() throws {
+    #if canImport(Metal)
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let stride = 40
+    var coefficients = Array(repeating: Int16(0), count: stride * 40)
+    for y in 0..<32 {
+        for x in 0..<32 {
+            let raw = ((x * 29 + y * 31 + x * y * 7) % 767) - 383
+            coefficients[(4 + y) * stride + 5 + x] = Int16(raw)
+        }
+    }
+
+    let quantCode = try PyrowaveQuantization.encodeBlockScale(1.0 / 1024.0)
+    let blocks = [
+        try PyrowaveRateController.makeBlock(
+            blockIndex: 0,
+            coefficients: coefficients,
+            stride: stride,
+            originX: 5,
+            originY: 4,
+            validWidth: 32,
+            validHeight: 32,
+            quantCode: quantCode,
+            rdoDistortionScale: 1.0
+        ),
+        try PyrowaveRateController.makeBlock(
+            blockIndex: 1,
+            coefficients: coefficients,
+            stride: stride,
+            originX: 5,
+            originY: 4,
+            validWidth: 17,
+            validHeight: 23,
+            quantCode: quantCode,
+            qScaleCodes: (0..<16).map { UInt8(($0 * 3) % 16) },
+            rdoDistortionScale: 1.75
+        )
+    ]
+
+    let distortions = blocks.map { block in
+        (0..<PyrowaveBlockStats.candidateCount).map { block.distortion(quantLevel: $0) }
+    }
+    let packetByteCosts = blocks.map(\.packetByteCosts)
+    let metal = try backend.rateControlBucketIndices(
+        distortions: distortions,
+        packetByteCosts: packetByteCosts
+    )
+    let cpu = blocks.map { PyrowaveRateController.inclusiveBucketIndices(for: $0) }
+
+    #expect(metal == cpu)
+    let metalOperations = PyrowaveRateController.makeRDOperations(
+        blocksByPlane: [blocks],
+        bucketIndicesByPlane: [metal]
+    )
+    let cpuOperations = PyrowaveRateController.makeRDOperations(blocksByPlane: [blocks])
+    #expect(metalOperations == cpuOperations)
+    #endif
+}
+
 @Test func metalCodecMatchesCPUReferenceWhenDeviceExists() throws {
     #if canImport(Metal)
     do {

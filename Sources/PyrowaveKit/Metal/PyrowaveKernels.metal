@@ -77,6 +77,10 @@ struct PacketByteCostConstants {
     uint descriptorCount;
 };
 
+struct RateControlBucketConstants {
+    uint blockCount;
+};
+
 struct DWTConstants {
     uint activeWidth;
     uint activeHeight;
@@ -444,6 +448,48 @@ kernel void pyrowave_packet_byte_costs(
         uint signPayloadBytes = (signCount + 7u) / 8u;
         uint unpaddedSize = 8u + activeBlockCount * 2u + activeBlockCount + magnitudePayloadBytes + signPayloadBytes;
         byteCosts[outputOffset + quantLevel] = ((unpaddedSize + 3u) / 4u) * 4u;
+    }
+}
+
+kernel void pyrowave_rate_control_bucket_indices(
+    device const float *distortions [[buffer(0)]],
+    device const uint *packetByteCosts [[buffer(1)]],
+    device uint *bucketIndices [[buffer(2)]],
+    constant RateControlBucketConstants &constants [[buffer(3)]],
+    uint blockIndex [[thread_position_in_grid]]
+) {
+    if (blockIndex >= constants.blockCount) {
+        return;
+    }
+
+    constexpr uint candidateCount = 15u;
+    constexpr uint bucketCount = 128u;
+    constexpr uint bucketClusterWidth = 16u;
+    uint offset = blockIndex * candidateCount;
+    float baseDistortion = distortions[offset];
+    uint baseCost = packetByteCosts[offset];
+    uint raw[candidateCount];
+
+    for (uint quantLevel = 0u; quantLevel < candidateCount; ++quantLevel) {
+        uint bucket = 0u;
+        if (quantLevel != 0u && packetByteCosts[offset + quantLevel] != baseCost) {
+            float distortionDelta = max(distortions[offset + quantLevel] - baseDistortion, 0.0f);
+            int saving = int(baseCost) - int(packetByteCosts[offset + quantLevel]);
+            float costSaving = saving > 0 ? float(saving) : 1.40129846e-45f;
+            float index = 60.0f + 2.0f * log2(distortionDelta / costSaving);
+            if (isfinite(index)) {
+                bucket = uint(clamp(floor(index + 0.5f), 0.0f, 127.0f));
+            }
+        }
+        raw[quantLevel] = min(bucket, bucketCount - bucketClusterWidth + quantLevel);
+    }
+
+    for (uint quantLevel = 0u; quantLevel < candidateCount; ++quantLevel) {
+        uint bucket = raw[quantLevel];
+        for (uint previous = 0u; previous < quantLevel; ++previous) {
+            bucket = max(bucket, raw[previous] + quantLevel - previous);
+        }
+        bucketIndices[offset + quantLevel] = min(bucketCount - 1u, bucket);
     }
 }
 

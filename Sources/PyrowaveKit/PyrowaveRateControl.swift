@@ -164,7 +164,8 @@ enum PyrowaveRateController {
     static func selectThresholds(
         blocksByPlane: [[PyrowaveRateControlBlock]],
         fixedHeaderBytes: Int,
-        maximumEncodedBytes: Int
+        maximumEncodedBytes: Int,
+        bucketIndicesByPlane: [[[Int]]]? = nil
     ) -> [[Int]]? {
         var thresholds = blocksByPlane.map { Array(repeating: 0, count: $0.count) }
         var currentBytes = estimateFrameBytes(
@@ -177,7 +178,10 @@ enum PyrowaveRateController {
             return thresholds
         }
 
-        let operations = makeRDOperations(blocksByPlane: blocksByPlane)
+        let operations = makeRDOperations(
+            blocksByPlane: blocksByPlane,
+            bucketIndicesByPlane: bucketIndicesByPlane
+        )
         guard !operations.isEmpty else {
             return nil
         }
@@ -216,12 +220,24 @@ enum PyrowaveRateController {
         return byteCount
     }
 
-    static func makeRDOperations(blocksByPlane: [[PyrowaveRateControlBlock]]) -> [RDOperation] {
+    static func makeRDOperations(
+        blocksByPlane: [[PyrowaveRateControlBlock]],
+        bucketIndicesByPlane: [[[Int]]]? = nil
+    ) -> [RDOperation] {
         var buckets = Array(repeating: [RDOperation](), count: bucketCount)
 
         for (planeIndex, blocks) in blocksByPlane.enumerated() {
             for (blockIndex, block) in blocks.enumerated() {
-                let bucketIndices = inclusiveBucketIndices(for: block)
+                let providedBucketIndices: [Int]?
+                if let bucketIndicesByPlane,
+                   planeIndex < bucketIndicesByPlane.count,
+                   blockIndex < bucketIndicesByPlane[planeIndex].count,
+                   bucketIndicesByPlane[planeIndex][blockIndex].count == PyrowaveRateControlBlock.candidateCount {
+                    providedBucketIndices = bucketIndicesByPlane[planeIndex][blockIndex]
+                } else {
+                    providedBucketIndices = nil
+                }
+                let bucketIndices = providedBucketIndices ?? inclusiveBucketIndices(for: block)
                 for quantLevel in 1..<PyrowaveRateControlBlock.candidateCount {
                     let saving = block.packetByteCost(quantLevel: quantLevel - 1) - block.packetByteCost(quantLevel: quantLevel)
                     guard saving > 0 else {
