@@ -320,6 +320,39 @@ import Testing
     #expect(decoded.chroma == frame.chroma)
 }
 
+@Test func geometryAwarePacketStreamDecoderAcceptsCoefficientRestartWithoutSequenceHeader() throws {
+    let width = 64
+    let height = 64
+    let layout = try PyrowaveBlockLayout(width: width, height: height, chroma: .yuv420)
+    let requiredPackets = layout.descriptors.count / 2 + 1
+    let stream = try PyrowavePacketStreamDecoder(width: width, height: height, chroma: .yuv420, useMetalAcceleration: false)
+    var coefficients = Array(repeating: Int16(0), count: PyrowaveBitstream.coefficientBlockSize * PyrowaveBitstream.coefficientBlockSize)
+    coefficients[0] = 1
+
+    for descriptor in layout.descriptors.prefix(requiredPackets) {
+        let packet = try #require(try PyrowaveCoefficientBlockCodec.encodeBlock(
+            blockIndex: descriptor.blockIndex,
+            coefficients: coefficients,
+            stride: PyrowaveBitstream.coefficientBlockSize,
+            originX: 0,
+            originY: 0,
+            validWidth: PyrowaveBitstream.coefficientBlockSize,
+            validHeight: PyrowaveBitstream.coefficientBlockSize,
+            threshold: 0,
+            sequence: 4,
+            quantCode: try PyrowaveQuantization.encodeBlockScale(1.0 / 1024.0)
+        ))
+        try stream.pushPacket(EncodedPacket(data: packet))
+    }
+
+    #expect(!stream.decodeIsReady())
+    #expect(stream.decodeIsReady(allowPartialFrame: true))
+    let decoded = try stream.decode(allowPartialFrame: true)
+    #expect(decoded.width == width)
+    #expect(decoded.height == height)
+    #expect(decoded.chroma == .yuv420)
+}
+
 @Test func codecPreservesSequenceVideoSignalMetadata() throws {
     let source = try TestFrames.synthetic420(width: 64, height: 64)
     let frame = try YUVFrame(

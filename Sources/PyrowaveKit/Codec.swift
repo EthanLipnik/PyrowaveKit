@@ -37,6 +37,7 @@ public extension EncodedFrame {
 
 public final class PyrowavePacketStreamDecoder {
     private let codec: PyrowaveCodec
+    private let expectedFrame: ExpectedFrame?
     private var sequenceHeader: PyrowaveSequenceHeader?
     private var blockPackets = [Int: Data]()
     private var decodedFrameForCurrentSequence = false
@@ -44,6 +45,25 @@ public final class PyrowavePacketStreamDecoder {
 
     public init(useMetalAcceleration: Bool = true) {
         codec = PyrowaveCodec(useMetalAcceleration: useMetalAcceleration)
+        expectedFrame = nil
+    }
+
+    public init(
+        width: Int,
+        height: Int,
+        chroma: ChromaSubsampling,
+        videoSignal: VideoSignalMetadata = .default,
+        useMetalAcceleration: Bool = true
+    ) throws {
+        codec = PyrowaveCodec(useMetalAcceleration: useMetalAcceleration)
+        let layout = try PyrowaveBlockLayout(width: width, height: height, chroma: chroma)
+        expectedFrame = ExpectedFrame(
+            width: width,
+            height: height,
+            chroma: chroma,
+            videoSignal: videoSignal,
+            totalBlocks: layout.descriptors.count
+        )
     }
 
     public func clear() {
@@ -81,14 +101,17 @@ public final class PyrowavePacketStreamDecoder {
             guard packetEnd <= data.count else {
                 throw PyrowaveError.truncatedInput
             }
-            guard sequenceHeader != nil else {
-                throw PyrowaveError.invalidBitstream("coefficient packet before sequence header")
-            }
             if isStale(header.sequence) {
                 return
             }
             if lastSequence != header.sequence {
-                throw PyrowaveError.invalidBitstream("coefficient packet sequence has no matching sequence header")
+                guard let expectedFrame else {
+                    throw PyrowaveError.invalidBitstream("coefficient packet sequence has no matching sequence header")
+                }
+                try beginSequence(expectedFrame.sequenceHeader(sequence: header.sequence))
+            }
+            guard sequenceHeader != nil else {
+                throw PyrowaveError.invalidBitstream("coefficient packet before sequence header")
             }
 
             if blockPackets[header.blockIndex] == nil {
@@ -139,6 +162,25 @@ public final class PyrowavePacketStreamDecoder {
         }
         let diff = (Int(sequence) - Int(lastSequence)) & PyrowaveBitstream.sequenceCountMask
         return diff > PyrowaveBitstream.sequenceCountMask / 2
+    }
+
+    private struct ExpectedFrame {
+        var width: Int
+        var height: Int
+        var chroma: ChromaSubsampling
+        var videoSignal: VideoSignalMetadata
+        var totalBlocks: Int
+
+        func sequenceHeader(sequence: UInt8) throws -> PyrowaveSequenceHeader {
+            try PyrowaveSequenceHeader(
+                width: width,
+                height: height,
+                sequence: sequence,
+                totalBlocks: totalBlocks,
+                chroma: chroma,
+                videoSignal: videoSignal
+            )
+        }
     }
 }
 
