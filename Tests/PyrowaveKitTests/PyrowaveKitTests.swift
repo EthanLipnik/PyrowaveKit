@@ -575,6 +575,8 @@ import Metal
     #expect(arguments.outputDirectory.path.hasSuffix(".pyrowave-results"))
     #expect(arguments.maximumPyrowaveBytes == nil)
     #expect(arguments.matchHEVCFrameBudget)
+    #expect(arguments.requiredPyrowaveEncodeSpeedup == nil)
+    #expect(arguments.requiredPyrowaveDecodeSpeedup == nil)
     #expect(!arguments.shouldShowHelp)
 }
 
@@ -585,7 +587,9 @@ import Metal
         "--output-dir", ".pyrowave-results/custom",
         "--bitrate", "40000000",
         "--quantization-step", "0.002",
-        "--max-pyrowave-bytes", "123456"
+        "--max-pyrowave-bytes", "123456",
+        "--require-pyrowave-encode-speedup", "1.25",
+        "--require-pyrowave-decode-speedup", "1.5"
     ])
     #expect(custom.width == 3840)
     #expect(custom.height == 2160)
@@ -595,12 +599,20 @@ import Metal
     #expect(abs(custom.quantizationStep - 0.002) < 0.000001)
     #expect(custom.maximumPyrowaveBytes == 123_456)
     #expect(!custom.matchHEVCFrameBudget)
+    #expect(custom.requiredPyrowaveEncodeSpeedup == 1.25)
+    #expect(custom.requiredPyrowaveDecodeSpeedup == 1.5)
 
-    let size = try PyrowaveBenchmarkArguments(["--size", "1920x1080", "--unbounded-pyrowave"])
+    let size = try PyrowaveBenchmarkArguments([
+        "--size", "1920x1080",
+        "--unbounded-pyrowave",
+        "--require-pyrowave-faster-than-hevc"
+    ])
     #expect(size.width == 1920)
     #expect(size.height == 1080)
     #expect(size.maximumPyrowaveBytes == nil)
     #expect(!size.matchHEVCFrameBudget)
+    #expect(size.requiredPyrowaveEncodeSpeedup == 1)
+    #expect(size.requiredPyrowaveDecodeSpeedup == 1)
 }
 
 @Test func benchmarkArgumentsValidateInputsWithoutRunningBenchmark() throws {
@@ -613,10 +625,17 @@ import Metal
     #expect(throws: PyrowaveError.unsupportedFormat("unknown preset 8k")) {
         _ = try PyrowaveBenchmarkArguments(["--preset", "8k"])
     }
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try PyrowaveBenchmarkArguments(["--require-pyrowave-encode-speedup", "0"])
+    }
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try PyrowaveBenchmarkArguments(["--require-pyrowave-decode-speedup", "nan"])
+    }
 
     let help = try PyrowaveBenchmarkArguments(["--help"])
     #expect(help.shouldShowHelp)
     #expect(PyrowaveBenchmarkArguments.usage.contains("--preset 6k|4k|1080p|720p"))
+    #expect(PyrowaveBenchmarkArguments.usage.contains("--require-pyrowave-faster-than-hevc"))
 }
 
 @Test func benchmarkInputMustProvideRequestedFrameCount() throws {
@@ -690,6 +709,72 @@ import Metal
     let encoded = try JSONEncoder().encode(report)
     let decoded = try JSONDecoder().decode(PyrowaveBenchmarkReport.self, from: encoded)
     #expect(decoded == report)
+}
+
+@Test func benchmarkArgumentsValidateRequiredPyrowaveSpeedups() throws {
+    let pyrowave = CodecBenchmarkResult(
+        codec: "pyrowavekit-swift-metal",
+        frameCount: 60,
+        encodedBytes: 240,
+        encodeSeconds: 0.25,
+        decodeSeconds: 0.10,
+        metrics: nil,
+        note: nil
+    )
+    let hevc = CodecBenchmarkResult(
+        codec: "hevc_avkit",
+        frameCount: 60,
+        encodedBytes: 80,
+        encodeSeconds: 2.0,
+        decodeSeconds: 0.50,
+        metrics: nil,
+        note: nil
+    )
+    let report = PyrowaveBenchmarkReport(
+        generatedAt: "2026-07-03T00:00:00Z",
+        width: 1920,
+        height: 1080,
+        frames: 60,
+        frameRateNumerator: 60,
+        frameRateDenominator: 1,
+        bitrate: 20_000_000,
+        pyrowaveFrameBudgetBytes: 41_667,
+        pyrowave: pyrowave,
+        hevc: hevc,
+        comparison: CodecBenchmarkComparison(pyrowave: pyrowave, hevc: hevc)
+    )
+
+    try PyrowaveBenchmarkArguments([
+        "--require-pyrowave-encode-speedup", "8",
+        "--require-pyrowave-decode-speedup", "5"
+    ]).validate(report: report)
+
+    #expect(throws: PyrowaveError.processFailed("Pyrowave encode speedup over HEVC 8.0 is below required 8.1")) {
+        try PyrowaveBenchmarkArguments(["--require-pyrowave-encode-speedup", "8.1"]).validate(report: report)
+    }
+    #expect(throws: PyrowaveError.processFailed("Pyrowave decode speedup over HEVC 5.0 is below required 5.1")) {
+        try PyrowaveBenchmarkArguments(["--require-pyrowave-decode-speedup", "5.1"]).validate(report: report)
+    }
+
+    let unavailable = PyrowaveBenchmarkReport(
+        generatedAt: "2026-07-03T00:00:00Z",
+        width: 1920,
+        height: 1080,
+        frames: 0,
+        frameRateNumerator: 60,
+        frameRateDenominator: 1,
+        bitrate: 20_000_000,
+        pyrowaveFrameBudgetBytes: nil,
+        pyrowave: CodecBenchmarkResult(codec: "pyrowave", frameCount: 0, encodedBytes: 0, encodeSeconds: 0, decodeSeconds: 0, metrics: nil, note: nil),
+        hevc: CodecBenchmarkResult(codec: "hevc", frameCount: 0, encodedBytes: 0, encodeSeconds: 0, decodeSeconds: 0, metrics: nil, note: nil),
+        comparison: CodecBenchmarkComparison(
+            pyrowave: CodecBenchmarkResult(codec: "pyrowave", frameCount: 0, encodedBytes: 0, encodeSeconds: 0, decodeSeconds: 0, metrics: nil, note: nil),
+            hevc: CodecBenchmarkResult(codec: "hevc", frameCount: 0, encodedBytes: 0, encodeSeconds: 0, decodeSeconds: 0, metrics: nil, note: nil)
+        )
+    )
+    #expect(throws: PyrowaveError.processFailed("Pyrowave encode speedup over HEVC is unavailable")) {
+        try PyrowaveBenchmarkArguments(["--require-pyrowave-encode-speedup", "1"]).validate(report: unavailable)
+    }
 }
 
 @Test func pyrowaveBenchmarkRunnerWritesReviewArtifactsWithoutHEVC() throws {

@@ -108,7 +108,7 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
     public static let defaultFrames = 60
     public static let defaultBitrate = 80_000_000
     public static let defaultQuantizationStep: Float = 1.0 / 1024.0
-    public static let usage = "Usage: pyrowave-swift-bench [--input file.y4m] [--frames N] [--preset 6k|4k|1080p|720p] [--size WxH] [--output-dir DIR] [--bitrate BPS] [--quantization-step Q] [--max-pyrowave-bytes N|--unbounded-pyrowave]"
+    public static let usage = "Usage: pyrowave-swift-bench [--input file.y4m] [--frames N] [--preset 6k|4k|1080p|720p] [--size WxH] [--output-dir DIR] [--bitrate BPS] [--quantization-step Q] [--max-pyrowave-bytes N|--unbounded-pyrowave] [--require-pyrowave-faster-than-hevc|--require-pyrowave-encode-speedup X|--require-pyrowave-decode-speedup X]"
 
     public var input: URL?
     public var frames: Int
@@ -119,6 +119,8 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
     public var quantizationStep: Float
     public var maximumPyrowaveBytes: Int?
     public var matchHEVCFrameBudget: Bool
+    public var requiredPyrowaveEncodeSpeedup: Double?
+    public var requiredPyrowaveDecodeSpeedup: Double?
     public var shouldShowHelp: Bool
 
     public init(_ arguments: [String] = Array(CommandLine.arguments.dropFirst())) throws {
@@ -131,6 +133,8 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
         quantizationStep = Self.defaultQuantizationStep
         maximumPyrowaveBytes = nil
         matchHEVCFrameBudget = true
+        requiredPyrowaveEncodeSpeedup = nil
+        requiredPyrowaveDecodeSpeedup = nil
         shouldShowHelp = false
 
         var iterator = arguments.makeIterator()
@@ -177,6 +181,13 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
             case "--unbounded-pyrowave":
                 maximumPyrowaveBytes = nil
                 matchHEVCFrameBudget = false
+            case "--require-pyrowave-faster-than-hevc":
+                requiredPyrowaveEncodeSpeedup = max(requiredPyrowaveEncodeSpeedup ?? 1.0, 1.0)
+                requiredPyrowaveDecodeSpeedup = max(requiredPyrowaveDecodeSpeedup ?? 1.0, 1.0)
+            case "--require-pyrowave-encode-speedup":
+                requiredPyrowaveEncodeSpeedup = try Self.parsePositiveDouble(iterator.next())
+            case "--require-pyrowave-decode-speedup":
+                requiredPyrowaveDecodeSpeedup = try Self.parsePositiveDouble(iterator.next())
             case "--help", "-h":
                 shouldShowHelp = true
             default:
@@ -185,6 +196,44 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
         }
         guard shouldShowHelp || (frames > 0 && width > 0 && height > 0 && bitrate > 0 && quantizationStep > 0) else {
             throw PyrowaveError.invalidDimensions
+        }
+    }
+
+    public func validate(report: PyrowaveBenchmarkReport) throws {
+        if let requiredPyrowaveEncodeSpeedup {
+            try Self.validate(
+                report.comparison.pyrowaveEncodeSpeedupOverHEVC,
+                minimum: requiredPyrowaveEncodeSpeedup,
+                label: "encode"
+            )
+        }
+        if let requiredPyrowaveDecodeSpeedup {
+            try Self.validate(
+                report.comparison.pyrowaveDecodeSpeedupOverHEVC,
+                minimum: requiredPyrowaveDecodeSpeedup,
+                label: "decode"
+            )
+        }
+    }
+
+    private static func parsePositiveDouble(_ value: String?) throws -> Double {
+        guard let value,
+              let parsed = Double(value),
+              parsed.isFinite,
+              parsed > 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        return parsed
+    }
+
+    private static func validate(_ measured: Double?, minimum: Double, label: String) throws {
+        guard let measured, measured.isFinite else {
+            throw PyrowaveError.processFailed("Pyrowave \(label) speedup over HEVC is unavailable")
+        }
+        guard measured >= minimum else {
+            throw PyrowaveError.processFailed(
+                "Pyrowave \(label) speedup over HEVC \(measured) is below required \(minimum)"
+            )
         }
     }
 
@@ -476,6 +525,7 @@ public enum PyrowaveBenchmarkCLI {
         let reportData = try encoder.encode(report)
         let reportURL = arguments.outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.report)
         try reportData.write(to: reportURL)
+        try arguments.validate(report: report)
         return reportURL
     }
 }
