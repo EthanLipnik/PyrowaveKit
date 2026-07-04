@@ -14,6 +14,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     private let quantizePlaneTilesPipeline: MTLComputePipelineState
     private let sparseApplyPipeline: MTLComputePipelineState
     private let rateControlStatsPipeline: MTLComputePipelineState
+    private let packetByteCostsPipeline: MTLComputePipelineState
     private let dwtLiftRowsPipeline: MTLComputePipelineState
     private let dwtLiftColumnsPipeline: MTLComputePipelineState
     private let dwtPackRowsPipeline: MTLComputePipelineState
@@ -49,6 +50,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         quantizePlaneTilesPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize_plane_tiles", library: library))
         sparseApplyPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_apply_sparse_coefficients", library: library))
         rateControlStatsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_tile_stats", library: library))
+        packetByteCostsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_packet_byte_costs", library: library))
         dwtLiftRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_rows", library: library))
         dwtLiftColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_columns", library: library))
         dwtPackRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_pack_rows", library: library))
@@ -363,6 +365,58 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
             let start = index * PyrowaveBlockStats.candidateCount
             let end = start + PyrowaveBlockStats.candidateCount
             return MetalRateControlTileStats(numPlanes: metalNumPlanes[index], stats: Array(metalStats[start..<end]))
+        }
+    }
+
+    func packetByteCosts(
+        coefficients: [Int16],
+        descriptors: [MetalPacketByteCostDescriptor]
+    ) throws -> [[Int]] {
+        guard !coefficients.isEmpty else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard !descriptors.isEmpty else {
+            return []
+        }
+        guard descriptors.count <= Int(UInt32.max) else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        let byteCosts = Array(repeating: UInt32(0), count: descriptors.count * PyrowaveBlockStats.candidateCount)
+        guard let coefficientBuffer = device.makeBuffer(bytes: coefficients, length: coefficients.count * MemoryLayout<Int16>.stride, options: .storageModeShared),
+              let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptors.count * MemoryLayout<MetalPacketByteCostDescriptor>.stride, options: .storageModeShared),
+              let byteCostBuffer = device.makeBuffer(bytes: byteCosts, length: byteCosts.count * MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal packet byte-cost buffers")
+        }
+
+        var constants = PacketByteCostConstants(descriptorCount: UInt32(descriptors.count))
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal packet byte-cost command encoder")
+        }
+
+        encoder.setComputePipelineState(packetByteCostsPipeline)
+        encoder.setBuffer(coefficientBuffer, offset: 0, index: 0)
+        encoder.setBuffer(descriptorBuffer, offset: 0, index: 1)
+        encoder.setBuffer(byteCostBuffer, offset: 0, index: 2)
+        encoder.setBytes(&constants, length: MemoryLayout<PacketByteCostConstants>.stride, index: 3)
+        let width = min(packetByteCostsPipeline.maxTotalThreadsPerThreadgroup, 256)
+        encoder.dispatchThreads(
+            MTLSize(width: descriptors.count, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal packet byte-cost command failed: \(error)")
+        }
+
+        let pointer = byteCostBuffer.contents().bindMemory(to: UInt32.self, capacity: byteCosts.count)
+        let flatCosts = Array(UnsafeBufferPointer(start: pointer, count: byteCosts.count))
+        return Swift.stride(from: 0, to: flatCosts.count, by: PyrowaveBlockStats.candidateCount).map {
+            flatCosts[$0..<$0 + PyrowaveBlockStats.candidateCount].map(Int.init)
         }
     }
 
@@ -785,6 +839,14 @@ struct MetalRateControlTileStats {
     var stats: [MetalRateControlQuantStats]
 }
 
+struct MetalPacketByteCostDescriptor {
+    var originX: UInt32
+    var originY: UInt32
+    var validWidth: UInt32
+    var validHeight: UInt32
+    var stride: UInt32
+}
+
 private struct PadPlaneConstants {
     var sourceWidth: UInt32
     var sourceHeight: UInt32
@@ -808,6 +870,10 @@ private struct SparseApplyConstants {
 }
 
 private struct RateControlStatsConstants {
+    var descriptorCount: UInt32
+}
+
+private struct PacketByteCostConstants {
     var descriptorCount: UInt32
 }
 
@@ -855,6 +921,13 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         coefficients: [Int16],
         descriptors: [MetalRateControlStatsDescriptor]
     ) throws -> [MetalRateControlTileStats] {
+        throw PyrowaveError.externalToolUnavailable("Metal")
+    }
+
+    func packetByteCosts(
+        coefficients: [Int16],
+        descriptors: [MetalPacketByteCostDescriptor]
+    ) throws -> [[Int]] {
         throw PyrowaveError.externalToolUnavailable("Metal")
     }
 
@@ -908,5 +981,13 @@ struct MetalRateControlQuantStats {
 struct MetalRateControlTileStats {
     var numPlanes: UInt32
     var stats: [MetalRateControlQuantStats]
+}
+
+struct MetalPacketByteCostDescriptor {
+    var originX: UInt32
+    var originY: UInt32
+    var validWidth: UInt32
+    var validHeight: UInt32
+    var stride: UInt32
 }
 #endif

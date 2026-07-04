@@ -65,6 +65,18 @@ struct RateControlStatsConstants {
     uint descriptorCount;
 };
 
+struct PacketByteCostDescriptor {
+    uint originX;
+    uint originY;
+    uint validWidth;
+    uint validHeight;
+    uint stride;
+};
+
+struct PacketByteCostConstants {
+    uint descriptorCount;
+};
+
 struct DWTConstants {
     uint activeWidth;
     uint activeHeight;
@@ -197,6 +209,10 @@ static inline uint pyrowave_significant_bit_count(uint value) {
         bits += 1u;
     }
     return bits;
+}
+
+static inline uint2 pyrowave_coordinate_in_8x8(uint subblock, uint pixel) {
+    return uint2((subblock / 4u) * 4u + (pixel >> 1u), (subblock % 4u) * 2u + (pixel & 1u));
 }
 
 kernel void pyrowave_quantize_plane_tiles(
@@ -342,6 +358,92 @@ kernel void pyrowave_rate_control_tile_stats(
             encodeCostBits += retainedValues;
         }
         stats[statsOffset + quantLevel] = RateControlQuantStats{squareError, encodeCostBits};
+    }
+}
+
+kernel void pyrowave_packet_byte_costs(
+    device const short *coefficients [[buffer(0)]],
+    device const PacketByteCostDescriptor *descriptors [[buffer(1)]],
+    device uint *byteCosts [[buffer(2)]],
+    constant PacketByteCostConstants &constants [[buffer(3)]],
+    uint descriptorIndex [[thread_position_in_grid]]
+) {
+    if (descriptorIndex >= constants.descriptorCount) {
+        return;
+    }
+
+    PacketByteCostDescriptor descriptor = descriptors[descriptorIndex];
+    uint outputOffset = descriptorIndex * 15u;
+    for (uint quantLevel = 0u; quantLevel < 15u; ++quantLevel) {
+        bool activeSmallBlocks[16];
+        uint activeBlockCount = 0u;
+        for (uint smallBlock = 0u; smallBlock < 16u; ++smallBlock) {
+            activeSmallBlocks[smallBlock] = false;
+        }
+
+        for (uint y = 0u; y < descriptor.validHeight; ++y) {
+            uint row = (descriptor.originY + y) * descriptor.stride + descriptor.originX;
+            for (uint x = 0u; x < descriptor.validWidth; ++x) {
+                int value = int(coefficients[row + x]);
+                uint magnitude = uint(abs(value)) >> quantLevel;
+                if (magnitude != 0u) {
+                    uint smallBlock = (y / 8u) * 4u + (x / 8u);
+                    if (!activeSmallBlocks[smallBlock]) {
+                        activeSmallBlocks[smallBlock] = true;
+                        activeBlockCount += 1u;
+                    }
+                }
+            }
+        }
+
+        if (activeBlockCount == 0u) {
+            byteCosts[outputOffset + quantLevel] = 0u;
+            continue;
+        }
+
+        uint magnitudePayloadBytes = 0u;
+        uint signCount = 0u;
+
+        for (uint smallBlock = 0u; smallBlock < 16u; ++smallBlock) {
+            if (!activeSmallBlocks[smallBlock]) {
+                continue;
+            }
+
+            uint smallOriginX = (smallBlock % 4u) * 8u;
+            uint smallOriginY = (smallBlock / 4u) * 8u;
+            uint bitWidths[8];
+            uint maxBitWidth = 0u;
+
+            for (uint subblock = 0u; subblock < 8u; ++subblock) {
+                uint maxMagnitude = 0u;
+                for (uint pixel = 0u; pixel < 8u; ++pixel) {
+                    uint2 coord = pyrowave_coordinate_in_8x8(subblock, pixel);
+                    uint x = smallOriginX + coord.x;
+                    uint y = smallOriginY + coord.y;
+                    uint magnitude = 0u;
+                    if (x < descriptor.validWidth && y < descriptor.validHeight) {
+                        uint index = (descriptor.originY + y) * descriptor.stride + descriptor.originX + x;
+                        magnitude = uint(abs(int(coefficients[index]))) >> quantLevel;
+                    }
+                    maxMagnitude = max(maxMagnitude, magnitude);
+                    if (magnitude != 0u) {
+                        signCount += 1u;
+                    }
+                }
+                uint width = pyrowave_significant_bit_count(maxMagnitude);
+                bitWidths[subblock] = width;
+                maxBitWidth = max(maxBitWidth, width);
+            }
+
+            uint basePlanes = maxBitWidth > 3u ? maxBitWidth - 3u : 0u;
+            for (uint subblock = 0u; subblock < 8u; ++subblock) {
+                magnitudePayloadBytes += max(bitWidths[subblock], basePlanes);
+            }
+        }
+
+        uint signPayloadBytes = (signCount + 7u) / 8u;
+        uint unpaddedSize = 8u + activeBlockCount * 2u + activeBlockCount + magnitudePayloadBytes + signPayloadBytes;
+        byteCosts[outputOffset + quantLevel] = ((unpaddedSize + 3u) / 4u) * 4u;
     }
 }
 

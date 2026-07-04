@@ -584,12 +584,23 @@ public final class PyrowaveCodec: Sendable {
         guard tileStats.count == metalDescriptors.count else {
             throw PyrowaveError.processFailed("Metal rate-control returned \(tileStats.count) tile stats for \(metalDescriptors.count) descriptors")
         }
+        let packetCostDescriptors = descriptors.map {
+            MetalPacketByteCostDescriptor(
+                originX: UInt32($0.originX),
+                originY: UInt32($0.originY),
+                validWidth: UInt32($0.validWidth),
+                validHeight: UInt32($0.validHeight),
+                stride: UInt32(plane.paddedWidth)
+            )
+        }
+        let packetByteCosts = try backend.packetByteCosts(coefficients: plane.coefficients, descriptors: packetCostDescriptors)
+        guard packetByteCosts.count == descriptors.count else {
+            throw PyrowaveError.processFailed("Metal packet byte-cost returned \(packetByteCosts.count) block costs for \(descriptors.count) descriptors")
+        }
 
         var blocks = [PyrowaveRateControlBlock]()
         blocks.reserveCapacity(descriptors.count)
         for (descriptorIndex, descriptor) in descriptors.enumerated() {
-            let quantCode = try quantCode(for: descriptor, plane: plane)
-            let qScaleCodes = try qScaleCodes(for: descriptor, plane: plane)
             let firstTile = descriptorIndex * 16
             let eightByEightStats = try tileStats[firstTile..<(firstTile + 16)].map { tile -> PyrowaveBlockStats in
                 guard tile.stats.count == PyrowaveBlockStats.candidateCount else {
@@ -602,21 +613,10 @@ public final class PyrowaveCodec: Sendable {
                     }
                 )
             }
-            let packetByteCosts = try PyrowaveRateController.makePacketByteCosts(
-                blockIndex: descriptor.blockIndex,
-                coefficients: plane.coefficients,
-                stride: plane.paddedWidth,
-                originX: descriptor.originX,
-                originY: descriptor.originY,
-                validWidth: descriptor.validWidth,
-                validHeight: descriptor.validHeight,
-                quantCode: quantCode,
-                qScaleCodes: qScaleCodes
-            )
             blocks.append(PyrowaveRateControlBlock(
                 blockIndex: descriptor.blockIndex,
                 eightByEightStats: eightByEightStats,
-                packetByteCosts: packetByteCosts
+                packetByteCosts: packetByteCosts[descriptorIndex]
             ))
         }
         return blocks

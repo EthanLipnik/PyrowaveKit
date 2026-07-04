@@ -349,6 +349,7 @@ import Testing
         _ = try backend.makeFunction(named: "pyrowave_quantize_plane_tiles")
         _ = try backend.makeFunction(named: "pyrowave_apply_sparse_coefficients")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_tile_stats")
+        _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs")
     } catch PyrowaveError.externalToolUnavailable {
         return
     }
@@ -519,6 +520,61 @@ import Testing
             #expect(abs(converted.squareError - cpuStat.squareError) < 0.0001)
         }
     }
+    #endif
+}
+
+@Test func metalPacketByteCostsMatchCPUReferenceWhenDeviceExists() throws {
+    #if canImport(Metal)
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let stride = 40
+    var coefficients = Array(repeating: Int16(0), count: stride * 36)
+    for y in 0..<27 {
+        for x in 0..<29 {
+            let raw = ((x * 43 + y * 17 + x * y * 3) % 511) - 255
+            coefficients[(2 + y) * stride + 3 + x] = Int16(raw)
+        }
+    }
+    let quantCode = try PyrowaveQuantization.encodeBlockScale(1.0 / 1024.0)
+    let qScaleCodes = (0..<16).map { UInt8(($0 * 5) % 16) }
+    let descriptors = [
+        MetalPacketByteCostDescriptor(
+            originX: 3,
+            originY: 2,
+            validWidth: 29,
+            validHeight: 27,
+            stride: UInt32(stride)
+        ),
+        MetalPacketByteCostDescriptor(
+            originX: 0,
+            originY: 32,
+            validWidth: 32,
+            validHeight: 4,
+            stride: UInt32(stride)
+        )
+    ]
+
+    let metal = try backend.packetByteCosts(coefficients: coefficients, descriptors: descriptors)
+    let cpu = try PyrowaveRateController.makePacketByteCosts(
+        blockIndex: 11,
+        coefficients: coefficients,
+        stride: stride,
+        originX: 3,
+        originY: 2,
+        validWidth: 29,
+        validHeight: 27,
+        quantCode: quantCode,
+        qScaleCodes: qScaleCodes
+    )
+
+    #expect(metal.count == descriptors.count)
+    #expect(metal[0] == cpu)
+    #expect(metal[1] == Array(repeating: 0, count: PyrowaveBlockStats.candidateCount))
     #endif
 }
 
