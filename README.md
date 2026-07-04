@@ -9,7 +9,7 @@ The codec remains intra-only and wavelet based. It targets low-latency local vid
 - macOS 14 or newer
 - Swift 6 toolchain
 - Metal-capable Apple GPU
-- Optional: `ffmpeg` with VideoToolbox support for HEVC comparison benchmarks
+- AVKit/AVFoundation-capable Apple platform runtime for HEVC comparison benchmarks
 
 ## Build
 
@@ -28,10 +28,10 @@ The test suite covers the Swift packet format, packet stream decoding, mirrored 
 
 ## Benchmark
 
-The benchmark executable compares PyrowaveKit against a VideoToolbox HEVC encode/decode path through `ffmpeg`:
+The benchmark executable compares PyrowaveKit against a multi-frame HEVC encode/decode path using AVKit and AVFoundation:
 
 ```shell
-swift run -c release pyrowave-swift-bench --frames 60 --preset 1080p --output .pyrowave-results
+swift run -c release pyrowave-swift-bench --frames 60 --preset 1080p --output-dir .pyrowave-results
 ```
 
 Outputs are written to `.pyrowave-results/`, which is git ignored. The benchmark report is saved as `.pyrowave-results/benchmark-report.json` alongside the generated reference, Pyrowave, HEVC, and decoded sample artifacts.

@@ -150,14 +150,20 @@ import Testing
     }
 }
 
-@Test func hevcComparisonUsesExactFrameRateArgument() throws {
-    #expect(try HEVCComparison.frameRateArgument(numerator: 60, denominator: 1) == "60")
-    #expect(try HEVCComparison.frameRateArgument(numerator: 30000, denominator: 1001) == "30000/1001")
+@Test func hevcComparisonUsesExactFrameDuration() throws {
+    let sixty = try HEVCComparison.frameDuration(numerator: 60, denominator: 1)
+    #expect(sixty.value == 1)
+    #expect(sixty.timescale == 60)
+
+    let ntsc = try HEVCComparison.frameDuration(numerator: 30000, denominator: 1001)
+    #expect(ntsc.value == 1001)
+    #expect(ntsc.timescale == 30000)
+
     #expect(throws: PyrowaveError.invalidDimensions) {
-        _ = try HEVCComparison.frameRateArgument(numerator: 0, denominator: 1)
+        _ = try HEVCComparison.frameDuration(numerator: 0, denominator: 1)
     }
     #expect(throws: PyrowaveError.invalidDimensions) {
-        _ = try HEVCComparison.frameRateArgument(numerator: 60, denominator: 0)
+        _ = try HEVCComparison.frameDuration(numerator: 60, denominator: 0)
     }
 }
 

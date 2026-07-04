@@ -173,8 +173,8 @@ do {
         maximumEncodedBytes: pyrowaveBudget
     )
     let pyrowave = try runPyrowave(loaded: loaded, configuration: configuration, outputDirectory: arguments.outputDirectory)
-    let hevc = try HEVCComparison.runFFmpegVideoToolboxComparison(
-        reference: frames[0],
+    let hevc = try HEVCComparison.runAVKitHEVCComparison(
+        referenceFrames: frames,
         workingDirectory: arguments.outputDirectory,
         bitrate: arguments.bitrate,
         frameRateNumerator: loaded.frameRateNumerator,
