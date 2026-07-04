@@ -135,6 +135,9 @@ public struct PyrowaveStreamWriter {
 
     public init(url: URL, header: PyrowaveStreamHeader) throws {
         self.header = header
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
         FileManager.default.createFile(atPath: url.path, contents: nil)
         handle = try FileHandle(forWritingTo: url)
         try handle.write(contentsOf: Data("PYROWAVE".utf8))

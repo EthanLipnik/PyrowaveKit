@@ -391,6 +391,52 @@ import Testing
     #expect(decoded == report)
 }
 
+@Test func pyrowaveBenchmarkRunnerWritesReviewArtifactsWithoutHEVC() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let frames = [
+        try TestFrames.synthetic420(width: 96, height: 64, frameIndex: 0),
+        try TestFrames.synthetic420(width: 96, height: 64, frameIndex: 1)
+    ]
+    let loaded = try PyrowaveBenchmarkFrames(
+        frames: frames,
+        frameRateNumerator: 60,
+        frameRateDenominator: 1,
+        bitDepth: 8
+    )
+
+    let result = try PyrowaveBenchmarkRunner.runPyrowave(
+        loaded: loaded,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0),
+        outputDirectory: directory,
+        useMetalAcceleration: false
+    )
+
+    #expect(result.codec == PyrowaveBenchmarkRunner.pyrowaveCodecName)
+    #expect(result.frameCount == frames.count)
+    #expect(result.encodedBytes > 0)
+    #expect(result.metrics?.weightedPSNR ?? 0 > 40)
+    #expect(result.note == PyrowaveBenchmarkRunner.pyrowaveImplementationNote)
+
+    let streamURL = directory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.pyrowaveStream)
+    var streamReader = try PyrowaveStreamReader(url: streamURL)
+    #expect(streamReader.header.width == 96)
+    #expect(streamReader.header.height == 64)
+    #expect(streamReader.header.frameRateNumerator == 60)
+    #expect(streamReader.header.frameRateDenominator == 1)
+    #expect(try streamReader.readFrame() != nil)
+    #expect(try streamReader.readFrame() != nil)
+    #expect(try streamReader.readFrame() == nil)
+
+    let decodedURL = directory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.pyrowaveDecodedY4M)
+    var decodedReader = try YUV4MPEGReader(url: decodedURL)
+    #expect(decodedReader.frameRateNumerator == 60)
+    #expect(decodedReader.frameRateDenominator == 1)
+    #expect(try decodedReader.readFrame() != nil)
+    #expect(try decodedReader.readFrame() != nil)
+    #expect(try decodedReader.readFrame() == nil)
+}
+
 @Test func codecBenchmarkComparisonReportsHEVCDeltas() throws {
     let pyrowave = CodecBenchmarkResult(
         codec: "pyrowave",

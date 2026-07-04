@@ -9,6 +9,31 @@ public enum PyrowaveBenchmarkArtifactNames {
     public static let report = "benchmark-report.json"
 }
 
+public struct PyrowaveBenchmarkFrames: Equatable, Sendable {
+    public var frames: [YUVFrame]
+    public var frameRateNumerator: Int
+    public var frameRateDenominator: Int
+    public var bitDepth: Int
+
+    public init(
+        frames: [YUVFrame],
+        frameRateNumerator: Int,
+        frameRateDenominator: Int,
+        bitDepth: Int
+    ) throws {
+        guard !frames.isEmpty,
+              frameRateNumerator > 0,
+              frameRateDenominator > 0,
+              [8, 10, 12, 14, 16].contains(bitDepth) else {
+            throw PyrowaveError.invalidDimensions
+        }
+        self.frames = frames
+        self.frameRateNumerator = frameRateNumerator
+        self.frameRateDenominator = frameRateDenominator
+        self.bitDepth = bitDepth
+    }
+}
+
 public struct PyrowaveBenchmarkArtifacts: Codable, Equatable, Sendable {
     public var referenceY4M: String
     public var pyrowaveStream: String
@@ -178,5 +203,88 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
         default:
             throw PyrowaveError.unsupportedFormat("unknown preset \(value)")
         }
+    }
+}
+
+public enum PyrowaveBenchmarkRunner {
+    public static let pyrowaveCodecName = "pyrowavekit-swift-metal-hybrid"
+    public static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane pad/crop, DWT/iDWT, block quantization, sparse packet byte-cost prefiltering, sparse decode apply, rate-control stats, 32x32 sparse packets, and optional frame-size cap"
+
+    public static func loadFrames(arguments: PyrowaveBenchmarkArguments) throws -> PyrowaveBenchmarkFrames {
+        if let input = arguments.input {
+            var reader = try YUV4MPEGReader(url: input)
+            var frames = [YUVFrame]()
+            while frames.count < arguments.frames, let frame = try reader.readFrame() {
+                frames.append(frame)
+            }
+            return try PyrowaveBenchmarkFrames(
+                frames: frames,
+                frameRateNumerator: reader.frameRateNumerator,
+                frameRateDenominator: reader.frameRateDenominator,
+                bitDepth: reader.bitDepth
+            )
+        }
+
+        let frames = try (0..<arguments.frames).map {
+            try TestFrames.synthetic420(width: arguments.width, height: arguments.height, frameIndex: $0)
+        }
+        return try PyrowaveBenchmarkFrames(frames: frames, frameRateNumerator: 60, frameRateDenominator: 1, bitDepth: 8)
+    }
+
+    public static func runPyrowave(
+        loaded: PyrowaveBenchmarkFrames,
+        configuration: CodecConfiguration,
+        outputDirectory: URL,
+        useMetalAcceleration: Bool = true
+    ) throws -> CodecBenchmarkResult {
+        let codec = try PyrowaveCodec(useMetalAcceleration: useMetalAcceleration)
+        let frames = loaded.frames
+        var encodedFrames = [EncodedFrame]()
+        encodedFrames.reserveCapacity(frames.count)
+
+        var stopwatch = Stopwatch()
+        for frame in frames {
+            encodedFrames.append(try codec.encode(frame, configuration: configuration))
+        }
+        let encodeSeconds = stopwatch.lapSeconds()
+
+        var decodedFrames = [YUVFrame]()
+        decodedFrames.reserveCapacity(frames.count)
+        for frame in encodedFrames {
+            decodedFrames.append(try codec.decode(frame))
+        }
+        let decodeSeconds = stopwatch.lapSeconds()
+
+        let encodedBytes = encodedFrames.reduce(0) { $0 + $1.data.count }
+        let streamURL = outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.pyrowaveStream)
+        var stream = try PyrowaveStreamWriter(
+            url: streamURL,
+            header: PyrowaveStreamHeader(
+                frame: frames[0],
+                frameRateNumerator: loaded.frameRateNumerator,
+                frameRateDenominator: loaded.frameRateDenominator,
+                bitDepth: loaded.bitDepth
+            )
+        )
+        for frame in encodedFrames {
+            try stream.writeFrame(frame)
+        }
+        try YUV4MPEGWriter.write(
+            frames: decodedFrames,
+            to: outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.pyrowaveDecodedY4M),
+            frameRateNumerator: loaded.frameRateNumerator,
+            frameRateDenominator: loaded.frameRateDenominator
+        )
+
+        let metric = try Metrics.compare(frames, decodedFrames)
+        return CodecBenchmarkResult(
+            codec: pyrowaveCodecName,
+            frameCount: frames.count,
+            encodedBytes: encodedBytes,
+            encodeSeconds: encodeSeconds,
+            decodeSeconds: decodeSeconds,
+            metrics: metric,
+            note: pyrowaveImplementationNote
+        )
     }
 }
