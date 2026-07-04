@@ -151,13 +151,33 @@ import Testing
     #expect(sequence.width == frame.width)
     #expect(sequence.height == frame.height)
     #expect(sequence.chroma == .yuv420)
-    #expect(sequence.sequence == 0)
+    #expect(sequence.sequence == 1)
     #expect(sequence.totalBlocks > 0)
 
     encoded[3] &= 0x7f
     #expect(throws: PyrowaveError.invalidBitstream("sequence header missing extended bit")) {
         _ = try codec.decode(EncodedFrame(data: encoded))
     }
+}
+
+@Test func codecAdvancesPyrowaveSequenceCounterModuloEight() throws {
+    let frame = try TestFrames.synthetic420(width: 64, height: 64)
+    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    var observedSequences = [UInt8]()
+
+    for _ in 0..<9 {
+        let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
+        var reader = BinaryReader(encoded.data)
+        let sequence = try PyrowaveSequenceHeader(reader: &reader)
+        observedSequences.append(sequence.sequence)
+
+        while reader.offset < encoded.data.count {
+            let block = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
+            #expect(block.sequence == sequence.sequence)
+        }
+    }
+
+    #expect(observedSequences == [1, 2, 3, 4, 5, 6, 7, 0, 1])
 }
 
 @Test func codecPreservesSequenceVideoSignalMetadata() throws {

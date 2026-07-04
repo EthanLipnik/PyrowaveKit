@@ -4,6 +4,7 @@ public final class PyrowaveCodec: Sendable {
     private static let sparseBlockSize = 32
 
     private let metalBackend: MetalPyrowaveBackend?
+    private let sequenceCounter = SequenceCounter()
 
     public init(useMetalAcceleration: Bool = true) {
         if useMetalAcceleration {
@@ -20,6 +21,7 @@ public final class PyrowaveCodec: Sendable {
             throw PyrowaveError.invalidDimensions
         }
 
+        let sequenceNumber = sequenceCounter.next()
         let layout = try PyrowaveBlockLayout(width: frame.width, height: frame.height, chroma: frame.chroma)
         let encodedPlanes = [
             try encodePlane(frame.y, component: 0, frameWidth: frame.width, frameHeight: frame.height, chroma: frame.chroma, layout: layout, configuration: configuration),
@@ -36,6 +38,7 @@ public final class PyrowaveCodec: Sendable {
             try sparseBlocks(
                 plane,
                 layout: layout,
+                sequence: sequenceNumber,
                 quantLevels: rateControlPlan.quantLevelsByPlane?[index],
                 defaultQuantLevel: rateControlPlan.defaultQuantLevel
             )
@@ -46,7 +49,7 @@ public final class PyrowaveCodec: Sendable {
         let sequence = try PyrowaveSequenceHeader(
             width: frame.width,
             height: frame.height,
-            sequence: 0,
+            sequence: sequenceNumber,
             totalBlocks: sortedBlocks.count,
             chroma: frame.chroma,
             videoSignal: frame.videoSignal
@@ -159,6 +162,18 @@ public final class PyrowaveCodec: Sendable {
         var requestedLevels: Int
     }
 
+    private final class SequenceCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: UInt8 = 0
+
+        func next() -> UInt8 {
+            lock.lock()
+            defer { lock.unlock() }
+            value = (value + 1) & UInt8(PyrowaveBitstream.sequenceCountMask)
+            return value
+        }
+    }
+
     private func encodePlane(
         _ plane: Plane8,
         component: Int,
@@ -244,6 +259,7 @@ public final class PyrowaveCodec: Sendable {
     private func sparseBlocks(
         _ plane: EncodedPlane,
         layout: PyrowaveBlockLayout,
+        sequence: UInt8 = 0,
         quantLevels: [Int]? = nil,
         defaultQuantLevel: Int
     ) throws -> [SparseBlock] {
@@ -267,6 +283,7 @@ public final class PyrowaveCodec: Sendable {
                 validHeight: descriptor.validHeight,
                 threshold: 0,
                 quantLevel: quantLevel,
+                sequence: sequence,
                 quantCode: try quantCode(for: descriptor, plane: plane),
                 qScaleCodes: try qScaleCodes(for: descriptor, plane: plane)
             ) {
