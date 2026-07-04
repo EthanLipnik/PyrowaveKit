@@ -69,8 +69,11 @@ public struct PyrowaveStreamHeader: Codable, Equatable, Sendable {
               (formatCode < 2) == (decodedBitDepth == 8) else {
             throw PyrowaveError.invalidBitstream("bad stream bit depth")
         }
-        guard let range = YCbCrRange(rawValue: UInt8(clamping: words[4])),
-              let siting = ChromaSiting(rawValue: UInt8(clamping: words[7])) else {
+        guard let colorPrimaries = ColorPrimaries(rawValue: UInt8((words[4] >> 0) & 0x1)),
+              let transferFunction = TransferFunction(rawValue: UInt8((words[4] >> 1) & 0x1)),
+              let yCbCrTransform = YCbCrTransform(rawValue: UInt8((words[4] >> 2) & 0x1)),
+              let range = YCbCrRange(rawValue: UInt8((words[4] >> 3) & 0x1)),
+              let siting = ChromaSiting(rawValue: UInt8((words[4] >> 4) & 0x1)) else {
             throw PyrowaveError.invalidBitstream("bad stream video metadata")
         }
 
@@ -78,7 +81,13 @@ public struct PyrowaveStreamHeader: Codable, Equatable, Sendable {
             width: Int(words[0]),
             height: Int(words[1]),
             chroma: decodedChroma,
-            videoSignal: VideoSignalMetadata(yCbCrRange: range, chromaSiting: siting),
+            videoSignal: VideoSignalMetadata(
+                colorPrimaries: colorPrimaries,
+                transferFunction: transferFunction,
+                yCbCrTransform: yCbCrTransform,
+                yCbCrRange: range,
+                chromaSiting: siting
+            ),
             frameRateNumerator: Int(words[5]),
             frameRateDenominator: Int(words[6]),
             bitDepth: decodedBitDepth
@@ -91,11 +100,19 @@ public struct PyrowaveStreamHeader: Codable, Equatable, Sendable {
             UInt32(height),
             UInt32(formatCode),
             UInt32(bitDepth),
-            UInt32(videoSignal.yCbCrRange.rawValue),
+            packedVideoSignal,
             UInt32(frameRateNumerator),
             UInt32(frameRateDenominator),
-            UInt32(videoSignal.chromaSiting.rawValue)
+            0
         ]
+    }
+
+    private var packedVideoSignal: UInt32 {
+        UInt32(videoSignal.colorPrimaries.rawValue) << 0 |
+            UInt32(videoSignal.transferFunction.rawValue) << 1 |
+            UInt32(videoSignal.yCbCrTransform.rawValue) << 2 |
+            UInt32(videoSignal.yCbCrRange.rawValue) << 3 |
+            UInt32(videoSignal.chromaSiting.rawValue) << 4
     }
 
     private var formatCode: Int {

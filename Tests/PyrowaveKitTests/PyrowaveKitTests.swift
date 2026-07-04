@@ -434,6 +434,38 @@ import Testing
     #expect(try reader.readFrame() == encoded)
 }
 
+@Test func pyrowaveStreamFilePreservesVideoSignalMetadata() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("video-signal.pwks")
+    let source = try TestFrames.synthetic420(width: 96, height: 64)
+    let frame = try YUVFrame(
+        width: source.width,
+        height: source.height,
+        chroma: source.chroma,
+        y: source.y,
+        cb: source.cb,
+        cr: source.cr,
+        videoSignal: VideoSignalMetadata(
+            colorPrimaries: .bt2020,
+            transferFunction: .pq,
+            yCbCrTransform: .bt2020,
+            yCbCrRange: .limited,
+            chromaSiting: .left
+        )
+    )
+    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+        frame,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
+    )
+
+    var writer = try PyrowaveStreamWriter(url: url, header: PyrowaveStreamHeader(frame: frame))
+    try writer.writeFrame(encoded)
+
+    let reader = try PyrowaveStreamReader(url: url)
+    #expect(reader.header.videoSignal == frame.videoSignal)
+}
+
 @Test func pyrowaveStreamFileRejectsMissingMagic() throws {
     let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -480,10 +512,14 @@ import Testing
         UInt32(header.height),
         UInt32(0),
         UInt32(header.bitDepth),
-        UInt32(header.videoSignal.yCbCrRange.rawValue),
+        UInt32(header.videoSignal.colorPrimaries.rawValue) << 0 |
+            UInt32(header.videoSignal.transferFunction.rawValue) << 1 |
+            UInt32(header.videoSignal.yCbCrTransform.rawValue) << 2 |
+            UInt32(header.videoSignal.yCbCrRange.rawValue) << 3 |
+            UInt32(header.videoSignal.chromaSiting.rawValue) << 4,
         UInt32(header.frameRateNumerator),
         UInt32(header.frameRateDenominator),
-        UInt32(header.videoSignal.chromaSiting.rawValue)
+        0
     ] {
         writer.append(word)
     }
