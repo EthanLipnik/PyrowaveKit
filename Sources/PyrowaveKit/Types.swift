@@ -157,6 +157,61 @@ public struct YUVFrame: Equatable, Sendable {
         self.cr = cr
         self.videoSignal = videoSignal
     }
+
+    public init(
+        width: Int,
+        height: Int,
+        nv12Y: [UInt8],
+        nv12CbCr: [UInt8],
+        yRowStride: Int? = nil,
+        cbCrRowStride: Int? = nil,
+        videoSignal: VideoSignalMetadata = .default
+    ) throws {
+        guard width > 0, height > 0, width % 2 == 0, height % 2 == 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        let yStride = yRowStride ?? width
+        let cbCrStride = cbCrRowStride ?? width
+        let chromaWidth = width / 2
+        let chromaHeight = height / 2
+        guard yStride >= width,
+              cbCrStride >= width,
+              nv12Y.count >= yStride * (height - 1) + width,
+              nv12CbCr.count >= cbCrStride * (chromaHeight - 1) + width else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        var y = [UInt8]()
+        y.reserveCapacity(width * height)
+        for row in 0..<height {
+            let rowStart = row * yStride
+            y.append(contentsOf: nv12Y[rowStart..<(rowStart + width)])
+        }
+
+        var cb = [UInt8]()
+        var cr = [UInt8]()
+        cb.reserveCapacity(chromaWidth * chromaHeight)
+        cr.reserveCapacity(chromaWidth * chromaHeight)
+        for row in 0..<chromaHeight {
+            let rowStart = row * cbCrStride
+            for column in 0..<chromaWidth {
+                let offset = rowStart + column * 2
+                cb.append(nv12CbCr[offset])
+                cr.append(nv12CbCr[offset + 1])
+            }
+        }
+
+        try self.init(
+            width: width,
+            height: height,
+            chroma: .yuv420,
+            y: Plane8(width: width, height: height, data: y),
+            cb: Plane8(width: chromaWidth, height: chromaHeight, data: cb),
+            cr: Plane8(width: chromaWidth, height: chromaHeight, data: cr),
+            videoSignal: videoSignal
+        )
+    }
 }
 
 public struct EncodedFrame: Equatable, Sendable {

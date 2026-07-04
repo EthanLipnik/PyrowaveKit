@@ -142,6 +142,60 @@ import Testing
     #expect(decoded == frame)
 }
 
+@Test func yuvFrameImportsStrideAwareNV12CPUBuffer() throws {
+    let y: [UInt8] = [
+        0, 1, 2, 3, 90, 91,
+        10, 11, 12, 13, 92, 93,
+        20, 21, 22, 23, 94, 95,
+        30, 31, 32, 33, 96, 97
+    ]
+    let cbCr: [UInt8] = [
+        100, 150, 101, 151, 80, 81, 82, 83,
+        102, 152, 103, 153, 84, 85, 86, 87
+    ]
+    let videoSignal = VideoSignalMetadata(
+        colorPrimaries: .bt2020,
+        transferFunction: .pq,
+        yCbCrTransform: .bt2020,
+        yCbCrRange: .limited,
+        chromaSiting: .left
+    )
+
+    let frame = try YUVFrame(
+        width: 4,
+        height: 4,
+        nv12Y: y,
+        nv12CbCr: cbCr,
+        yRowStride: 6,
+        cbCrRowStride: 8,
+        videoSignal: videoSignal
+    )
+
+    #expect(frame.chroma == .yuv420)
+    #expect(frame.y.data == [
+        0, 1, 2, 3,
+        10, 11, 12, 13,
+        20, 21, 22, 23,
+        30, 31, 32, 33
+    ])
+    #expect(frame.cb.data == [100, 101, 102, 103])
+    #expect(frame.cr.data == [150, 151, 152, 153])
+    #expect(frame.videoSignal == videoSignal)
+
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try YUVFrame(width: 3, height: 4, nv12Y: y, nv12CbCr: cbCr)
+    }
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try YUVFrame(width: 4, height: 4, nv12Y: y, nv12CbCr: cbCr, yRowStride: 3)
+    }
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try YUVFrame(width: 4, height: 4, nv12Y: Array(y.dropLast(3)), nv12CbCr: cbCr, yRowStride: 6)
+    }
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try YUVFrame(width: 4, height: 4, nv12Y: y, nv12CbCr: Array(cbCr.dropLast(5)), cbCrRowStride: 8)
+    }
+}
+
 @Test func yuv4mpegReadWrite444AndRejectsMismatchedWriterChroma() throws {
     let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
