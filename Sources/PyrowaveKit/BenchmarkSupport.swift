@@ -209,7 +209,7 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
 public enum PyrowaveBenchmarkRunner {
     public static let pyrowaveCodecName = "pyrowavekit-swift-metal-hybrid"
     public static let timedBenchmarkScopeNote = "Timed encode/decode excludes input loading, pixel-buffer preparation, artifact writes, report serialization, and quality metric generation."
-    public static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane pad/crop, DWT/iDWT, block quantization, sparse packet byte-cost prefiltering, sparse decode apply, rate-control stats, 32x32 sparse packets, and optional frame-size cap. \(timedBenchmarkScopeNote)"
+    public static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane pad/crop, DWT/iDWT, block quantization, sparse packet byte-cost prefiltering, sparse decode apply, rate-control stats and bucket resolve, 32x32 sparse packets, and optional frame-size cap. \(timedBenchmarkScopeNote)"
 
     public static func loadFrames(arguments: PyrowaveBenchmarkArguments) throws -> PyrowaveBenchmarkFrames {
         if let input = arguments.input {

@@ -758,6 +758,7 @@ import CoreVideo
         _ = try backend.makeFunction(named: "pyrowave_apply_sparse_coefficients")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_tile_stats")
         _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs")
+        _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_indices")
     } catch PyrowaveError.externalToolUnavailable {
         return
     }
