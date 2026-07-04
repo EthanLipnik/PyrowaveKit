@@ -421,6 +421,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
             chroma: chroma,
             videoSignal: videoSignal,
             sequenceNumber: sequenceNumber,
+            totalLayoutBlocks: layout.descriptors.count,
             blocks: defaultBlocks
         )
         guard let maximumEncodedBytes = configuration.maximumEncodedBytes else {
@@ -449,6 +450,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
             chroma: chroma,
             videoSignal: videoSignal,
             sequenceNumber: sequenceNumber,
+            totalLayoutBlocks: layout.descriptors.count,
             blocks: planeBlocks
         )
 
@@ -465,22 +467,40 @@ public final class PyrowaveCodec: @unchecked Sendable {
         chroma: ChromaSubsampling,
         videoSignal: VideoSignalMetadata,
         sequenceNumber: UInt8,
+        totalLayoutBlocks: Int,
         blocks: [SparseBlock]
     ) throws -> EncodedFrame {
-        let sortedBlocks = blocks.sorted { $0.blockIndex < $1.blockIndex }
-        let capacity = frameHeaderSize + sortedBlocks.reduce(0) { $0 + $1.data.count }
+        guard totalLayoutBlocks >= 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        var blockDataByIndex = Array<Data?>(repeating: nil, count: totalLayoutBlocks)
+        var payloadBytes = 0
+        for block in blocks {
+            guard block.blockIndex >= 0, block.blockIndex < totalLayoutBlocks else {
+                throw PyrowaveError.processFailed("sparse block index \(block.blockIndex) is outside layout block count \(totalLayoutBlocks)")
+            }
+            guard blockDataByIndex[block.blockIndex] == nil else {
+                throw PyrowaveError.processFailed("duplicate sparse block index \(block.blockIndex)")
+            }
+            blockDataByIndex[block.blockIndex] = block.data
+            payloadBytes += block.data.count
+        }
+
+        let capacity = frameHeaderSize + payloadBytes
         var writer = BinaryWriter(capacity: capacity)
         let sequence = try PyrowaveSequenceHeader(
             width: width,
             height: height,
             sequence: sequenceNumber,
-            totalBlocks: sortedBlocks.count,
+            totalBlocks: blocks.count,
             chroma: chroma,
             videoSignal: videoSignal
         )
         sequence.write(to: &writer)
-        for block in sortedBlocks {
-            writer.append(data: block.data)
+        for blockData in blockDataByIndex {
+            if let blockData {
+                writer.append(data: blockData)
+            }
         }
         return EncodedFrame(data: writer.data)
     }
