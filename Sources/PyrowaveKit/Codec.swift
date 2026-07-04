@@ -279,6 +279,7 @@ public final class PyrowaveCodec: Sendable {
         var decodedPlanes = try (0..<PyrowaveBitstream.componentCount).map { component in
             try makeDecodedPlane(component: component, width: sequence.width, height: sequence.height, chroma: sequence.chroma, layout: layout)
         }
+        var pendingSparseBlocks = Array(repeating: [PendingSparseBlock](), count: PyrowaveBitstream.componentCount)
         var seenBlocks = Set<Int>()
 
         while reader.offset < frame.data.count {
@@ -293,7 +294,7 @@ public final class PyrowaveCodec: Sendable {
                   let descriptor = decodedPlanes[target].descriptorsByBlockIndex[block.blockIndex] else {
                 throw PyrowaveError.invalidBitstream("sparse block index has no plane mapping")
             }
-            try applySparseBlock(block, descriptor: descriptor, decodedPlane: &decodedPlanes[target])
+            pendingSparseBlocks[target].append(PendingSparseBlock(block: block, descriptor: descriptor))
         }
 
         if seenBlocks.count < sequence.totalBlocks {
@@ -306,6 +307,10 @@ public final class PyrowaveCodec: Sendable {
 
         guard reader.offset == frame.data.count else {
             throw PyrowaveError.invalidBitstream("trailing bytes")
+        }
+
+        for index in decodedPlanes.indices {
+            try applySparseBlocks(pendingSparseBlocks[index], decodedPlane: &decodedPlanes[index])
         }
 
         let y = try finishDecodedPlane(decodedPlanes[0])
@@ -336,6 +341,11 @@ public final class PyrowaveCodec: Sendable {
     private struct SparseBlock {
         var blockIndex: Int
         var data: Data
+    }
+
+    private struct PendingSparseBlock {
+        var block: PyrowaveCoefficientBlockCodec.DecodedBlock
+        var descriptor: PlaneBlockDescriptor
     }
 
     private struct SparseRateControlPlan {
@@ -556,26 +566,84 @@ public final class PyrowaveCodec: Sendable {
         descriptor: PlaneBlockDescriptor,
         decodedPlane: inout DecodedPlane
     ) throws {
-        let blockSize = Self.sparseBlockSize
         for entry in block.coefficients {
-            let localOffset = Int(entry.offset)
-            let localX = localOffset % blockSize
-            let localY = localOffset / blockSize
-            let x = descriptor.originX + localX
-            let y = descriptor.originY + localY
-            guard localOffset < blockSize * blockSize,
-                  localX < descriptor.validWidth,
-                  localY < descriptor.validHeight,
-                  x < decodedPlane.paddedWidth,
-                  y < decodedPlane.paddedHeight else {
-                throw PyrowaveError.invalidBitstream("sparse coefficient out of range")
-            }
-            decodedPlane.samples[y * decodedPlane.paddedWidth + x] = PyrowaveQuantization.dequantize(
+            let destinationOffset = try sparseDestinationOffset(
+                entryOffset: entry.offset,
+                descriptor: descriptor,
+                decodedPlane: decodedPlane
+            )
+            decodedPlane.samples[destinationOffset] = PyrowaveQuantization.dequantize(
                 coefficient: entry.value,
                 quantCode: block.quantCode,
                 qScaleCode: entry.qScaleCode
             )
         }
+    }
+
+    private func applySparseBlocks(
+        _ blocks: [PendingSparseBlock],
+        decodedPlane: inout DecodedPlane
+    ) throws {
+        guard let metalBackend else {
+            for pending in blocks {
+                try applySparseBlock(pending.block, descriptor: pending.descriptor, decodedPlane: &decodedPlane)
+            }
+            return
+        }
+
+        let entries = try metalSparseCoefficientEntries(blocks, decodedPlane: decodedPlane)
+        decodedPlane.samples = try metalBackend.applySparseCoefficients(
+            sampleCount: decodedPlane.paddedWidth * decodedPlane.paddedHeight,
+            entries: entries
+        )
+    }
+
+    private func metalSparseCoefficientEntries(
+        _ blocks: [PendingSparseBlock],
+        decodedPlane: DecodedPlane
+    ) throws -> [MetalSparseCoefficientEntry] {
+        let capacity = blocks.reduce(0) { $0 + $1.block.coefficients.count }
+        var entries = [MetalSparseCoefficientEntry]()
+        entries.reserveCapacity(capacity)
+
+        for pending in blocks {
+            for entry in pending.block.coefficients {
+                let destinationOffset = try sparseDestinationOffset(
+                    entryOffset: entry.offset,
+                    descriptor: pending.descriptor,
+                    decodedPlane: decodedPlane
+                )
+                entries.append(MetalSparseCoefficientEntry(
+                    destinationOffset: UInt32(destinationOffset),
+                    coefficient: Int32(entry.value),
+                    quantCode: UInt32(pending.block.quantCode),
+                    qScaleCode: UInt32(entry.qScaleCode)
+                ))
+            }
+        }
+
+        return entries
+    }
+
+    private func sparseDestinationOffset(
+        entryOffset: UInt16,
+        descriptor: PlaneBlockDescriptor,
+        decodedPlane: DecodedPlane
+    ) throws -> Int {
+        let blockSize = Self.sparseBlockSize
+        let localOffset = Int(entryOffset)
+        let localX = localOffset % blockSize
+        let localY = localOffset / blockSize
+        let x = descriptor.originX + localX
+        let y = descriptor.originY + localY
+        guard localOffset < blockSize * blockSize,
+              localX < descriptor.validWidth,
+              localY < descriptor.validHeight,
+              x < decodedPlane.paddedWidth,
+              y < decodedPlane.paddedHeight else {
+            throw PyrowaveError.invalidBitstream("sparse coefficient out of range")
+        }
+        return y * decodedPlane.paddedWidth + x
     }
 
     private func finishDecodedPlane(_ plane: DecodedPlane) throws -> Plane8 {

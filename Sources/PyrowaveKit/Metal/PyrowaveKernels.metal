@@ -20,6 +20,18 @@ struct PlaneQuantizationConstants {
     uint descriptorCount;
 };
 
+struct SparseCoefficientEntry {
+    uint destinationOffset;
+    int coefficient;
+    uint quantCode;
+    uint qScaleCode;
+};
+
+struct SparseApplyConstants {
+    uint entryCount;
+    uint sampleCount;
+};
+
 struct DWTConstants {
     uint activeWidth;
     uint activeHeight;
@@ -91,6 +103,16 @@ static inline uchar pyrowave_encode_8x8_scale_code(float maxScaledCoefficient) {
     return pyrowave_encode_8x8_scale(maxScaledCoefficient / targetMax);
 }
 
+static inline float pyrowave_decode_block_scale(uint quantCode) {
+    int exponent = 4 - int(quantCode >> 3u);
+    uint mantissa = quantCode & 7u;
+    return (float(8u + mantissa) * exp2(float(20 + exponent))) / (8.0f * 1024.0f * 1024.0f);
+}
+
+static inline float pyrowave_decode_8x8_scale(uint code) {
+    return float(code) / 8.0f + 0.25f;
+}
+
 kernel void pyrowave_quantize_plane_tiles(
     device const float *samples [[buffer(0)]],
     device short *coefficients [[buffer(1)]],
@@ -140,6 +162,32 @@ kernel void pyrowave_quantize_plane_tiles(
             coefficients[row + x] = short(scaled);
         }
     }
+}
+
+kernel void pyrowave_apply_sparse_coefficients(
+    device float *samples [[buffer(0)]],
+    device const SparseCoefficientEntry *entries [[buffer(1)]],
+    constant SparseApplyConstants &constants [[buffer(2)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index >= constants.entryCount) {
+        return;
+    }
+
+    SparseCoefficientEntry entry = entries[index];
+    if (entry.destinationOffset >= constants.sampleCount) {
+        return;
+    }
+
+    float value = float(entry.coefficient);
+    if (value > 0.0f) {
+        value += 0.5f;
+    } else if (value < 0.0f) {
+        value -= 0.5f;
+    }
+    samples[entry.destinationOffset] = value
+        * pyrowave_decode_block_scale(entry.quantCode)
+        * pyrowave_decode_8x8_scale(entry.qScaleCode);
 }
 
 kernel void pyrowave_dwt_lift_rows(

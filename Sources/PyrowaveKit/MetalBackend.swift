@@ -10,6 +10,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     private let quantizePipeline: MTLComputePipelineState
     private let dequantizePipeline: MTLComputePipelineState
     private let quantizePlaneTilesPipeline: MTLComputePipelineState
+    private let sparseApplyPipeline: MTLComputePipelineState
     private let dwtLiftRowsPipeline: MTLComputePipelineState
     private let dwtLiftColumnsPipeline: MTLComputePipelineState
     private let dwtPackRowsPipeline: MTLComputePipelineState
@@ -41,6 +42,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         quantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize", library: library))
         dequantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dequantize", library: library))
         quantizePlaneTilesPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize_plane_tiles", library: library))
+        sparseApplyPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_apply_sparse_coefficients", library: library))
         dwtLiftRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_rows", library: library))
         dwtLiftColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_columns", library: library))
         dwtPackRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_pack_rows", library: library))
@@ -145,6 +147,50 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
             Array(flatQScales[$0..<$0 + 16])
         }
         return MetalPlaneQuantizationResult(coefficients: coefficientValues, qScaleCodesByDescriptor: perDescriptor)
+    }
+
+    func applySparseCoefficients(sampleCount: Int, entries: [MetalSparseCoefficientEntry]) throws -> [Float] {
+        guard sampleCount >= 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard sampleCount <= Int(UInt32.max), entries.count <= Int(UInt32.max) else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard !entries.isEmpty else {
+            return Array(repeating: 0, count: sampleCount)
+        }
+
+        let samples = Array(repeating: Float(0), count: sampleCount)
+        guard let output = device.makeBuffer(bytes: samples, length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let entryBuffer = device.makeBuffer(bytes: entries, length: entries.count * MemoryLayout<MetalSparseCoefficientEntry>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient buffers")
+        }
+
+        var constants = SparseApplyConstants(entryCount: UInt32(entries.count), sampleCount: UInt32(sampleCount))
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal sparse coefficient command encoder")
+        }
+
+        encoder.setComputePipelineState(sparseApplyPipeline)
+        encoder.setBuffer(output, offset: 0, index: 0)
+        encoder.setBuffer(entryBuffer, offset: 0, index: 1)
+        encoder.setBytes(&constants, length: MemoryLayout<SparseApplyConstants>.stride, index: 2)
+        let width = min(sparseApplyPipeline.maxTotalThreadsPerThreadgroup, 256)
+        encoder.dispatchThreads(
+            MTLSize(width: entries.count, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal sparse coefficient command failed: \(error)")
+        }
+
+        let pointer = output.contents().bindMemory(to: Float.self, capacity: sampleCount)
+        return Array(UnsafeBufferPointer(start: pointer, count: sampleCount))
     }
 
     public func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
@@ -538,8 +584,20 @@ struct MetalPlaneQuantizationResult {
     var qScaleCodesByDescriptor: [[UInt8]]
 }
 
+struct MetalSparseCoefficientEntry {
+    var destinationOffset: UInt32
+    var coefficient: Int32
+    var quantCode: UInt32
+    var qScaleCode: UInt32
+}
+
 private struct PlaneQuantizationConstants {
     var descriptorCount: UInt32
+}
+
+private struct SparseApplyConstants {
+    var entryCount: UInt32
+    var sampleCount: UInt32
 }
 
 private struct DWTConstants {
@@ -570,6 +628,10 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         throw PyrowaveError.externalToolUnavailable("Metal")
     }
 
+    func applySparseCoefficients(sampleCount: Int, entries: [MetalSparseCoefficientEntry]) throws -> [Float] {
+        throw PyrowaveError.externalToolUnavailable("Metal")
+    }
+
     public func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
         throw PyrowaveError.externalToolUnavailable("Metal")
     }
@@ -592,5 +654,12 @@ struct MetalPlaneQuantizationDescriptor {
 struct MetalPlaneQuantizationResult {
     var coefficients: [Int16]
     var qScaleCodesByDescriptor: [[UInt8]]
+}
+
+struct MetalSparseCoefficientEntry {
+    var destinationOffset: UInt32
+    var coefficient: Int32
+    var quantCode: UInt32
+    var qScaleCode: UInt32
 }
 #endif

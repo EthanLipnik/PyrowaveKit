@@ -298,6 +298,7 @@ import Testing
         _ = try backend.makeFunction(named: "pyrowave_quantize")
         _ = try backend.makeFunction(named: "pyrowave_dequantize")
         _ = try backend.makeFunction(named: "pyrowave_quantize_plane_tiles")
+        _ = try backend.makeFunction(named: "pyrowave_apply_sparse_coefficients")
     } catch PyrowaveError.externalToolUnavailable {
         return
     }
@@ -324,6 +325,37 @@ import Testing
 
     let dequantized = try backend.dequantize(metal, quantizationStep: step)
     #expect(dequantized == cpu.map { Float($0) * step })
+    #endif
+}
+
+@Test func metalSparseApplyMatchesCPUReferenceWhenDeviceExists() throws {
+    #if canImport(Metal)
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let quantCode = UInt8(32)
+    let entries = [
+        MetalSparseCoefficientEntry(destinationOffset: 7, coefficient: -9, quantCode: UInt32(quantCode), qScaleCode: 3),
+        MetalSparseCoefficientEntry(destinationOffset: 2, coefficient: 14, quantCode: UInt32(quantCode), qScaleCode: 6),
+        MetalSparseCoefficientEntry(destinationOffset: 11, coefficient: 1, quantCode: UInt32(quantCode), qScaleCode: 15)
+    ]
+    let metal = try backend.applySparseCoefficients(sampleCount: 16, entries: entries)
+    var cpu = Array(repeating: Float(0), count: 16)
+    for entry in entries {
+        cpu[Int(entry.destinationOffset)] = PyrowaveQuantization.dequantize(
+            coefficient: Int16(entry.coefficient),
+            quantCode: UInt8(entry.quantCode),
+            qScaleCode: UInt8(entry.qScaleCode)
+        )
+    }
+
+    let maxError = zip(metal, cpu).map { abs($0 - $1) }.max() ?? 0
+    #expect(maxError < 0.000001)
+    #expect(try backend.applySparseCoefficients(sampleCount: 5, entries: []) == Array(repeating: Float(0), count: 5))
     #endif
 }
 
