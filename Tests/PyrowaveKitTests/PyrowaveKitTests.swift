@@ -4,7 +4,7 @@ import Testing
 
 @Test func roundTripSynthetic420() throws {
     let frame = try TestFrames.synthetic420(width: 160, height: 96)
-    let codec = PyrowaveCodec()
+    let codec = try PyrowaveCodec(useMetalAcceleration: false)
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
     let decoded = try codec.decode(encoded)
     let metrics = try Metrics.compare(frame, decoded)
@@ -18,7 +18,7 @@ import Testing
 
 @Test func roundTripSynthetic444() throws {
     let frame = try TestFrames.synthetic444(width: 128, height: 96)
-    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec(useMetalAcceleration: false)
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
     let decoded = try codec.decode(encoded)
     let metrics = try Metrics.compare(frame, decoded)
@@ -47,7 +47,7 @@ import Testing
 
 @Test func roundTripNonAlignedSynthetic420UsesMirroredPadding() throws {
     let frame = try TestFrames.synthetic420(width: 130, height: 74)
-    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec(useMetalAcceleration: false)
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
     let decoded = try codec.decode(encoded)
     let metrics = try Metrics.compare(frame, decoded)
@@ -190,7 +190,7 @@ import Testing
 
 @Test func sparseRateControlCapsEncodedFrameSize() throws {
     let frame = try TestFrames.synthetic420(width: 256, height: 144)
-    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec(useMetalAcceleration: false)
     let uncapped = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
     let cap = max(512, uncapped.data.count / 2)
     let capped = try codec.encode(
@@ -211,7 +211,7 @@ import Testing
 
 @Test func codecUsesPyrowaveSequenceHeaderStreamOnly() throws {
     let frame = try TestFrames.synthetic420(width: 64, height: 64)
-    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec(useMetalAcceleration: false)
     var encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)).data
 
     var reader = BinaryReader(encoded)
@@ -230,7 +230,7 @@ import Testing
 
 @Test func codecAdvancesPyrowaveSequenceCounterModuloEight() throws {
     let frame = try TestFrames.synthetic420(width: 64, height: 64)
-    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec(useMetalAcceleration: false)
     var observedSequences = [UInt8]()
 
     for _ in 0..<9 {
@@ -269,11 +269,11 @@ import Testing
 
 @Test func packetStreamDecoderReconstructsCompletePacketizedFrame() throws {
     let frame = try TestFrames.synthetic420(width: 96, height: 64)
-    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec(useMetalAcceleration: false)
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
     let expected = try codec.decode(encoded)
     let packets = try encoded.packetized(maximumPacketBytes: 8)
-    let stream = PyrowavePacketStreamDecoder(useMetalAcceleration: false)
+    let stream = try PyrowavePacketStreamDecoder(useMetalAcceleration: false)
 
     for packet in packets.dropLast() {
         try stream.pushPacket(packet)
@@ -287,11 +287,11 @@ import Testing
 
 @Test func packetStreamDecoderReconstructsComplete444Frame() throws {
     let frame = try TestFrames.synthetic444(width: 96, height: 64)
-    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec(useMetalAcceleration: false)
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
     let expected = try codec.decode(encoded)
     let packets = try encoded.packetized(maximumPacketBytes: 64)
-    let stream = PyrowavePacketStreamDecoder(useMetalAcceleration: false)
+    let stream = try PyrowavePacketStreamDecoder(useMetalAcceleration: false)
 
     for packet in packets {
         try stream.pushPacket(packet)
@@ -311,7 +311,7 @@ import Testing
     let sequencePacket = try #require(packets.first)
     var sequenceReader = BinaryReader(sequencePacket.data)
     let sequence = try PyrowaveSequenceHeader(reader: &sequenceReader)
-    let stream = PyrowavePacketStreamDecoder(useMetalAcceleration: false)
+    let stream = try PyrowavePacketStreamDecoder(useMetalAcceleration: false)
 
     try stream.pushPacket(sequencePacket)
     for packet in packets.dropFirst().prefix(sequence.totalBlocks / 2) {
@@ -386,7 +386,7 @@ import Testing
     let sequencePacket = try #require(packets.first)
     var sequenceReader = BinaryReader(sequencePacket.data)
     let sequence = try PyrowaveSequenceHeader(reader: &sequenceReader)
-    let stream = PyrowavePacketStreamDecoder(useMetalAcceleration: false)
+    let stream = try PyrowavePacketStreamDecoder(useMetalAcceleration: false)
 
     try stream.pushPacket(sequencePacket)
     try stream.pushPacket(try #require(packets.dropFirst().first))
@@ -423,7 +423,7 @@ import Testing
         )
     )
 
-    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec(useMetalAcceleration: false)
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
     let decoded = try codec.decode(encoded)
 
@@ -490,7 +490,7 @@ import Testing
 
 @Test func codecRequiresSpecDecompositionLevelCount() throws {
     let frame = try TestFrames.synthetic420(width: 64, height: 64)
-    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec(useMetalAcceleration: false)
     #expect(throws: PyrowaveError.invalidDimensions) {
         _ = try codec.encode(frame, configuration: CodecConfiguration(decompositionLevels: 4))
     }

@@ -43,8 +43,8 @@ public final class PyrowavePacketStreamDecoder {
     private var decodedFrameForCurrentSequence = false
     private var lastSequence: UInt8?
 
-    public init(useMetalAcceleration: Bool = true) {
-        codec = PyrowaveCodec(useMetalAcceleration: useMetalAcceleration)
+    public init(useMetalAcceleration: Bool = true) throws {
+        codec = try PyrowaveCodec(useMetalAcceleration: useMetalAcceleration)
         expectedFrame = nil
     }
 
@@ -55,7 +55,7 @@ public final class PyrowavePacketStreamDecoder {
         videoSignal: VideoSignalMetadata = .default,
         useMetalAcceleration: Bool = true
     ) throws {
-        codec = PyrowaveCodec(useMetalAcceleration: useMetalAcceleration)
+        codec = try PyrowaveCodec(useMetalAcceleration: useMetalAcceleration)
         let layout = try PyrowaveBlockLayout(width: width, height: height, chroma: chroma)
         expectedFrame = ExpectedFrame(
             width: width,
@@ -205,9 +205,9 @@ public final class PyrowaveCodec: Sendable {
     private let metalBackend: MetalPyrowaveBackend?
     private let sequenceCounter = SequenceCounter()
 
-    public init(useMetalAcceleration: Bool = true) {
+    public init(useMetalAcceleration: Bool = true) throws {
         if useMetalAcceleration {
-            metalBackend = try? MetalPyrowaveBackend()
+            metalBackend = try MetalPyrowaveBackend()
         } else {
             metalBackend = nil
         }

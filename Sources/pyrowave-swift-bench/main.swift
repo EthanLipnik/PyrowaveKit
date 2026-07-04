@@ -104,7 +104,7 @@ func loadFrames(arguments: Arguments) throws -> [YUVFrame] {
 }
 
 func runPyrowave(frames: [YUVFrame], configuration: CodecConfiguration, outputDirectory: URL) throws -> CodecBenchmarkResult {
-    let codec = PyrowaveCodec()
+    let codec = try PyrowaveCodec()
     var encodedFrames = [EncodedFrame]()
     encodedFrames.reserveCapacity(frames.count)
 
