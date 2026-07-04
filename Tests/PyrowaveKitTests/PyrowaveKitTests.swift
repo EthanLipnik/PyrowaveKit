@@ -99,6 +99,35 @@ import CoreVideo
     let exportedFrame = try YUVFrame(cvPixelBuffer: exportedPixelBuffer)
     #expect(exportedFrame == frame)
 }
+
+@Test func codecEncodesAndDecodesCoreVideoPixelBuffers() throws {
+    let source = try TestFrames.synthetic420(width: 64, height: 64)
+    let sourcePixelBuffer = try source.makeCVPixelBuffer()
+    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+
+    let encoded = try codec.encode(
+        sourcePixelBuffer,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0)
+    )
+    let decodedPixelBuffer = try codec.decodeToCVPixelBuffer(encoded)
+    let decoded = try YUVFrame(cvPixelBuffer: decodedPixelBuffer)
+    let metrics = try Metrics.compare(source, decoded)
+
+    #expect(encoded.data.count > 0)
+    #expect(decoded.width == source.width)
+    #expect(decoded.height == source.height)
+    #expect(decoded.chroma == .yuv420)
+    #expect(metrics.weightedPSNR > 44.0)
+
+    let packets = try encoded.packetized(maximumPacketBytes: 64)
+    let stream = try PyrowavePacketStreamDecoder(width: source.width, height: source.height, chroma: source.chroma, useMetalAcceleration: false)
+    for packet in packets {
+        try stream.pushPacket(packet)
+    }
+    let streamedPixelBuffer = try stream.decodeToCVPixelBuffer()
+    let streamed = try YUVFrame(cvPixelBuffer: streamedPixelBuffer)
+    #expect(try Metrics.compare(source, streamed).weightedPSNR > 44.0)
+}
 #endif
 
 @Test func roundTripSynthetic420() throws {

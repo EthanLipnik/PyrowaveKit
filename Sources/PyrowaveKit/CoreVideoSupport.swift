@@ -123,4 +123,33 @@ extension YUVFrame {
         videoSignal.yCbCrRange == .limited ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
     }
 }
+
+extension PyrowaveCodec {
+    public func encode(
+        _ cvPixelBuffer: CVPixelBuffer,
+        configuration: CodecConfiguration = CodecConfiguration(),
+        videoSignal: VideoSignalMetadata? = nil
+    ) throws -> EncodedFrame {
+        try encode(
+            YUVFrame(cvPixelBuffer: cvPixelBuffer, videoSignal: videoSignal),
+            configuration: configuration
+        )
+    }
+
+    public func decodeToCVPixelBuffer(
+        _ frame: EncodedFrame,
+        pixelFormat: OSType? = nil
+    ) throws -> CVPixelBuffer {
+        try decode(frame).makeCVPixelBuffer(pixelFormat: pixelFormat)
+    }
+}
+
+extension PyrowavePacketStreamDecoder {
+    public func decodeToCVPixelBuffer(
+        allowPartialFrame: Bool = false,
+        pixelFormat: OSType? = nil
+    ) throws -> CVPixelBuffer {
+        try decode(allowPartialFrame: allowPartialFrame).makeCVPixelBuffer(pixelFormat: pixelFormat)
+    }
+}
 #endif
