@@ -198,6 +198,42 @@ import Testing
     }
 }
 
+@Test func hevcEquivalentBudgetUsesMirageStyleSixtyHertzQualityReference() throws {
+    #expect(try HEVCComparison.qualityReferenceFrameRate(numerator: 60, denominator: 1).numerator == 60)
+    #expect(try HEVCComparison.qualityReferenceFrameRate(numerator: 60, denominator: 1).denominator == 1)
+    #expect(try HEVCComparison.qualityReferenceFrameRate(numerator: 120, denominator: 1).numerator == 60)
+    #expect(try HEVCComparison.qualityReferenceFrameRate(numerator: 120, denominator: 1).denominator == 1)
+    #expect(try HEVCComparison.qualityReferenceFrameRate(numerator: 30000, denominator: 1001).numerator == 30000)
+    #expect(try HEVCComparison.qualityReferenceFrameRate(numerator: 30000, denominator: 1001).denominator == 1001)
+
+    let sixty = try HEVCComparison.matchedFrameByteBudget(
+        bitrate: 8_000,
+        frameRateNumerator: 60,
+        frameRateDenominator: 1
+    )
+    let oneTwenty = try HEVCComparison.matchedFrameByteBudget(
+        bitrate: 8_000,
+        frameRateNumerator: 120,
+        frameRateDenominator: 1
+    )
+    let thirty = try HEVCComparison.matchedFrameByteBudget(
+        bitrate: 8_000,
+        frameRateNumerator: 30,
+        frameRateDenominator: 1
+    )
+
+    #expect(oneTwenty == sixty)
+    #expect(thirty == sixty * 2)
+    #expect(sixty == 17)
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try HEVCComparison.matchedFrameByteBudget(
+            bitrate: 0,
+            frameRateNumerator: 60,
+            frameRateDenominator: 1
+        )
+    }
+}
+
 @Test func metalBackendCompilesKernelsWhenDeviceExists() throws {
     #if canImport(Metal)
     do {

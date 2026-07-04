@@ -6,6 +6,10 @@ struct BenchmarkReport: Codable {
     var width: Int
     var height: Int
     var frames: Int
+    var frameRateNumerator: Int
+    var frameRateDenominator: Int
+    var bitrate: Int
+    var pyrowaveFrameBudgetBytes: Int?
     var pyrowave: CodecBenchmarkResult
     var hevc: CodecBenchmarkResult
 }
@@ -167,7 +171,18 @@ do {
     try FileManager.default.createDirectory(at: arguments.outputDirectory, withIntermediateDirectories: true)
     let loaded = try loadFrames(arguments: arguments)
     let frames = loaded.frames
-    let pyrowaveBudget = arguments.maximumPyrowaveBytes ?? (arguments.matchHEVCFrameBudget ? max(1, arguments.bitrate / 8 / 60) : nil)
+    let pyrowaveBudget: Int?
+    if let maximumPyrowaveBytes = arguments.maximumPyrowaveBytes {
+        pyrowaveBudget = maximumPyrowaveBytes
+    } else if arguments.matchHEVCFrameBudget {
+        pyrowaveBudget = try HEVCComparison.matchedFrameByteBudget(
+            bitrate: arguments.bitrate,
+            frameRateNumerator: loaded.frameRateNumerator,
+            frameRateDenominator: loaded.frameRateDenominator
+        )
+    } else {
+        pyrowaveBudget = nil
+    }
     let configuration = CodecConfiguration(
         quantizationStep: arguments.quantizationStep,
         maximumEncodedBytes: pyrowaveBudget
@@ -186,6 +201,10 @@ do {
         width: frames[0].width,
         height: frames[0].height,
         frames: frames.count,
+        frameRateNumerator: loaded.frameRateNumerator,
+        frameRateDenominator: loaded.frameRateDenominator,
+        bitrate: arguments.bitrate,
+        pyrowaveFrameBudgetBytes: pyrowaveBudget,
         pyrowave: pyrowave,
         hevc: hevc
     )

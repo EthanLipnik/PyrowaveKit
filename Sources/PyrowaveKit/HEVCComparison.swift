@@ -34,6 +34,8 @@ public struct CodecBenchmarkResult: Codable, Equatable, Sendable {
 }
 
 public enum HEVCComparison {
+    private static let maximumQualityReferenceFrameRate = 60
+
     public static func runAVKitHEVCComparison(
         referenceFrames: [YUVFrame],
         workingDirectory: URL,
@@ -106,6 +108,43 @@ public enum HEVCComparison {
             note: "AVFoundation is unavailable on this platform"
         )
         #endif
+    }
+
+    public static func matchedFrameByteBudget(
+        bitrate: Int,
+        frameRateNumerator: Int,
+        frameRateDenominator: Int
+    ) throws -> Int {
+        guard bitrate > 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        let referenceFrameRate = try qualityReferenceFrameRate(
+            numerator: frameRateNumerator,
+            denominator: frameRateDenominator
+        )
+        let numerator = Int64(referenceFrameRate.numerator)
+        let denominator = Int64(referenceFrameRate.denominator)
+        let bitsPerFrameDenominator = Int64(8) * numerator
+        let multiplied = Int64(bitrate).multipliedReportingOverflow(by: denominator)
+        guard !multiplied.overflow, multiplied.partialValue > 0, bitsPerFrameDenominator > 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        let bitsPerFrameNumerator = multiplied.partialValue
+        let roundedNumerator = bitsPerFrameNumerator.addingReportingOverflow(bitsPerFrameDenominator - 1)
+        guard !roundedNumerator.overflow else {
+            throw PyrowaveError.invalidDimensions
+        }
+        return max(1, Int(roundedNumerator.partialValue / bitsPerFrameDenominator))
+    }
+
+    public static func qualityReferenceFrameRate(numerator: Int, denominator: Int) throws -> (numerator: Int, denominator: Int) {
+        guard numerator > 0, denominator > 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        if numerator > maximumQualityReferenceFrameRate * denominator {
+            return (maximumQualityReferenceFrameRate, 1)
+        }
+        return (numerator, denominator)
     }
 
     static func frameDuration(numerator: Int, denominator: Int) throws -> CMTime {
