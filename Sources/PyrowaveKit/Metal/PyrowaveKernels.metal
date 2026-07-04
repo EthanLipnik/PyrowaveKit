@@ -53,6 +53,21 @@ struct SparseApplyConstants {
     uint sampleCount;
 };
 
+struct SparsePacketDecodeDescriptor {
+    uint packetOffset;
+    uint payloadEnd;
+    uint originX;
+    uint originY;
+    uint validWidth;
+    uint validHeight;
+    uint stride;
+};
+
+struct SparsePacketDecodeConstants {
+    uint descriptorCount;
+    uint sampleCount;
+};
+
 struct RateControlStatsDescriptor {
     uint originX;
     uint originY;
@@ -630,6 +645,17 @@ static inline void pyrowave_write_u32_le(device uchar *output, uint offset, uint
     output[offset + 3u] = uchar((value >> 24u) & 0xffu);
 }
 
+static inline uint pyrowave_read_u16_le(device const uchar *input, uint offset) {
+    return uint(input[offset]) | (uint(input[offset + 1u]) << 8u);
+}
+
+static inline uint pyrowave_read_u32_le(device const uchar *input, uint offset) {
+    return uint(input[offset])
+        | (uint(input[offset + 1u]) << 8u)
+        | (uint(input[offset + 2u]) << 16u)
+        | (uint(input[offset + 3u]) << 24u);
+}
+
 static inline uint pyrowave_modify_quant_code(uint quantCode, uint quantLevel) {
     if (quantLevel == 0u) {
         return quantCode;
@@ -787,6 +813,139 @@ kernel void pyrowave_encode_sparse_packets(
     uint packedBlock = (descriptor.blockIndex << 8u) | pyrowave_modify_quant_code(descriptor.quantCode, descriptor.quantLevel);
     pyrowave_write_u32_le(packet, 4u, packedBlock);
     outputSizes[descriptorIndex] = packetSize;
+}
+
+kernel void pyrowave_decode_sparse_packets(
+    device float *samples [[buffer(0)]],
+    device const uchar *packets [[buffer(1)]],
+    device const SparsePacketDecodeDescriptor *descriptors [[buffer(2)]],
+    constant SparsePacketDecodeConstants &constants [[buffer(3)]],
+    uint index [[thread_position_in_grid]]
+) {
+    uint descriptorIndex = index >> 4u;
+    if (descriptorIndex >= constants.descriptorCount) {
+        return;
+    }
+    uint targetSmallBlock = index & 15u;
+
+    SparsePacketDecodeDescriptor descriptor = descriptors[descriptorIndex];
+    uint packetOffset = descriptor.packetOffset;
+    uint ballot = pyrowave_read_u16_le(packets, packetOffset);
+    if (ballot == 0u || descriptor.validWidth == 0u || descriptor.validHeight == 0u) {
+        return;
+    }
+    if ((ballot & (1u << targetSmallBlock)) == 0u) {
+        return;
+    }
+
+    uint packedBlock = pyrowave_read_u32_le(packets, packetOffset + 4u);
+    uint quantCode = packedBlock & 0xffu;
+    uint activeBlockCount = popcount(ballot);
+    uint codeWordStart = packetOffset + 8u;
+    uint qScaleStart = codeWordStart + activeBlockCount * 2u;
+    uint magnitudeStart = qScaleStart + activeBlockCount;
+
+    uint magnitudeOffset = 0u;
+    uint signBase = 0u;
+    uint totalMagnitudeBytes = 0u;
+    uint targetCompactIndex = 0u;
+    uint targetMagnitudeOffset = 0u;
+    uint targetSignBase = 0u;
+    uint compactIndex = 0u;
+    for (uint smallBlock = 0u; smallBlock < 16u; ++smallBlock) {
+        if ((ballot & (1u << smallBlock)) == 0u) {
+            continue;
+        }
+
+        uint codeWord = pyrowave_read_u16_le(packets, codeWordStart + compactIndex * 2u);
+        uint qScale = uint(packets[qScaleStart + compactIndex]);
+        uint basePlanes = qScale & 0x0fu;
+        uint smallBlockMagnitudeOffset = magnitudeOffset;
+        uint smallBlockMagnitudeBytes = 0u;
+        uint smallBlockSignCount = 0u;
+        for (uint subblock = 0u; subblock < 8u; ++subblock) {
+            uint encodedPlanes = ((codeWord >> (2u * subblock)) & 0x3u) + basePlanes;
+            smallBlockMagnitudeBytes += encodedPlanes;
+            uint magnitudes[8];
+            for (uint pixel = 0u; pixel < 8u; ++pixel) {
+                magnitudes[pixel] = 0u;
+            }
+            uint subblockOffset = smallBlockMagnitudeOffset;
+            for (uint previousSubblock = 0u; previousSubblock < subblock; ++previousSubblock) {
+                subblockOffset += ((codeWord >> (2u * previousSubblock)) & 0x3u) + basePlanes;
+            }
+            for (uint plane = 0u; plane < encodedPlanes && magnitudeStart + subblockOffset + plane < descriptor.payloadEnd; ++plane) {
+                uint byte = uint(packets[magnitudeStart + subblockOffset + plane]);
+                for (uint pixel = 0u; pixel < 8u; ++pixel) {
+                    magnitudes[pixel] = (magnitudes[pixel] << 1u) | ((byte >> pixel) & 1u);
+                }
+            }
+            for (uint pixel = 0u; pixel < 8u; ++pixel) {
+                if (magnitudes[pixel] != 0u) {
+                    smallBlockSignCount += 1u;
+                }
+            }
+        }
+
+        if (smallBlock == targetSmallBlock) {
+            targetCompactIndex = compactIndex;
+            targetMagnitudeOffset = magnitudeOffset;
+            targetSignBase = signBase;
+        }
+        magnitudeOffset += smallBlockMagnitudeBytes;
+        signBase += smallBlockSignCount;
+        totalMagnitudeBytes += smallBlockMagnitudeBytes;
+        compactIndex += 1u;
+    }
+
+    uint signStart = magnitudeStart + totalMagnitudeBytes;
+    uint cursor = magnitudeStart + targetMagnitudeOffset;
+    uint signIndex = targetSignBase;
+    uint smallOriginX = (targetSmallBlock % 4u) * 8u;
+    uint smallOriginY = (targetSmallBlock / 4u) * 8u;
+    uint codeWord = pyrowave_read_u16_le(packets, codeWordStart + targetCompactIndex * 2u);
+    uint qScale = uint(packets[qScaleStart + targetCompactIndex]);
+    uint basePlanes = qScale & 0x0fu;
+    uint qScaleCode = qScale >> 4u;
+    float coefficientToSampleScale = pyrowave_decode_block_scale(quantCode)
+        * pyrowave_decode_8x8_scale(qScaleCode);
+
+    for (uint subblock = 0u; subblock < 8u; ++subblock) {
+        uint encodedPlanes = ((codeWord >> (2u * subblock)) & 0x3u) + basePlanes;
+        uint magnitudes[8];
+        for (uint pixel = 0u; pixel < 8u; ++pixel) {
+            magnitudes[pixel] = 0u;
+        }
+        for (uint plane = 0u; plane < encodedPlanes && cursor < descriptor.payloadEnd; ++plane) {
+            uint byte = uint(packets[cursor]);
+            cursor += 1u;
+            for (uint pixel = 0u; pixel < 8u; ++pixel) {
+                magnitudes[pixel] = (magnitudes[pixel] << 1u) | ((byte >> pixel) & 1u);
+            }
+        }
+
+        for (uint pixel = 0u; pixel < 8u; ++pixel) {
+            uint magnitude = magnitudes[pixel];
+            if (magnitude == 0u) {
+                continue;
+            }
+
+            uint2 coord = pyrowave_coordinate_in_8x8(subblock, pixel);
+            uint localX = smallOriginX + coord.x;
+            uint localY = smallOriginY + coord.y;
+            if (localX < descriptor.validWidth && localY < descriptor.validHeight) {
+                uint destinationOffset = (descriptor.originY + localY) * descriptor.stride + descriptor.originX + localX;
+                if (destinationOffset < constants.sampleCount) {
+                    uint signByte = uint(packets[signStart + signIndex / 8u]);
+                    bool negative = ((signByte >> (signIndex & 7u)) & 1u) != 0u;
+                    float value = float(magnitude);
+                    value = negative ? -(value + 0.5f) : value + 0.5f;
+                    samples[destinationOffset] = value * coefficientToSampleScale;
+                }
+            }
+            signIndex += 1u;
+        }
+    }
 }
 
 kernel void pyrowave_rate_control_bucket_indices(
