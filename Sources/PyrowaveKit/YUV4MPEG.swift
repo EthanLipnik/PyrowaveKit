@@ -72,8 +72,14 @@ public struct YUV4MPEGReader {
 
 public struct YUV4MPEGWriter {
     private var handle: FileHandle
+    public let width: Int
+    public let height: Int
+    public let chroma: ChromaSubsampling
 
     public init(url: URL, width: Int, height: Int, chroma: ChromaSubsampling, frameRate: String = "60:1") throws {
+        self.width = width
+        self.height = height
+        self.chroma = chroma
         FileManager.default.createFile(atPath: url.path, contents: nil)
         handle = try FileHandle(forWritingTo: url)
         let chromaTag = chroma == .yuv444 ? "C444" : "C420jpeg"
@@ -81,6 +87,9 @@ public struct YUV4MPEGWriter {
     }
 
     public mutating func writeFrame(_ frame: YUVFrame) throws {
+        guard frame.width == width, frame.height == height, frame.chroma == chroma else {
+            throw PyrowaveError.invalidDimensions
+        }
         try handle.write(contentsOf: Data("FRAME\n".utf8))
         try handle.write(contentsOf: Data(frame.y.data))
         try handle.write(contentsOf: Data(frame.cb.data))

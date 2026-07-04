@@ -34,4 +34,34 @@ public enum TestFrames {
             cr: Plane8(width: width / 2, height: height / 2, data: cr)
         )
     }
+
+    public static func synthetic444(width: Int, height: Int, frameIndex: Int = 0) throws -> YUVFrame {
+        guard width > 0, height > 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        var y = Array(repeating: UInt8(0), count: width * height)
+        var cb = y
+        var cr = y
+
+        for row in 0..<height {
+            for column in 0..<width {
+                let index = row * width + column
+                let gradient = (column * 255) / max(1, width - 1)
+                let wave = Int(28.0 * sin(Double(row + frameIndex * 5) / 11.0))
+                y[index] = UInt8(clamping: gradient + wave)
+                cb[index] = UInt8(clamping: 128 + ((row * 3 + column + frameIndex) % 48) - 24)
+                cr[index] = UInt8(clamping: 128 + ((column * 5 + row + frameIndex) % 64) - 32)
+            }
+        }
+
+        return try YUVFrame(
+            width: width,
+            height: height,
+            chroma: .yuv444,
+            y: Plane8(width: width, height: height, data: y),
+            cb: Plane8(width: width, height: height, data: cb),
+            cr: Plane8(width: width, height: height, data: cr)
+        )
+    }
 }

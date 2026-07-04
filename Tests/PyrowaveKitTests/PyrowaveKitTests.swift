@@ -16,6 +16,20 @@ import Testing
     #expect(metrics.weightedPSNR > 44.0)
 }
 
+@Test func roundTripSynthetic444() throws {
+    let frame = try TestFrames.synthetic444(width: 128, height: 96)
+    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
+    let decoded = try codec.decode(encoded)
+    let metrics = try Metrics.compare(frame, decoded)
+
+    #expect(decoded.width == frame.width)
+    #expect(decoded.height == frame.height)
+    #expect(decoded.chroma == .yuv444)
+    #expect(metrics.y.psnr > 42.0)
+    #expect(metrics.weightedPSNR > 38.0)
+}
+
 @Test func waveletPaddingUsesMirroredRepeat() throws {
     let plane = try Plane8(width: 3, height: 2, data: [
         0, 50, 100,
@@ -56,6 +70,25 @@ import Testing
     var reader = try YUV4MPEGReader(url: url)
     let decoded = try #require(try reader.readFrame())
     #expect(decoded == frame)
+}
+
+@Test func yuv4mpegReadWrite444AndRejectsMismatchedWriterChroma() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("sample444.y4m")
+    let frame = try TestFrames.synthetic444(width: 48, height: 32)
+
+    var writer = try YUV4MPEGWriter(url: url, width: frame.width, height: frame.height, chroma: frame.chroma)
+    try writer.writeFrame(frame)
+
+    var reader = try YUV4MPEGReader(url: url)
+    let decoded = try #require(try reader.readFrame())
+    #expect(decoded == frame)
+
+    let mismatched = try TestFrames.synthetic420(width: 48, height: 32)
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        try writer.writeFrame(mismatched)
+    }
 }
 
 @Test func metalBackendCompilesKernelsWhenDeviceExists() throws {
@@ -245,6 +278,22 @@ import Testing
     #expect(!stream.decodeIsReady())
 }
 
+@Test func packetStreamDecoderReconstructsComplete444Frame() throws {
+    let frame = try TestFrames.synthetic444(width: 96, height: 64)
+    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
+    let expected = try codec.decode(encoded)
+    let packets = try encoded.packetized(maximumPacketBytes: 64)
+    let stream = PyrowavePacketStreamDecoder(useMetalAcceleration: false)
+
+    for packet in packets {
+        try stream.pushPacket(packet)
+    }
+
+    #expect(stream.decodeIsReady())
+    #expect(try stream.decode() == expected)
+}
+
 @Test func packetStreamDecoderAllowsPartialFrameAfterHalfTheBlocks() throws {
     let frame = try TestFrames.synthetic420(width: 96, height: 64)
     let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
@@ -428,6 +477,12 @@ import Testing
 
     let blockIndices = layout.descriptors.map(\.blockIndex)
     #expect(blockIndices == Array(0..<layout.descriptors.count))
+}
+
+@Test func pyrowaveBlockLayoutIncludesTopLevelChromaFor444() throws {
+    let layout = try PyrowaveBlockLayout(width: 256, height: 256, chroma: .yuv444)
+    #expect(layout.descriptors.contains { $0.level == 0 && $0.component == 1 && $0.band == 1 })
+    #expect(layout.descriptors.contains { $0.level == 0 && $0.component == 2 && $0.band == 3 })
 }
 
 @Test func pyrowaveCoefficientBlockPayloadRoundTripsBitPlanes() throws {
