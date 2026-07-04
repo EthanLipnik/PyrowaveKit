@@ -280,7 +280,13 @@ public final class PyrowaveCodec: Sendable {
                 validWidth: descriptor.validWidth,
                 validHeight: descriptor.validHeight,
                 quantCode: try quantCode(for: descriptor, plane: plane),
-                qScaleCodes: try qScaleCodes(for: descriptor, plane: plane)
+                qScaleCodes: try qScaleCodes(for: descriptor, plane: plane),
+                rdoDistortionScale: PyrowaveQuantization.rdoDistortionScale(
+                    level: descriptor.globalLevel,
+                    component: plane.component,
+                    band: descriptor.band,
+                    chroma: layout.chroma
+                )
             )
         }
     }

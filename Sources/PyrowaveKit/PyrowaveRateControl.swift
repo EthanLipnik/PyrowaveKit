@@ -80,20 +80,29 @@ enum PyrowaveRateController {
         validHeight: Int,
         quantCode: UInt8,
         qScaleCode: UInt8 = PyrowaveQuantization.identityQScaleCode,
-        qScaleCodes: [UInt8]? = nil
+        qScaleCodes: [UInt8]? = nil,
+        rdoDistortionScale: Float = 1.0
     ) throws -> PyrowaveRateControlBlock {
+        if let qScaleCodes, qScaleCodes.count != 16 {
+            throw PyrowaveError.invalidBitstream("8x8 quant scale table must contain 16 entries")
+        }
+
         var stats = [PyrowaveBlockStats]()
         stats.reserveCapacity(16)
 
         for tileY in 0..<4 {
             for tileX in 0..<4 {
+                let tileIndex = tileY * 4 + tileX
                 stats.append(make8x8Stats(
                     coefficients: coefficients,
                     stride: stride,
                     originX: originX + tileX * 8,
                     originY: originY + tileY * 8,
                     validWidth: max(0, min(8, validWidth - tileX * 8)),
-                    validHeight: max(0, min(8, validHeight - tileY * 8))
+                    validHeight: max(0, min(8, validHeight - tileY * 8)),
+                    quantCode: quantCode,
+                    qScaleCode: qScaleCodes?[tileIndex] ?? qScaleCode,
+                    rdoDistortionScale: rdoDistortionScale
                 ))
             }
         }
@@ -264,7 +273,10 @@ enum PyrowaveRateController {
         originX: Int,
         originY: Int,
         validWidth: Int,
-        validHeight: Int
+        validHeight: Int,
+        quantCode: UInt8,
+        qScaleCode: UInt8,
+        rdoDistortionScale: Float
     ) -> PyrowaveBlockStats {
         guard validWidth > 0, validHeight > 0 else {
             return PyrowaveBlockStats(
@@ -284,6 +296,8 @@ enum PyrowaveRateController {
         let numPlanes = maximumMagnitude == 0 ? 0 : min(14, significantBitCount(maximumMagnitude))
         var stats = [PyrowaveQuantStats]()
         stats.reserveCapacity(PyrowaveBlockStats.candidateCount)
+        let coefficientToSampleScale = PyrowaveQuantization.decodeBlockScale(quantCode) * PyrowaveQuantization.decode8x8Scale(qScaleCode)
+        let distortionWeight = coefficientToSampleScale * coefficientToSampleScale * rdoDistortionScale
 
         for quantLevel in 0..<PyrowaveBlockStats.candidateCount {
             var squareError = Float(0)
@@ -298,11 +312,13 @@ enum PyrowaveRateController {
                     if retainedMagnitude != 0 {
                         retainedValues += 1
                         encodeCostBits += significantBitCount(retainedMagnitude)
-                        let reconstructedMagnitude = retainedMagnitude << quantLevel
-                        let delta = magnitude - reconstructedMagnitude
-                        squareError += Float(delta * delta)
+                        if quantLevel != 0 {
+                            let reconstructedMagnitude = (Float(retainedMagnitude) + 0.5) * Float(1 << quantLevel)
+                            let delta = Float(magnitude) - reconstructedMagnitude
+                            squareError += delta * delta * distortionWeight
+                        }
                     } else {
-                        squareError += Float(magnitude * magnitude)
+                        squareError += Float(magnitude * magnitude) * distortionWeight
                     }
                 }
             }

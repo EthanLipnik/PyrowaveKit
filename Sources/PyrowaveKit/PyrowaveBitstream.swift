@@ -98,6 +98,33 @@ enum PyrowaveQuantization {
     static func quantizationStep(level: Int, component: Int, band: Int, baseStep: Float, referenceBaseStep: Float = 1.0 / 1024.0) -> Float {
         (baseStep / referenceBaseStep) / quantizationResolution(level: level, component: component, band: band)
     }
+
+    static func rdoDistortionScale(
+        level: Int,
+        component: Int,
+        band: Int,
+        chroma: ChromaSubsampling,
+        precision: Int = 0
+    ) -> Float {
+        let horizontalMidpoint: Float = (band & 1) != 0 ? 0.75 : 0.25
+        let verticalMidpoint: Float = (band & 2) != 0 ? 0.75 : 0.25
+        let dpi: Float = 96.0
+        let viewingDistance: Float = 1.0
+        let cpdNyquist = 0.34 * viewingDistance * dpi
+        var cyclesPerDegree = sqrt(horizontalMidpoint * horizontalMidpoint + verticalMidpoint * verticalMidpoint)
+        cyclesPerDegree *= cpdNyquist * exp2(-Float(level))
+        cyclesPerDegree = max(cyclesPerDegree, 8.0)
+
+        var csf = 2.6 * (0.0192 + 0.114 * cyclesPerDegree)
+        csf *= exp(-pow(0.114 * cyclesPerDegree, 1.1))
+        if component != 0, level != PyrowaveBitstream.decompositionLevels - 1, chroma == .yuv420 {
+            csf *= 0.6
+        }
+
+        let resolution = noisePowerNormalizedResolution(level: level, component: component, band: band, precision: precision)
+        let weightedResolution = csf * resolution
+        return weightedResolution * weightedResolution
+    }
 }
 
 struct PyrowavePacketHeader: Equatable, Sendable {

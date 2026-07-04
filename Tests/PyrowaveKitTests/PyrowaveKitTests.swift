@@ -397,6 +397,9 @@ import Testing
     #expect(PyrowaveQuantization.quantizationResolution(level: 4, component: 0, band: 0) == 512)
     #expect(PyrowaveQuantization.quantizationResolution(level: 1, component: 1, band: 1) == 128)
     #expect(PyrowaveQuantization.quantizationStep(level: 4, component: 0, band: 0, baseStep: 1.0 / 1024.0) == 1.0 / 512.0)
+    let lumaDistortion = PyrowaveQuantization.rdoDistortionScale(level: 1, component: 0, band: 1, chroma: .yuv420)
+    let chromaDistortion = PyrowaveQuantization.rdoDistortionScale(level: 1, component: 1, band: 1, chroma: .yuv420)
+    #expect(abs((chromaDistortion / lumaDistortion) - 0.09) < 0.0001)
     #expect(PyrowaveQuantization.encode8x8ScaleCode(maxScaledCoefficient: 0.999) == PyrowaveQuantization.identityQScaleCode)
     #expect(PyrowaveQuantization.encode8x8ScaleCode(maxScaledCoefficient: 1.75) == PyrowaveQuantization.identityQScaleCode)
     #expect(PyrowaveQuantization.encode8x8ScaleCode(maxScaledCoefficient: 2.0) == 8)
@@ -446,6 +449,32 @@ import Testing
     for threshold in 1..<PyrowaveBlockStats.candidateCount {
         #expect(block.packetByteCosts[threshold] <= block.packetByteCosts[threshold - 1])
     }
+}
+
+@Test func pyrowaveRateControlWeightsBitplaneDistortionLikeQuantShader() throws {
+    let stride = 32
+    var coefficients = Array(repeating: Int16(0), count: stride * stride)
+    coefficients[0] = 8
+    let quantCode = try PyrowaveQuantization.encodeBlockScale(1.0)
+
+    let block = try PyrowaveRateController.makeBlock(
+        blockIndex: 0,
+        coefficients: coefficients,
+        stride: stride,
+        originX: 0,
+        originY: 0,
+        validWidth: 32,
+        validHeight: 32,
+        quantCode: quantCode,
+        qScaleCode: PyrowaveQuantization.identityQScaleCode,
+        rdoDistortionScale: 4.0
+    )
+
+    let stats = block.eightByEightStats[0].stats
+    #expect(stats[0].squareError == 0)
+    #expect(stats[1].squareError == 4)
+    #expect(stats[2].squareError == 16)
+    #expect(stats[4].squareError == 256)
 }
 
 @Test func pyrowaveRateControlUsesClusteredRDBuckets() throws {
