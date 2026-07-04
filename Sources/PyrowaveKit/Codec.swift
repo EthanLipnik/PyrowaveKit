@@ -962,23 +962,15 @@ public final class PyrowaveCodec: @unchecked Sendable {
             }
             return geometry
         }
-        let padded = try metalBackend.padTexturePlaneBuffers(inputs.indices.map { index in
+        let levels = geometries.map {
+            Wavelet.usableLevels(width: $0.paddedWidth, height: $0.paddedHeight, requested: $0.requestedLevels)
+        }
+        let transformed = try metalBackend.padTexturePlaneBuffersAndForwardWaveletBuffers(inputs.indices.map { index in
             (
                 texture: inputs[index].texture,
                 channel: inputs[index].channel,
                 paddedWidth: geometries[index].paddedWidth,
-                paddedHeight: geometries[index].paddedHeight
-            )
-        })
-        let levels = geometries.map {
-            Wavelet.usableLevels(width: $0.paddedWidth, height: $0.paddedHeight, requested: $0.requestedLevels)
-        }
-        let transformed = try metalBackend.forwardWaveletBuffers(inputs.indices.map { index in
-            (
-                buffer: padded[index],
-                sampleCount: geometries[index].paddedWidth * geometries[index].paddedHeight,
-                width: geometries[index].paddedWidth,
-                height: geometries[index].paddedHeight,
+                paddedHeight: geometries[index].paddedHeight,
                 levels: levels[index]
             )
         })

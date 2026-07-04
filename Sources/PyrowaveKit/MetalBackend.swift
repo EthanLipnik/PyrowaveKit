@@ -247,6 +247,132 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         return outputs
     }
 
+    func padTexturePlaneBuffersAndForwardWaveletBuffers(
+        _ planes: [(texture: MTLTexture, channel: Int, paddedWidth: Int, paddedHeight: Int, levels: Int)]
+    ) throws -> [MTLBuffer] {
+        guard !planes.isEmpty else {
+            return []
+        }
+
+        var outputs = [MTLBuffer]()
+        outputs.reserveCapacity(planes.count)
+        var scratchBuffers = [MTLBuffer]()
+        scratchBuffers.reserveCapacity(planes.count)
+
+        for plane in planes {
+            let validChannel = plane.texture.pixelFormat == .r8Unorm
+                ? plane.channel == 0
+                : (plane.texture.pixelFormat == .rg8Unorm && (plane.channel == 0 || plane.channel == 1))
+            guard validChannel else {
+                throw PyrowaveError.unsupportedFormat("Metal texture padding expects r8Unorm channel 0 or rg8Unorm channel 0/1")
+            }
+            guard plane.texture.width > 0,
+                  plane.texture.height > 0,
+                  plane.paddedWidth > 0,
+                  plane.paddedHeight > 0,
+                  plane.texture.width <= Int(UInt32.max),
+                  plane.texture.height <= Int(UInt32.max),
+                  plane.paddedWidth <= Int(UInt32.max),
+                  plane.paddedHeight <= Int(UInt32.max) else {
+                throw PyrowaveError.invalidDimensions
+            }
+            let sampleCount = plane.paddedWidth * plane.paddedHeight
+            guard sampleCount > 0, sampleCount <= Int(UInt32.max) else {
+                throw PyrowaveError.invalidDimensions
+            }
+            try validateWaveletShape(width: plane.paddedWidth, height: plane.paddedHeight, levels: plane.levels)
+
+            guard let output = device.makeBuffer(length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared),
+                  let scratch = device.makeBuffer(length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal texture padding/DWT buffers")
+            }
+            outputs.append(output)
+            scratchBuffers.append(scratch)
+        }
+
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal texture padding/DWT command encoder")
+        }
+
+        encoder.setComputePipelineState(padTexturePlanePipeline)
+        let width = min(16, padTexturePlanePipeline.maxTotalThreadsPerThreadgroup)
+        let height = max(1, min(16, padTexturePlanePipeline.maxTotalThreadsPerThreadgroup / width))
+        let threadsPerThreadgroup = MTLSize(width: width, height: height, depth: 1)
+        for (index, plane) in planes.enumerated() {
+            var constants = PadPlaneConstants(
+                sourceWidth: UInt32(plane.texture.width),
+                sourceHeight: UInt32(plane.texture.height),
+                paddedWidth: UInt32(plane.paddedWidth),
+                paddedHeight: UInt32(plane.paddedHeight),
+                channel: UInt32(plane.channel)
+            )
+            encoder.setTexture(plane.texture, index: 0)
+            encoder.setBuffer(outputs[index], offset: 0, index: 0)
+            encoder.setBytes(&constants, length: MemoryLayout<PadPlaneConstants>.stride, index: 1)
+            encoder.dispatchThreads(
+                MTLSize(width: plane.paddedWidth, height: plane.paddedHeight, depth: 1),
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
+        encoder.endEncoding()
+
+        let maxLevels = planes.map(\.levels).max() ?? 0
+        for level in 0..<maxLevels {
+            var active = [DWTBatchDispatch]()
+            active.reserveCapacity(planes.count)
+            for (planeIndex, plane) in planes.enumerated() where level < plane.levels {
+                active.append(DWTBatchDispatch(
+                    primary: outputs[planeIndex],
+                    scratch: scratchBuffers[planeIndex],
+                    activeWidth: plane.paddedWidth >> level,
+                    activeHeight: plane.paddedHeight >> level,
+                    stride: plane.paddedWidth
+                ))
+            }
+            guard !active.isEmpty else {
+                continue
+            }
+
+            for phase in 0...4 {
+                try encodeDWTInPlaceBatch(
+                    commandBuffer: commandBuffer,
+                    pipeline: dwtLiftRowsPipeline,
+                    dispatches: active.map {
+                        (buffer: $0.primary, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: phase)
+                    }
+                )
+            }
+            try encodeDWTCopyBatch(
+                commandBuffer: commandBuffer,
+                pipeline: dwtPackRowsPipeline,
+                dispatches: active.map {
+                    (input: $0.primary, output: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: 0)
+                }
+            )
+
+            for phase in 0...4 {
+                try encodeDWTInPlaceBatch(
+                    commandBuffer: commandBuffer,
+                    pipeline: dwtLiftColumnsPipeline,
+                    dispatches: active.map {
+                        (buffer: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: phase)
+                    }
+                )
+            }
+            try encodeDWTCopyBatch(
+                commandBuffer: commandBuffer,
+                pipeline: dwtPackColumnsPipeline,
+                dispatches: active.map {
+                    (input: $0.scratch, output: $0.primary, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: 0)
+                }
+            )
+        }
+
+        try finish(commandBuffer: commandBuffer, context: "Metal texture padding/DWT")
+        return outputs
+    }
+
     func cropPlane(_ samples: [Float], paddedWidth: Int, width: Int, height: Int) throws -> Plane8 {
         guard paddedWidth > 0,
               width > 0,
