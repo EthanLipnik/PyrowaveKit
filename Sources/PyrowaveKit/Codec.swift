@@ -407,34 +407,85 @@ public final class PyrowaveCodec: @unchecked Sendable {
         layout: PyrowaveBlockLayout,
         configuration: CodecConfiguration
     ) throws -> EncodedFrame {
-        let defaultBlocks = try sparseBlocks(
-            encodedPlanes,
-            layout: layout,
-            sequence: sequenceNumber,
-            quantLevelsByPlane: nil,
-            packetByteCostsByPlane: nil,
-            defaultQuantLevel: 0
-        ).flatMap { $0 }
-        let defaultFrame = try assembleEncodedFrame(
-            width: width,
-            height: height,
-            chroma: chroma,
-            videoSignal: videoSignal,
-            sequenceNumber: sequenceNumber,
-            totalLayoutBlocks: layout.descriptors.count,
-            blocks: defaultBlocks
-        )
         guard let maximumEncodedBytes = configuration.maximumEncodedBytes else {
-            return defaultFrame
+            let defaultBlocks = try sparseBlocks(
+                encodedPlanes,
+                layout: layout,
+                sequence: sequenceNumber,
+                quantLevelsByPlane: nil,
+                packetByteCostsByPlane: nil,
+                defaultQuantLevel: 0
+            ).flatMap { $0 }
+            return try assembleEncodedFrame(
+                width: width,
+                height: height,
+                chroma: chroma,
+                videoSignal: videoSignal,
+                sequenceNumber: sequenceNumber,
+                totalLayoutBlocks: layout.descriptors.count,
+                blocks: defaultBlocks
+            )
         }
-        if defaultFrame.data.count <= maximumEncodedBytes {
-            return defaultFrame
+
+        let preflightPacketByteCosts: [[[Int]]]?
+        if shouldPreflightCappedFrame(width: width, height: height, maximumEncodedBytes: maximumEncodedBytes) {
+            let descriptorsByPlane = encodedPlanes.map { planeBlockDescriptors(plane: $0, layout: layout) }
+            let packetByteCostsByPlane = try metalSparsePacketByteCosts(
+                planes: encodedPlanes,
+                descriptorsByPlane: descriptorsByPlane
+            )
+            if defaultFrameByteEstimate(packetByteCostsByPlane: packetByteCostsByPlane) <= maximumEncodedBytes {
+                let defaultBlocks = try sparseBlocks(
+                    encodedPlanes,
+                    layout: layout,
+                    sequence: sequenceNumber,
+                    quantLevelsByPlane: nil,
+                    packetByteCostsByPlane: packetByteCostsByPlane,
+                    defaultQuantLevel: 0
+                ).flatMap { $0 }
+                let defaultFrame = try assembleEncodedFrame(
+                    width: width,
+                    height: height,
+                    chroma: chroma,
+                    videoSignal: videoSignal,
+                    sequenceNumber: sequenceNumber,
+                    totalLayoutBlocks: layout.descriptors.count,
+                    blocks: defaultBlocks
+                )
+                guard defaultFrame.data.count > maximumEncodedBytes else {
+                    return defaultFrame
+                }
+            }
+            preflightPacketByteCosts = packetByteCostsByPlane
+        } else {
+            let defaultBlocks = try sparseBlocks(
+                encodedPlanes,
+                layout: layout,
+                sequence: sequenceNumber,
+                quantLevelsByPlane: nil,
+                packetByteCostsByPlane: nil,
+                defaultQuantLevel: 0
+            ).flatMap { $0 }
+            let defaultFrame = try assembleEncodedFrame(
+                width: width,
+                height: height,
+                chroma: chroma,
+                videoSignal: videoSignal,
+                sequenceNumber: sequenceNumber,
+                totalLayoutBlocks: layout.descriptors.count,
+                blocks: defaultBlocks
+            )
+            if defaultFrame.data.count <= maximumEncodedBytes {
+                return defaultFrame
+            }
+            preflightPacketByteCosts = nil
         }
 
         let rateControlPlan = try selectSparseRateControlPlan(
             planes: encodedPlanes,
             layout: layout,
-            configuration: configuration
+            configuration: configuration,
+            packetByteCostsByPlane: preflightPacketByteCosts
         )
         let planeBlocks = try sparseBlocks(
             encodedPlanes,
@@ -459,6 +510,18 @@ public final class PyrowaveCodec: @unchecked Sendable {
         }
 
         return rateControlledFrame
+    }
+
+    private func shouldPreflightCappedFrame(width: Int, height: Int, maximumEncodedBytes: Int) -> Bool {
+        Int64(maximumEncodedBytes) * 16 < Int64(width) * Int64(height)
+    }
+
+    private func defaultFrameByteEstimate(packetByteCostsByPlane: [[[Int]]]) -> Int {
+        packetByteCostsByPlane.reduce(frameHeaderSize) { frameBytes, planeCosts in
+            frameBytes + planeCosts.reduce(0) { planeBytes, blockCosts in
+                planeBytes + (blockCosts.first ?? 0)
+            }
+        }
     }
 
     private func assembleEncodedFrame(
@@ -1008,15 +1071,20 @@ public final class PyrowaveCodec: @unchecked Sendable {
     private func selectSparseRateControlPlan(
         planes: [EncodedPlane],
         layout: PyrowaveBlockLayout,
-        configuration: CodecConfiguration
+        configuration: CodecConfiguration,
+        packetByteCostsByPlane: [[[Int]]]? = nil
     ) throws -> SparseRateControlPlan {
         guard let maximumEncodedBytes = configuration.maximumEncodedBytes else {
             return SparseRateControlPlan(defaultQuantLevel: 0, quantLevelsByPlane: nil, packetByteCostsByPlane: nil)
         }
 
         let fixedHeaderBytes = frameHeaderSize
-        let rateBlocksByPlane = try makeRateControlBlocks(planes, layout: layout)
-        let packetByteCostsByPlane = rateBlocksByPlane.map { $0.map(\.packetByteCosts) }
+        let rateBlocksByPlane = try makeRateControlBlocks(
+            planes,
+            layout: layout,
+            packetByteCostsByPlane: packetByteCostsByPlane
+        )
+        let selectedPacketByteCostsByPlane = rateBlocksByPlane.map { $0.map(\.packetByteCosts) }
         let metalBucketData = try metalRateControlBucketData(blocksByPlane: rateBlocksByPlane)
         if let thresholdsByPlane = PyrowaveRateController.selectThresholds(
             blocksByPlane: rateBlocksByPlane,
@@ -1028,7 +1096,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
             return SparseRateControlPlan(
                 defaultQuantLevel: 0,
                 quantLevelsByPlane: thresholdsByPlane,
-                packetByteCostsByPlane: packetByteCostsByPlane
+                packetByteCostsByPlane: selectedPacketByteCostsByPlane
             )
         }
 
@@ -1052,7 +1120,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         return SparseRateControlPlan(
             defaultQuantLevel: low,
             quantLevelsByPlane: nil,
-            packetByteCostsByPlane: packetByteCostsByPlane
+            packetByteCostsByPlane: selectedPacketByteCostsByPlane
         )
     }
 
@@ -1306,12 +1374,56 @@ public final class PyrowaveCodec: @unchecked Sendable {
         return costs
     }
 
+    private func metalSparsePacketByteCosts(
+        planes: [EncodedPlane],
+        descriptorsByPlane: [[PlaneBlockDescriptor]]
+    ) throws -> [[[Int]]] {
+        guard planes.count == descriptorsByPlane.count else {
+            throw PyrowaveError.processFailed("packet byte-cost plane count does not match descriptor plane count")
+        }
+        guard planes.allSatisfy({ $0.coefficientBuffer != nil }) else {
+            return try planes.indices.map { index in
+                try metalSparsePacketByteCosts(
+                    plane: planes[index],
+                    descriptors: descriptorsByPlane[index]
+                )
+            }
+        }
+
+        let packetCostDescriptorsByPlane = zip(planes, descriptorsByPlane).map { plane, descriptors in
+            metalPacketByteCostDescriptors(descriptors: descriptors, stride: plane.paddedWidth)
+        }
+        let costsByPlane = try metalBackend.packetByteCostsBatch(planes.indices.map { index in
+            (
+                coefficientBuffer: planes[index].coefficientBuffer!,
+                coefficientCount: planes[index].coefficientCount,
+                descriptors: packetCostDescriptorsByPlane[index]
+            )
+        })
+        guard costsByPlane.count == planes.count else {
+            throw PyrowaveError.processFailed("Metal packet byte-cost returned \(costsByPlane.count) planes for \(planes.count) inputs")
+        }
+        for planeIndex in planes.indices {
+            guard costsByPlane[planeIndex].count == descriptorsByPlane[planeIndex].count else {
+                throw PyrowaveError.processFailed("Metal packet byte-cost returned \(costsByPlane[planeIndex].count) block costs for \(descriptorsByPlane[planeIndex].count) descriptors")
+            }
+        }
+        return costsByPlane
+    }
+
     private func makeRateControlBlocks(_ plane: EncodedPlane, layout: PyrowaveBlockLayout) throws -> [PyrowaveRateControlBlock] {
         let descriptors = planeBlockDescriptors(plane: plane, layout: layout)
         return try makeRateControlBlocksWithMetal(plane, descriptors: descriptors, layout: layout, backend: metalBackend)
     }
 
-    private func makeRateControlBlocks(_ planes: [EncodedPlane], layout: PyrowaveBlockLayout) throws -> [[PyrowaveRateControlBlock]] {
+    private func makeRateControlBlocks(
+        _ planes: [EncodedPlane],
+        layout: PyrowaveBlockLayout,
+        packetByteCostsByPlane: [[[Int]]]? = nil
+    ) throws -> [[PyrowaveRateControlBlock]] {
+        if let packetByteCostsByPlane, packetByteCostsByPlane.count != planes.count {
+            throw PyrowaveError.processFailed("packet byte-cost plane count \(packetByteCostsByPlane.count) does not match plane count \(planes.count)")
+        }
         guard planes.allSatisfy({ $0.coefficientBuffer != nil }) else {
             return try planes.map { try makeRateControlBlocks($0, layout: layout) }
         }
@@ -1358,21 +1470,20 @@ public final class PyrowaveCodec: @unchecked Sendable {
                 descriptors: statsDescriptorsByPlane[index]
             )
         })
-        let packetCostDescriptorsByPlane = zip(planes, descriptorsByPlane).map { plane, descriptors in
-            metalPacketByteCostDescriptors(descriptors: descriptors, stride: plane.paddedWidth)
-        }
-        let packetByteCostsByPlane = try metalBackend.packetByteCostsBatch(planes.indices.map { index in
-            (
-                coefficientBuffer: planes[index].coefficientBuffer!,
-                coefficientCount: planes[index].coefficientCount,
-                descriptors: packetCostDescriptorsByPlane[index]
+        let selectedPacketByteCostsByPlane: [[[Int]]]
+        if let packetByteCostsByPlane {
+            selectedPacketByteCostsByPlane = packetByteCostsByPlane
+        } else {
+            selectedPacketByteCostsByPlane = try metalSparsePacketByteCosts(
+                planes: planes,
+                descriptorsByPlane: descriptorsByPlane
             )
-        })
+        }
 
         return try planes.indices.map { planeIndex in
             let descriptors = descriptorsByPlane[planeIndex]
             let tileStats = tileStatsByPlane[planeIndex]
-            let packetByteCosts = packetByteCostsByPlane[planeIndex]
+            let packetByteCosts = selectedPacketByteCostsByPlane[planeIndex]
             guard tileStats.count == statsDescriptorsByPlane[planeIndex].count else {
                 throw PyrowaveError.processFailed("Metal rate-control returned \(tileStats.count) tile stats for \(statsDescriptorsByPlane[planeIndex].count) descriptors")
             }
