@@ -291,6 +291,106 @@ import Testing
     #expect(empty.decodeMillisecondsPerFrame == 0)
 }
 
+@Test func benchmarkArgumentsDefaultToGitIgnoredSixKBaseline() throws {
+    let arguments = try PyrowaveBenchmarkArguments([])
+    #expect(arguments.input == nil)
+    #expect(arguments.frames == 60)
+    #expect(arguments.width == 6144)
+    #expect(arguments.height == 3456)
+    #expect(arguments.bitrate == 80_000_000)
+    #expect(arguments.quantizationStep == 1.0 / 1024.0)
+    #expect(arguments.outputDirectory.path.hasSuffix(".pyrowave-results"))
+    #expect(arguments.maximumPyrowaveBytes == nil)
+    #expect(arguments.matchHEVCFrameBudget)
+    #expect(!arguments.shouldShowHelp)
+}
+
+@Test func benchmarkArgumentsParsePresetsAndBudgetModes() throws {
+    let custom = try PyrowaveBenchmarkArguments([
+        "--preset", "4k",
+        "--frames", "12",
+        "--output-dir", ".pyrowave-results/custom",
+        "--bitrate", "40000000",
+        "--quantization-step", "0.002",
+        "--max-pyrowave-bytes", "123456"
+    ])
+    #expect(custom.width == 3840)
+    #expect(custom.height == 2160)
+    #expect(custom.frames == 12)
+    #expect(custom.outputDirectory.path.hasSuffix(".pyrowave-results/custom"))
+    #expect(custom.bitrate == 40_000_000)
+    #expect(abs(custom.quantizationStep - 0.002) < 0.000001)
+    #expect(custom.maximumPyrowaveBytes == 123_456)
+    #expect(!custom.matchHEVCFrameBudget)
+
+    let size = try PyrowaveBenchmarkArguments(["--size", "1920x1080", "--unbounded-pyrowave"])
+    #expect(size.width == 1920)
+    #expect(size.height == 1080)
+    #expect(size.maximumPyrowaveBytes == nil)
+    #expect(!size.matchHEVCFrameBudget)
+}
+
+@Test func benchmarkArgumentsValidateInputsWithoutRunningBenchmark() throws {
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try PyrowaveBenchmarkArguments(["--frames", "0"])
+    }
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try PyrowaveBenchmarkArguments(["--size", "bad"])
+    }
+    #expect(throws: PyrowaveError.unsupportedFormat("unknown preset 8k")) {
+        _ = try PyrowaveBenchmarkArguments(["--preset", "8k"])
+    }
+
+    let help = try PyrowaveBenchmarkArguments(["--help"])
+    #expect(help.shouldShowHelp)
+    #expect(PyrowaveBenchmarkArguments.usage.contains("--preset 6k|4k|1080p|720p"))
+}
+
+@Test func benchmarkReportSchemaNamesReviewArtifacts() throws {
+    let pyrowave = CodecBenchmarkResult(
+        codec: "pyrowavekit-swift-metal-hybrid",
+        frameCount: 60,
+        encodedBytes: 240,
+        encodeSeconds: 0.25,
+        decodeSeconds: 0.10,
+        metrics: nil,
+        note: nil
+    )
+    let hevc = CodecBenchmarkResult(
+        codec: "hevc_avkit",
+        frameCount: 60,
+        encodedBytes: 80,
+        encodeSeconds: 2.0,
+        decodeSeconds: 0.50,
+        metrics: nil,
+        note: nil
+    )
+    let report = PyrowaveBenchmarkReport(
+        generatedAt: "2026-07-03T00:00:00Z",
+        width: PyrowaveBenchmarkArguments.defaultWidth,
+        height: PyrowaveBenchmarkArguments.defaultHeight,
+        frames: PyrowaveBenchmarkArguments.defaultFrames,
+        frameRateNumerator: 60,
+        frameRateDenominator: 1,
+        bitrate: PyrowaveBenchmarkArguments.defaultBitrate,
+        pyrowaveFrameBudgetBytes: 166_667,
+        pyrowave: pyrowave,
+        hevc: hevc,
+        comparison: CodecBenchmarkComparison(pyrowave: pyrowave, hevc: hevc)
+    )
+
+    #expect(report.artifacts.referenceY4M == PyrowaveBenchmarkArtifactNames.referenceY4M)
+    #expect(report.artifacts.pyrowaveStream == PyrowaveBenchmarkArtifactNames.pyrowaveStream)
+    #expect(report.artifacts.pyrowaveDecodedY4M == PyrowaveBenchmarkArtifactNames.pyrowaveDecodedY4M)
+    #expect(report.artifacts.hevcMovie == PyrowaveBenchmarkArtifactNames.hevcMovie)
+    #expect(report.artifacts.hevcDecodedY4M == PyrowaveBenchmarkArtifactNames.hevcDecodedY4M)
+    #expect(PyrowaveBenchmarkArtifactNames.report == "benchmark-report.json")
+
+    let encoded = try JSONEncoder().encode(report)
+    let decoded = try JSONDecoder().decode(PyrowaveBenchmarkReport.self, from: encoded)
+    #expect(decoded == report)
+}
+
 @Test func codecBenchmarkComparisonReportsHEVCDeltas() throws {
     let pyrowave = CodecBenchmarkResult(
         codec: "pyrowave",
