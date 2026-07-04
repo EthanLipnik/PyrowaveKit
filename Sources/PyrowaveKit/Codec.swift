@@ -554,6 +554,17 @@ public final class PyrowaveCodec: Sendable {
                 descriptors: descriptors
             )
         }
+        if let metalBackend {
+            return try sparseBlocksWithMetal(
+                plane,
+                descriptors: descriptors,
+                sequence: sequence,
+                quantLevels: quantLevels,
+                packetByteCosts: selectedPacketByteCosts,
+                defaultQuantLevel: defaultQuantLevel,
+                backend: metalBackend
+            )
+        }
 
         for (index, descriptor) in descriptors.enumerated() {
             let quantLevel = quantLevels?[index] ?? defaultQuantLevel
@@ -582,6 +593,65 @@ public final class PyrowaveCodec: Sendable {
         }
 
         return blocks
+    }
+
+    private func sparseBlocksWithMetal(
+        _ plane: EncodedPlane,
+        descriptors: [PlaneBlockDescriptor],
+        sequence: UInt8,
+        quantLevels: [Int]?,
+        packetByteCosts: [[Int]]?,
+        defaultQuantLevel: Int,
+        backend: MetalPyrowaveBackend
+    ) throws -> [SparseBlock] {
+        var packetDescriptors = [MetalSparsePacketEncodeDescriptor]()
+        var packetQScaleCodes = [[UInt8]]()
+        var blockIndices = [Int]()
+        packetDescriptors.reserveCapacity(descriptors.count)
+        packetQScaleCodes.reserveCapacity(descriptors.count)
+        blockIndices.reserveCapacity(descriptors.count)
+
+        for (index, descriptor) in descriptors.enumerated() {
+            let quantLevel = quantLevels?[index] ?? defaultQuantLevel
+            guard quantLevel >= 0 else {
+                throw PyrowaveError.invalidBitstream("negative quant level")
+            }
+            if let packetByteCosts,
+               quantLevel < packetByteCosts[index].count,
+               packetByteCosts[index][quantLevel] == 0 {
+                continue
+            }
+            guard quantLevel <= Int(UInt32.max),
+                  descriptor.blockIndex <= Int(UInt32.max),
+                  plane.paddedWidth <= Int(UInt32.max) else {
+                throw PyrowaveError.invalidDimensions
+            }
+            packetDescriptors.append(MetalSparsePacketEncodeDescriptor(
+                originX: UInt32(descriptor.originX),
+                originY: UInt32(descriptor.originY),
+                validWidth: UInt32(descriptor.validWidth),
+                validHeight: UInt32(descriptor.validHeight),
+                stride: UInt32(plane.paddedWidth),
+                blockIndex: UInt32(descriptor.blockIndex),
+                quantLevel: UInt32(quantLevel),
+                sequence: UInt32(sequence),
+                quantCode: UInt32(try quantCode(for: descriptor, plane: plane))
+            ))
+            packetQScaleCodes.append(try qScaleCodes(for: descriptor, plane: plane))
+            blockIndices.append(descriptor.blockIndex)
+        }
+
+        let packets = try backend.encodeSparsePackets(
+            coefficients: plane.coefficients,
+            descriptors: packetDescriptors,
+            qScaleCodes: packetQScaleCodes
+        )
+        guard packets.count == packetDescriptors.count else {
+            throw PyrowaveError.processFailed("Metal sparse packet encode returned \(packets.count) packets for \(packetDescriptors.count) descriptors")
+        }
+        return packets.indices.compactMap { index in
+            packets[index].map { SparseBlock(blockIndex: blockIndices[index], data: $0) }
+        }
     }
 
     private func metalSparsePacketByteCosts(

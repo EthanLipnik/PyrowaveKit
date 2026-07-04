@@ -758,6 +758,7 @@ import CoreVideo
         _ = try backend.makeFunction(named: "pyrowave_apply_sparse_coefficients")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_tile_stats")
         _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs")
+        _ = try backend.makeFunction(named: "pyrowave_encode_sparse_packets")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_indices")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_savings")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_savings_prefix")
@@ -1057,6 +1058,78 @@ import CoreVideo
     #expect(metal.count == descriptors.count)
     #expect(metal[0] == cpu)
     #expect(metal[1] == Array(repeating: 0, count: PyrowaveBlockStats.candidateCount))
+    #endif
+}
+
+@Test func metalSparsePacketEncodingMatchesCPUReferenceWhenDeviceExists() throws {
+    #if canImport(Metal)
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let stride = 40
+    var coefficients = Array(repeating: Int16(0), count: stride * 40)
+    for y in 0..<27 {
+        for x in 0..<29 {
+            let raw = ((x * 47 + y * 23 + x * y * 5) % 1021) - 510
+            coefficients[(2 + y) * stride + 3 + x] = Int16(raw)
+        }
+    }
+    coefficients[5 * stride + 7] = -32768
+
+    let quantCode = try PyrowaveQuantization.encodeBlockScale(1.0 / 1024.0)
+    let qScaleCodes = (0..<16).map { UInt8(($0 * 7) % 16) }
+    let descriptors = [
+        MetalSparsePacketEncodeDescriptor(
+            originX: 3,
+            originY: 2,
+            validWidth: 29,
+            validHeight: 27,
+            stride: UInt32(stride),
+            blockIndex: 37,
+            quantLevel: 2,
+            sequence: 5,
+            quantCode: UInt32(quantCode)
+        ),
+        MetalSparsePacketEncodeDescriptor(
+            originX: 32,
+            originY: 32,
+            validWidth: 8,
+            validHeight: 8,
+            stride: UInt32(stride),
+            blockIndex: 38,
+            quantLevel: 0,
+            sequence: 5,
+            quantCode: UInt32(quantCode)
+        )
+    ]
+
+    let metal = try backend.encodeSparsePackets(
+        coefficients: coefficients,
+        descriptors: descriptors,
+        qScaleCodes: [qScaleCodes, qScaleCodes]
+    )
+    let cpu = try PyrowaveCoefficientBlockCodec.encodeBlock(
+        blockIndex: 37,
+        coefficients: coefficients,
+        stride: stride,
+        originX: 3,
+        originY: 2,
+        validWidth: 29,
+        validHeight: 27,
+        threshold: 0,
+        quantLevel: 2,
+        sequence: 5,
+        quantCode: quantCode,
+        qScaleCodes: qScaleCodes
+    )
+
+    #expect(metal.count == descriptors.count)
+    #expect(metal[0] == cpu)
+    #expect(metal[1] == nil)
     #endif
 }
 

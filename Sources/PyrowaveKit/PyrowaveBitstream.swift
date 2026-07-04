@@ -356,6 +356,7 @@ struct PyrowaveBlockLayout: Sendable {
 }
 
 struct PyrowaveCoefficientBlockCodec {
+    static let maximumEncodedBlockBytes = 2_240
     private static let subblockCount = 8
     private static let pixelsPerSubblock = 8
 
