@@ -59,6 +59,17 @@ struct PyrowaveRateControlBlock: Equatable {
 }
 
 enum PyrowaveRateController {
+    private static let bucketCount = 128
+    private static let bucketClusterWidth = 16
+
+    struct RDOperation: Equatable {
+        var bucket: Int
+        var planeIndex: Int
+        var blockIndex: Int
+        var quantLevel: Int
+        var saving: Int
+    }
+
     static func makeBlock(
         blockIndex: Int,
         coefficients: [Int16],
@@ -125,61 +136,34 @@ enum PyrowaveRateController {
             thresholdsByPlane: thresholds,
             fixedHeaderBytes: fixedHeaderBytes
         )
-
-        if currentBytes <= maximumEncodedBytes {
+        var requiredSavings = currentBytes - maximumEncodedBytes
+        guard requiredSavings > 0 else {
             return thresholds
         }
 
-        while currentBytes > maximumEncodedBytes {
-            var best: (plane: Int, block: Int, nextThreshold: Int, saving: Int, score: Float)?
-
-            for (planeIndex, blocks) in blocksByPlane.enumerated() {
-                for (blockIndex, block) in blocks.enumerated() {
-                    let currentThreshold = thresholds[planeIndex][blockIndex]
-                    guard currentThreshold + 1 < PyrowaveRateControlBlock.candidateCount else {
-                        continue
-                    }
-
-                    let currentCost = block.packetByteCost(quantLevel: currentThreshold)
-                    var nextThreshold = currentThreshold + 1
-                    while nextThreshold < PyrowaveRateControlBlock.candidateCount &&
-                        block.packetByteCost(quantLevel: nextThreshold) == currentCost {
-                        nextThreshold += 1
-                    }
-                    guard nextThreshold < PyrowaveRateControlBlock.candidateCount else {
-                        continue
-                    }
-
-                    let nextCost = block.packetByteCost(quantLevel: nextThreshold)
-                    let saving = currentCost - nextCost
-                    guard saving > 0 else {
-                        continue
-                    }
-
-                    let distortionDelta = max(
-                        0,
-                        block.distortion(quantLevel: nextThreshold) - block.distortion(quantLevel: currentThreshold)
-                    )
-                    let score = distortionDelta / Float(saving)
-                    if best == nil ||
-                        score < best!.score ||
-                        (score == best!.score && saving > best!.saving) ||
-                        (score == best!.score && saving == best!.saving && planeIndex < best!.plane) ||
-                        (score == best!.score && saving == best!.saving && planeIndex == best!.plane && blockIndex < best!.block) {
-                        best = (planeIndex, blockIndex, nextThreshold, saving, score)
-                    }
-                }
-            }
-
-            guard let operation = best else {
-                return nil
-            }
-
-            thresholds[operation.plane][operation.block] = operation.nextThreshold
-            currentBytes -= operation.saving
+        let operations = makeRDOperations(blocksByPlane: blocksByPlane)
+        guard !operations.isEmpty else {
+            return nil
         }
 
-        return thresholds
+        for operation in operations where requiredSavings > 0 {
+            let currentLevel = thresholds[operation.planeIndex][operation.blockIndex]
+            guard operation.quantLevel > currentLevel else {
+                continue
+            }
+
+            let block = blocksByPlane[operation.planeIndex][operation.blockIndex]
+            let actualSaving = block.packetByteCost(quantLevel: currentLevel) - block.packetByteCost(quantLevel: operation.quantLevel)
+            guard actualSaving > 0 else {
+                continue
+            }
+
+            thresholds[operation.planeIndex][operation.blockIndex] = operation.quantLevel
+            currentBytes -= actualSaving
+            requiredSavings -= actualSaving
+        }
+
+        return currentBytes <= maximumEncodedBytes ? thresholds : nil
     }
 
     static func estimateFrameBytes(
@@ -194,6 +178,84 @@ enum PyrowaveRateController {
             }
         }
         return byteCount
+    }
+
+    static func makeRDOperations(blocksByPlane: [[PyrowaveRateControlBlock]]) -> [RDOperation] {
+        var buckets = Array(repeating: [RDOperation](), count: bucketCount)
+
+        for (planeIndex, blocks) in blocksByPlane.enumerated() {
+            for (blockIndex, block) in blocks.enumerated() {
+                let bucketIndices = inclusiveBucketIndices(for: block)
+                for quantLevel in 1..<PyrowaveRateControlBlock.candidateCount {
+                    let saving = block.packetByteCost(quantLevel: quantLevel - 1) - block.packetByteCost(quantLevel: quantLevel)
+                    guard saving > 0 else {
+                        continue
+                    }
+
+                    let bucket = bucketIndices[quantLevel]
+                    buckets[bucket].append(RDOperation(
+                        bucket: bucket,
+                        planeIndex: planeIndex,
+                        blockIndex: blockIndex,
+                        quantLevel: quantLevel,
+                        saving: saving
+                    ))
+                }
+            }
+        }
+
+        return buckets.flatMap { bucket in
+            bucket.sorted {
+                if $0.planeIndex != $1.planeIndex {
+                    return $0.planeIndex < $1.planeIndex
+                }
+                if $0.blockIndex != $1.blockIndex {
+                    return $0.blockIndex < $1.blockIndex
+                }
+                return $0.quantLevel < $1.quantLevel
+            }
+        }
+    }
+
+    static func distortionBucketIndex(distortion: Float, cost: Int, baseDistortion: Float, baseCost: Int) -> Int {
+        guard cost != baseCost else {
+            return 0
+        }
+
+        let distortionDelta = max(distortion - baseDistortion, 0)
+        let costSaving = max(Float(baseCost - cost), Float.leastNonzeroMagnitude)
+        let index = 60.0 + 2.0 * log2(distortionDelta / costSaving)
+        guard index.isFinite else {
+            return 0
+        }
+        return min(bucketCount - 1, max(0, Int((index + 0.5).rounded(.down))))
+    }
+
+    static func inclusiveBucketIndices(for block: PyrowaveRateControlBlock) -> [Int] {
+        let baseDistortion = block.distortion(quantLevel: 0)
+        let baseCost = block.packetByteCost(quantLevel: 0)
+        var raw = (0..<PyrowaveRateControlBlock.candidateCount).map { quantLevel in
+            quantLevel == 0 ? 0 : distortionBucketIndex(
+                distortion: block.distortion(quantLevel: quantLevel),
+                cost: block.packetByteCost(quantLevel: quantLevel),
+                baseDistortion: baseDistortion,
+                baseCost: baseCost
+            )
+        }
+
+        for quantLevel in raw.indices {
+            raw[quantLevel] = min(raw[quantLevel], bucketCount - bucketClusterWidth + quantLevel)
+        }
+
+        var clustered = raw
+        for quantLevel in clustered.indices {
+            var bucket = raw[quantLevel]
+            for previous in 0..<quantLevel {
+                bucket = max(bucket, raw[previous] + quantLevel - previous)
+            }
+            clustered[quantLevel] = min(bucketCount - 1, bucket)
+        }
+        return clustered
     }
 
     private static func make8x8Stats(

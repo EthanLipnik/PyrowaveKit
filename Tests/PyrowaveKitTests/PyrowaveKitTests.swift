@@ -448,6 +448,80 @@ import Testing
     }
 }
 
+@Test func pyrowaveRateControlUsesClusteredRDBuckets() throws {
+    let stride = 32
+    var coefficients = Array(repeating: Int16(0), count: stride * stride)
+    coefficients[0] = 1
+    coefficients[1] = -2
+    coefficients[9] = 4
+    coefficients[8 * stride + 2] = -8
+    coefficients[15 * stride + 15] = 14
+
+    let block = try PyrowaveRateController.makeBlock(
+        blockIndex: 3,
+        coefficients: coefficients,
+        stride: stride,
+        originX: 0,
+        originY: 0,
+        validWidth: 32,
+        validHeight: 32,
+        quantCode: PyrowaveQuantization.identityQScaleCode,
+        qScaleCode: PyrowaveQuantization.identityQScaleCode
+    )
+
+    let buckets = PyrowaveRateController.inclusiveBucketIndices(for: block)
+    #expect(buckets.count == PyrowaveBlockStats.candidateCount)
+    #expect(buckets[0] == 0)
+    #expect(buckets.allSatisfy { (0..<128).contains($0) })
+    for quantLevel in 1..<buckets.count {
+        #expect(buckets[quantLevel] >= buckets[quantLevel - 1] + 1)
+    }
+
+    let operations = PyrowaveRateController.makeRDOperations(blocksByPlane: [[block]])
+    #expect(!operations.isEmpty)
+    #expect(operations == operations.sorted {
+        if $0.bucket != $1.bucket {
+            return $0.bucket < $1.bucket
+        }
+        if $0.planeIndex != $1.planeIndex {
+            return $0.planeIndex < $1.planeIndex
+        }
+        if $0.blockIndex != $1.blockIndex {
+            return $0.blockIndex < $1.blockIndex
+        }
+        return $0.quantLevel < $1.quantLevel
+    })
+    #expect(operations.allSatisfy { $0.planeIndex == 0 && $0.blockIndex == 0 })
+    #expect(operations.allSatisfy { $0.quantLevel > 0 && $0.saving > 0 })
+    #expect(operations.allSatisfy { $0.bucket == buckets[$0.quantLevel] })
+}
+
+@Test func pyrowaveRateControlBucketIndexMatchesShaderFormulaShape() {
+    #expect(PyrowaveRateController.distortionBucketIndex(
+        distortion: 10,
+        cost: 16,
+        baseDistortion: 0,
+        baseCost: 16
+    ) == 0)
+
+    let lowDistortion = PyrowaveRateController.distortionBucketIndex(
+        distortion: 1,
+        cost: 8,
+        baseDistortion: 0,
+        baseCost: 16
+    )
+    let highDistortion = PyrowaveRateController.distortionBucketIndex(
+        distortion: 16,
+        cost: 8,
+        baseDistortion: 0,
+        baseCost: 16
+    )
+
+    #expect(highDistortion > lowDistortion)
+    #expect(lowDistortion >= 0)
+    #expect(highDistortion < 128)
+}
+
 @Test func pyrowaveRateControllerSelectsThresholdsToMeetCap() throws {
     let stride = 32
     var coefficients = Array(repeating: Int16(0), count: stride * stride)
