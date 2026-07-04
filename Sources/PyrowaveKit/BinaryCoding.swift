@@ -3,6 +3,12 @@ import Foundation
 struct BinaryWriter {
     private(set) var data = Data()
 
+    init(capacity: Int = 0) {
+        if capacity > 0 {
+            data.reserveCapacity(capacity)
+        }
+    }
+
     mutating func append(_ value: UInt8) {
         data.append(value)
     }

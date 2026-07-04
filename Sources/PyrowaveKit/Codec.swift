@@ -170,7 +170,8 @@ public final class PyrowavePacketStreamDecoder {
             throw PyrowaveError.invalidBitstream("packet stream is not ready to decode")
         }
 
-        var writer = BinaryWriter()
+        let packetBytes = blockPackets.values.reduce(0) { $0 + $1.count }
+        var writer = BinaryWriter(capacity: 8 + packetBytes)
         sequenceHeader.write(to: &writer)
         for blockIndex in blockPackets.keys.sorted() {
             if let packet = blockPackets[blockIndex] {
@@ -467,7 +468,8 @@ public final class PyrowaveCodec: @unchecked Sendable {
         blocks: [SparseBlock]
     ) throws -> EncodedFrame {
         let sortedBlocks = blocks.sorted { $0.blockIndex < $1.blockIndex }
-        var writer = BinaryWriter()
+        let capacity = frameHeaderSize + sortedBlocks.reduce(0) { $0 + $1.data.count }
+        var writer = BinaryWriter(capacity: capacity)
         let sequence = try PyrowaveSequenceHeader(
             width: width,
             height: height,
