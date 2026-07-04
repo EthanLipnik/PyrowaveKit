@@ -1,6 +1,4 @@
 import Foundation
-
-#if canImport(Metal)
 import Metal
 
 extension Plane8 {
@@ -140,4 +138,3 @@ extension PyrowavePacketStreamDecoder {
         return try decode(allowPartialFrame: allowPartialFrame).makeMetalTextures(device: device, usage: usage)
     }
 }
-#endif

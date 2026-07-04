@@ -238,10 +238,9 @@ public enum PyrowaveBenchmarkRunner {
     public static func runPyrowave(
         loaded: PyrowaveBenchmarkFrames,
         configuration: CodecConfiguration,
-        outputDirectory: URL,
-        useMetalAcceleration: Bool = true
+        outputDirectory: URL
     ) throws -> CodecBenchmarkResult {
-        let codec = try PyrowaveCodec(useMetalAcceleration: useMetalAcceleration)
+        let codec = try PyrowaveCodec()
         let frames = loaded.frames
         var encodedFrames = [EncodedFrame]()
         encodedFrames.reserveCapacity(frames.count)

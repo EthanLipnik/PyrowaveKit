@@ -1,8 +1,5 @@
 import Foundation
-
-#if canImport(Metal)
 import Metal
-#endif
 
 public extension EncodedFrame {
     func packetized(maximumPacketBytes: Int) throws -> [EncodedPacket] {
@@ -47,8 +44,8 @@ public final class PyrowavePacketStreamDecoder {
     private var decodedFrameForCurrentSequence = false
     private var lastSequence: UInt8?
 
-    public init(useMetalAcceleration: Bool = true) throws {
-        codec = try PyrowaveCodec(useMetalAcceleration: useMetalAcceleration)
+    public init() throws {
+        codec = try PyrowaveCodec()
         expectedFrame = nil
     }
 
@@ -56,10 +53,9 @@ public final class PyrowavePacketStreamDecoder {
         width: Int,
         height: Int,
         chroma: ChromaSubsampling,
-        videoSignal: VideoSignalMetadata = .default,
-        useMetalAcceleration: Bool = true
+        videoSignal: VideoSignalMetadata = .default
     ) throws {
-        codec = try PyrowaveCodec(useMetalAcceleration: useMetalAcceleration)
+        codec = try PyrowaveCodec()
         let layout = try PyrowaveBlockLayout(width: width, height: height, chroma: chroma)
         expectedFrame = ExpectedFrame(
             width: width,
@@ -209,15 +205,11 @@ public final class PyrowavePacketStreamDecoder {
 public final class PyrowaveCodec: Sendable {
     private static let sparseBlockSize = 32
 
-    private let metalBackend: MetalPyrowaveBackend?
+    private let metalBackend: MetalPyrowaveBackend
     private let sequenceCounter = SequenceCounter()
 
-    public init(useMetalAcceleration: Bool = true) throws {
-        if useMetalAcceleration {
-            metalBackend = try MetalPyrowaveBackend()
-        } else {
-            metalBackend = nil
-        }
+    public init() throws {
+        metalBackend = try MetalPyrowaveBackend()
     }
 
     public func encode(_ frame: YUVFrame, configuration: CodecConfiguration = CodecConfiguration()) throws -> EncodedFrame {
@@ -273,7 +265,6 @@ public final class PyrowaveCodec: Sendable {
         return EncodedFrame(data: writer.data)
     }
 
-    #if canImport(Metal)
     public func encode(
         yTexture: MTLTexture,
         cbTexture: MTLTexture,
@@ -354,7 +345,6 @@ public final class PyrowaveCodec: Sendable {
 
         return EncodedFrame(data: writer.data)
     }
-    #endif
 
     public func decode(_ frame: EncodedFrame) throws -> YUVFrame {
         try decode(frame, allowPartialFrame: false)
@@ -509,7 +499,6 @@ public final class PyrowaveCodec: Sendable {
         )
     }
 
-    #if canImport(Metal)
     private func encodeTexturePlane(
         _ texture: MTLTexture,
         component: Int,
@@ -519,9 +508,6 @@ public final class PyrowaveCodec: Sendable {
         layout: PyrowaveBlockLayout,
         configuration: CodecConfiguration
     ) throws -> EncodedPlane {
-        guard let metalBackend else {
-            throw PyrowaveError.externalToolUnavailable("Metal")
-        }
         let geometry = planeGeometry(component: component, frameWidth: frameWidth, frameHeight: frameHeight, chroma: chroma, requestedLevels: configuration.decompositionLevels)
         guard texture.width == geometry.visibleWidth,
               texture.height == geometry.visibleHeight else {
@@ -537,7 +523,6 @@ public final class PyrowaveCodec: Sendable {
             configuration: configuration
         )
     }
-    #endif
 
     private func encodePaddedPlane(
         samples: [Float],
@@ -589,8 +574,8 @@ public final class PyrowaveCodec: Sendable {
             blocksByPlane: rateBlocksByPlane,
             fixedHeaderBytes: fixedHeaderBytes,
             maximumEncodedBytes: maximumEncodedBytes,
-            bucketIndicesByPlane: metalBucketData?.indicesByPlane,
-            cumulativeBucketSavings: metalBucketData?.cumulativeSavings
+            bucketIndicesByPlane: metalBucketData.indicesByPlane,
+            cumulativeBucketSavings: metalBucketData.cumulativeSavings
         ) {
             return SparseRateControlPlan(
                 defaultQuantLevel: 0,
@@ -623,11 +608,7 @@ public final class PyrowaveCodec: Sendable {
         )
     }
 
-    private func metalRateControlBucketData(blocksByPlane: [[PyrowaveRateControlBlock]]) throws -> MetalRateControlBucketData? {
-        guard let metalBackend else {
-            return nil
-        }
-
+    private func metalRateControlBucketData(blocksByPlane: [[PyrowaveRateControlBlock]]) throws -> MetalRateControlBucketData {
         var bucketsByPlane = [[[Int]]]()
         bucketsByPlane.reserveCapacity(blocksByPlane.count)
         var flatBuckets = [[Int]]()
@@ -675,8 +656,6 @@ public final class PyrowaveCodec: Sendable {
             throw PyrowaveError.processFailed("packet byte-cost count \(packetByteCosts.count) does not match block count \(descriptors.count)")
         }
 
-        var blocks = [SparseBlock]()
-        blocks.reserveCapacity(descriptors.count)
         let selectedPacketByteCosts: [[Int]]?
         if let packetByteCosts {
             selectedPacketByteCosts = packetByteCosts
@@ -686,45 +665,15 @@ public final class PyrowaveCodec: Sendable {
                 descriptors: descriptors
             )
         }
-        if let metalBackend {
-            return try sparseBlocksWithMetal(
-                plane,
-                descriptors: descriptors,
-                sequence: sequence,
-                quantLevels: quantLevels,
-                packetByteCosts: selectedPacketByteCosts,
-                defaultQuantLevel: defaultQuantLevel,
-                backend: metalBackend
-            )
-        }
-
-        for (index, descriptor) in descriptors.enumerated() {
-            let quantLevel = quantLevels?[index] ?? defaultQuantLevel
-            if let selectedPacketByteCosts,
-               quantLevel >= 0,
-               quantLevel < selectedPacketByteCosts[index].count,
-               selectedPacketByteCosts[index][quantLevel] == 0 {
-                continue
-            }
-            if let data = try PyrowaveCoefficientBlockCodec.encodeBlock(
-                blockIndex: descriptor.blockIndex,
-                coefficients: plane.coefficients,
-                stride: plane.paddedWidth,
-                originX: descriptor.originX,
-                originY: descriptor.originY,
-                validWidth: descriptor.validWidth,
-                validHeight: descriptor.validHeight,
-                threshold: 0,
-                quantLevel: quantLevel,
-                sequence: sequence,
-                quantCode: try quantCode(for: descriptor, plane: plane),
-                qScaleCodes: try qScaleCodes(for: descriptor, plane: plane)
-            ) {
-                blocks.append(SparseBlock(blockIndex: descriptor.blockIndex, data: data))
-            }
-        }
-
-        return blocks
+        return try sparseBlocksWithMetal(
+            plane,
+            descriptors: descriptors,
+            sequence: sequence,
+            quantLevels: quantLevels,
+            packetByteCosts: selectedPacketByteCosts,
+            defaultQuantLevel: defaultQuantLevel,
+            backend: metalBackend
+        )
     }
 
     private func sparseBlocksWithMetal(
@@ -789,10 +738,7 @@ public final class PyrowaveCodec: Sendable {
     private func metalSparsePacketByteCosts(
         plane: EncodedPlane,
         descriptors: [PlaneBlockDescriptor]
-    ) throws -> [[Int]]? {
-        guard let metalBackend else {
-            return nil
-        }
+    ) throws -> [[Int]] {
         let packetCostDescriptors = metalPacketByteCostDescriptors(
             descriptors: descriptors,
             stride: plane.paddedWidth
@@ -809,29 +755,7 @@ public final class PyrowaveCodec: Sendable {
 
     private func makeRateControlBlocks(_ plane: EncodedPlane, layout: PyrowaveBlockLayout) throws -> [PyrowaveRateControlBlock] {
         let descriptors = planeBlockDescriptors(plane: plane, layout: layout)
-        if let metalBackend {
-            return try makeRateControlBlocksWithMetal(plane, descriptors: descriptors, layout: layout, backend: metalBackend)
-        }
-
-        return try descriptors.map { descriptor in
-            try PyrowaveRateController.makeBlock(
-                blockIndex: descriptor.blockIndex,
-                coefficients: plane.coefficients,
-                stride: plane.paddedWidth,
-                originX: descriptor.originX,
-                originY: descriptor.originY,
-                validWidth: descriptor.validWidth,
-                validHeight: descriptor.validHeight,
-                quantCode: try quantCode(for: descriptor, plane: plane),
-                qScaleCodes: try qScaleCodes(for: descriptor, plane: plane),
-                rdoDistortionScale: PyrowaveQuantization.rdoDistortionScale(
-                    level: descriptor.globalLevel,
-                    component: plane.component,
-                    band: descriptor.band,
-                    chroma: layout.chroma
-                )
-            )
-        }
+        return try makeRateControlBlocksWithMetal(plane, descriptors: descriptors, layout: layout, backend: metalBackend)
     }
 
     private func makeRateControlBlocksWithMetal(
@@ -942,36 +866,10 @@ public final class PyrowaveCodec: Sendable {
         )
     }
 
-    private func applySparseBlock(
-        _ block: PyrowaveCoefficientBlockCodec.DecodedBlock,
-        descriptor: PlaneBlockDescriptor,
-        decodedPlane: inout DecodedPlane
-    ) throws {
-        for entry in block.coefficients {
-            let destinationOffset = try sparseDestinationOffset(
-                entryOffset: entry.offset,
-                descriptor: descriptor,
-                decodedPlane: decodedPlane
-            )
-            decodedPlane.samples[destinationOffset] = PyrowaveQuantization.dequantize(
-                coefficient: entry.value,
-                quantCode: block.quantCode,
-                qScaleCode: entry.qScaleCode
-            )
-        }
-    }
-
     private func applySparseBlocks(
         _ blocks: [PendingSparseBlock],
         decodedPlane: inout DecodedPlane
     ) throws {
-        guard let metalBackend else {
-            for pending in blocks {
-                try applySparseBlock(pending.block, descriptor: pending.descriptor, decodedPlane: &decodedPlane)
-            }
-            return
-        }
-
         let entries = try metalSparseCoefficientEntries(blocks, decodedPlane: decodedPlane)
         decodedPlane.samples = try metalBackend.applySparseCoefficients(
             sampleCount: decodedPlane.paddedWidth * decodedPlane.paddedHeight,
@@ -1124,39 +1022,19 @@ public final class PyrowaveCodec: Sendable {
     }
 
     private func padPlane(_ plane: Plane8, paddedWidth: Int, paddedHeight: Int) throws -> [Float] {
-        if let metalBackend {
-            return try metalBackend.padPlane(plane, paddedWidth: paddedWidth, paddedHeight: paddedHeight)
-        }
-
-        return Wavelet.padPlane(plane, paddedWidth: paddedWidth, paddedHeight: paddedHeight).samples
+        try metalBackend.padPlane(plane, paddedWidth: paddedWidth, paddedHeight: paddedHeight)
     }
 
     private func cropPlane(_ samples: [Float], paddedWidth: Int, width: Int, height: Int) throws -> Plane8 {
-        if let metalBackend {
-            return try metalBackend.cropPlane(samples, paddedWidth: paddedWidth, width: width, height: height)
-        }
-
-        return try Wavelet.cropPlane(samples, paddedWidth: paddedWidth, width: width, height: height)
+        try metalBackend.cropPlane(samples, paddedWidth: paddedWidth, width: width, height: height)
     }
 
     private func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
-        if let metalBackend {
-            return try metalBackend.forwardWavelet(samples, width: width, height: height, levels: levels)
-        }
-
-        var transformed = samples
-        Wavelet.forward2D(&transformed, width: width, height: height, levels: levels)
-        return transformed
+        try metalBackend.forwardWavelet(samples, width: width, height: height, levels: levels)
     }
 
     private func inverseWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
-        if let metalBackend {
-            return try metalBackend.inverseWavelet(samples, width: width, height: height, levels: levels)
-        }
-
-        var transformed = samples
-        Wavelet.inverse2D(&transformed, width: width, height: height, levels: levels)
-        return transformed
+        try metalBackend.inverseWavelet(samples, width: width, height: height, levels: levels)
     }
 
     private func quantize(
@@ -1166,90 +1044,14 @@ public final class PyrowaveCodec: Sendable {
         component: Int,
         configuration: CodecConfiguration
     ) throws -> (coefficients: [Int16], quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]]) {
-        if let metalBackend {
-            return try quantizeWithMetal(
-                samples,
-                stride: stride,
-                descriptors: descriptors,
-                component: component,
-                configuration: configuration,
-                backend: metalBackend
-            )
-        }
-
-        return try quantizeOnCPU(
+        try quantizeWithMetal(
             samples,
             stride: stride,
             descriptors: descriptors,
             component: component,
-            configuration: configuration
+            configuration: configuration,
+            backend: metalBackend
         )
-    }
-
-    private func quantizeOnCPU(
-        _ samples: [Float],
-        stride: Int,
-        descriptors: [PlaneBlockDescriptor],
-        component: Int,
-        configuration: CodecConfiguration
-    ) throws -> (coefficients: [Int16], quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]]) {
-        var coefficients = Array(repeating: Int16(0), count: samples.count)
-        var quantCodes = [Int: UInt8]()
-        var qScaleCodes = [Int: [UInt8]]()
-        quantCodes.reserveCapacity(descriptors.count)
-        qScaleCodes.reserveCapacity(descriptors.count)
-
-        for descriptor in descriptors {
-            let requestedStep = PyrowaveQuantization.quantizationStep(
-                level: descriptor.globalLevel,
-                component: component,
-                band: descriptor.band,
-                baseStep: configuration.quantizationStep
-            )
-            let quantCode = try PyrowaveQuantization.encodeBlockScale(requestedStep)
-            let decodedStep = PyrowaveQuantization.decodeBlockScale(quantCode)
-            let baseScale = 1.0 / decodedStep
-            quantCodes[descriptor.blockIndex] = quantCode
-
-            var blockQScaleCodes = Array(repeating: PyrowaveQuantization.identityQScaleCode, count: 16)
-            for smallBlockY in 0..<4 {
-                for smallBlockX in 0..<4 {
-                    let smallBlock = smallBlockY * 4 + smallBlockX
-                    let smallOriginX = descriptor.originX + smallBlockX * PyrowaveBitstream.smallBlockSize
-                    let smallOriginY = descriptor.originY + smallBlockY * PyrowaveBitstream.smallBlockSize
-                    let smallValidWidth = max(0, min(PyrowaveBitstream.smallBlockSize, descriptor.validWidth - smallBlockX * PyrowaveBitstream.smallBlockSize))
-                    let smallValidHeight = max(0, min(PyrowaveBitstream.smallBlockSize, descriptor.validHeight - smallBlockY * PyrowaveBitstream.smallBlockSize))
-                    guard smallValidWidth > 0, smallValidHeight > 0 else {
-                        continue
-                    }
-
-                    var maxScaledCoefficient = Float(0)
-                    for y in 0..<smallValidHeight {
-                        let row = (smallOriginY + y) * stride + smallOriginX
-                        for x in 0..<smallValidWidth {
-                            maxScaledCoefficient = max(maxScaledCoefficient, abs(samples[row + x] * baseScale))
-                        }
-                    }
-
-                    let qScaleCode = PyrowaveQuantization.encode8x8ScaleCode(maxScaledCoefficient: maxScaledCoefficient)
-                    let quantScale = PyrowaveQuantization.quantScale(for8x8ScaleCode: qScaleCode)
-                    blockQScaleCodes[smallBlock] = qScaleCode
-
-                    for y in 0..<smallValidHeight {
-                        let row = (smallOriginY + y) * stride + smallOriginX
-                        for x in 0..<smallValidWidth {
-                            let index = row + x
-                            let quantized = Int((samples[index] * baseScale * quantScale).rounded(.towardZero))
-                            coefficients[index] = Int16(max(Int(Int16.min), min(Int(Int16.max), quantized)))
-                        }
-                    }
-                }
-            }
-
-            qScaleCodes[descriptor.blockIndex] = blockQScaleCodes
-        }
-
-        return (coefficients, quantCodes, qScaleCodes)
     }
 
     private func quantizeWithMetal(

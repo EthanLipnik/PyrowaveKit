@@ -1,12 +1,6 @@
 import Foundation
-
-#if canImport(AVFoundation)
 import AVFoundation
-#endif
-
-#if canImport(AVKit)
 import AVKit
-#endif
 
 public struct CodecBenchmarkResult: Codable, Equatable, Sendable {
     public var codec: String
@@ -82,7 +76,6 @@ public enum HEVCComparison {
         frameRateNumerator: Int = 60,
         frameRateDenominator: Int = 1
     ) throws -> CodecBenchmarkResult {
-        #if canImport(AVFoundation)
         guard let firstFrame = referenceFrames.first else {
             throw PyrowaveError.truncatedInput
         }
@@ -154,17 +147,6 @@ public enum HEVCComparison {
             metrics: metrics,
             note: decodedFrames.count == referenceFrames.count ? avKitTimingNote : "\(avKitTimingNote) Decoded \(decodedFrames.count) of \(referenceFrames.count) frames."
         )
-        #else
-        return CodecBenchmarkResult(
-            codec: "hevc_avkit",
-            frameCount: 0,
-            encodedBytes: 0,
-            encodeSeconds: 0,
-            decodeSeconds: 0,
-            metrics: nil,
-            note: "AVFoundation is unavailable on this platform"
-        )
-        #endif
     }
 
     public static func matchedFrameByteBudget(
@@ -211,7 +193,6 @@ public enum HEVCComparison {
         return CMTime(value: CMTimeValue(denominator), timescale: CMTimeScale(numerator))
     }
 
-    #if canImport(AVFoundation)
     private static func writeHEVCMovie(
         _ pixelBuffers: [CVPixelBuffer],
         frameSize: (width: Int, height: Int),
@@ -375,5 +356,4 @@ public enum HEVCComparison {
             return value
         }
     }
-    #endif
 }

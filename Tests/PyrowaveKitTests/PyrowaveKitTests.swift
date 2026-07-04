@@ -2,9 +2,7 @@ import Foundation
 import Testing
 @testable import PyrowaveKit
 
-#if canImport(CoreVideo)
 import CoreVideo
-#endif
 
 @Test func hardCutoverSourceTreeContainsOnlySwiftAndMetalSources() throws {
     let packageRoot = URL(fileURLWithPath: #filePath)
@@ -43,7 +41,6 @@ import CoreVideo
     #expect(forbiddenFiles.isEmpty, "Original-language or Vulkan-era files remain: \(forbiddenFiles.sorted())")
 }
 
-#if canImport(CoreVideo)
 @Test func yuvFrameImportsCoreVideoNV12PixelBuffer() throws {
     var pixelBuffer: CVPixelBuffer?
     let attributes = [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary
@@ -103,7 +100,7 @@ import CoreVideo
 @Test func codecEncodesAndDecodesCoreVideoPixelBuffers() throws {
     let source = try TestFrames.synthetic420(width: 64, height: 64)
     let sourcePixelBuffer = try source.makeCVPixelBuffer()
-    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec()
 
     let encoded = try codec.encode(
         sourcePixelBuffer,
@@ -120,7 +117,7 @@ import CoreVideo
     #expect(metrics.weightedPSNR > 44.0)
 
     let packets = try encoded.packetized(maximumPacketBytes: 64)
-    let stream = try PyrowavePacketStreamDecoder(width: source.width, height: source.height, chroma: source.chroma, useMetalAcceleration: false)
+    let stream = try PyrowavePacketStreamDecoder(width: source.width, height: source.height, chroma: source.chroma)
     for packet in packets {
         try stream.pushPacket(packet)
     }
@@ -128,11 +125,10 @@ import CoreVideo
     let streamed = try YUVFrame(cvPixelBuffer: streamedPixelBuffer)
     #expect(try Metrics.compare(source, streamed).weightedPSNR > 44.0)
 }
-#endif
 
 @Test func roundTripSynthetic420() throws {
     let frame = try TestFrames.synthetic420(width: 160, height: 96)
-    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec()
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
     let decoded = try codec.decode(encoded)
     let metrics = try Metrics.compare(frame, decoded)
@@ -146,7 +142,7 @@ import CoreVideo
 
 @Test func roundTripSynthetic444() throws {
     let frame = try TestFrames.synthetic444(width: 128, height: 96)
-    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec()
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
     let decoded = try codec.decode(encoded)
     let metrics = try Metrics.compare(frame, decoded)
@@ -175,7 +171,7 @@ import CoreVideo
 
 @Test func roundTripNonAlignedSynthetic420UsesEdgeExtendedPadding() throws {
     let frame = try TestFrames.synthetic420(width: 130, height: 74)
-    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec()
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
     let decoded = try codec.decode(encoded)
     let metrics = try Metrics.compare(frame, decoded)
@@ -670,8 +666,7 @@ import CoreVideo
     let result = try PyrowaveBenchmarkRunner.runPyrowave(
         loaded: loaded,
         configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0),
-        outputDirectory: directory,
-        useMetalAcceleration: false
+        outputDirectory: directory
     )
 
     #expect(result.codec == PyrowaveBenchmarkRunner.pyrowaveCodecName)
@@ -747,7 +742,6 @@ import CoreVideo
 }
 
 @Test func metalBackendCompilesKernelsWhenDeviceExists() throws {
-    #if canImport(Metal)
     do {
         let backend = try MetalPyrowaveBackend()
         _ = try backend.makeFunction(named: "pyrowave_pad_plane")
@@ -766,11 +760,9 @@ import CoreVideo
     } catch PyrowaveError.externalToolUnavailable {
         return
     }
-    #endif
 }
 
 @Test func metalTexturesRoundTripYUVFramesWhenDeviceExists() throws {
-    #if canImport(Metal)
     do {
         let backend = try MetalPyrowaveBackend()
         let frame420 = try TestFrames.synthetic420(width: 64, height: 64)
@@ -795,18 +787,16 @@ import CoreVideo
     } catch PyrowaveError.externalToolUnavailable {
         return
     }
-    #endif
 }
 
 @Test func codecEncodesAndDecodesMetalTexturesWhenDeviceExists() throws {
-    #if canImport(Metal)
     do {
         let backend = try MetalPyrowaveBackend()
         let source = try TestFrames.synthetic420(width: 64, height: 64)
         let sourceTextures = try source.makeMetalTextures(device: backend.device)
-        let referenceCodec = try PyrowaveCodec(useMetalAcceleration: true)
+        let referenceCodec = try PyrowaveCodec()
         let reference = try referenceCodec.encode(source, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
-        let codec = try PyrowaveCodec(useMetalAcceleration: true)
+        let codec = try PyrowaveCodec()
         let encoded = try codec.encode(
             yTexture: sourceTextures.y,
             cbTexture: sourceTextures.cb,
@@ -825,7 +815,7 @@ import CoreVideo
         #expect(try Metrics.compare(source, decoded).weightedPSNR > 44.0)
 
         let packets = try encoded.packetized(maximumPacketBytes: 64)
-        let stream = try PyrowavePacketStreamDecoder(width: source.width, height: source.height, chroma: source.chroma, useMetalAcceleration: false)
+        let stream = try PyrowavePacketStreamDecoder(width: source.width, height: source.height, chroma: source.chroma)
         for packet in packets {
             try stream.pushPacket(packet)
         }
@@ -840,11 +830,9 @@ import CoreVideo
     } catch PyrowaveError.externalToolUnavailable {
         return
     }
-    #endif
 }
 
 @Test func metalPlanePaddingMatchesCPUReferenceWhenDeviceExists() throws {
-    #if canImport(Metal)
     let backend: MetalPyrowaveBackend
     do {
         backend = try MetalPyrowaveBackend()
@@ -861,11 +849,9 @@ import CoreVideo
     #expect(metal.count == cpu.count)
     let maxError = zip(metal, cpu).map { abs($0 - $1) }.max() ?? 0
     #expect(maxError < 0.000001)
-    #endif
 }
 
 @Test func metalTexturePlanePaddingMatchesCPUReferenceWhenDeviceExists() throws {
-    #if canImport(Metal)
     let backend: MetalPyrowaveBackend
     do {
         backend = try MetalPyrowaveBackend()
@@ -883,11 +869,9 @@ import CoreVideo
     #expect(metal.count == cpu.count)
     let maxError = zip(metal, cpu).map { abs($0 - $1) }.max() ?? 0
     #expect(maxError < 0.000001)
-    #endif
 }
 
 @Test func metalPlaneCropMatchesCPUReferenceWhenDeviceExists() throws {
-    #if canImport(Metal)
     let backend: MetalPyrowaveBackend
     do {
         backend = try MetalPyrowaveBackend()
@@ -904,11 +888,9 @@ import CoreVideo
     let cpu = try Wavelet.cropPlane(samples, paddedWidth: paddedWidth, width: 4, height: 3)
     let metal = try backend.cropPlane(samples, paddedWidth: paddedWidth, width: 4, height: 3)
     #expect(metal == cpu)
-    #endif
 }
 
 @Test func metalQuantizationMatchesCPUReferenceWhenDeviceExists() throws {
-    #if canImport(Metal)
     let backend: MetalPyrowaveBackend
     do {
         backend = try MetalPyrowaveBackend()
@@ -927,11 +909,9 @@ import CoreVideo
 
     let dequantized = try backend.dequantize(metal, quantizationStep: step)
     #expect(dequantized == cpu.map { Float($0) * step })
-    #endif
 }
 
 @Test func metalSparseApplyMatchesCPUReferenceWhenDeviceExists() throws {
-    #if canImport(Metal)
     let backend: MetalPyrowaveBackend
     do {
         backend = try MetalPyrowaveBackend()
@@ -960,11 +940,9 @@ import CoreVideo
     let maxError = zip(metal, cpu).map { abs($0 - $1) }.max() ?? 0
     #expect(maxError < 0.000001)
     #expect(try backend.applySparseCoefficients(sampleCount: 5, entries: []) == Array(repeating: Float(0), count: 5))
-    #endif
 }
 
 @Test func metalRateControlStatsMatchCPUReferenceWhenDeviceExists() throws {
-    #if canImport(Metal)
     let backend: MetalPyrowaveBackend
     do {
         backend = try MetalPyrowaveBackend()
@@ -1029,11 +1007,9 @@ import CoreVideo
             #expect(abs(converted.squareError - cpuStat.squareError) < 0.0001)
         }
     }
-    #endif
 }
 
 @Test func metalPacketByteCostsMatchCPUReferenceWhenDeviceExists() throws {
-    #if canImport(Metal)
     let backend: MetalPyrowaveBackend
     do {
         backend = try MetalPyrowaveBackend()
@@ -1084,11 +1060,9 @@ import CoreVideo
     #expect(metal.count == descriptors.count)
     #expect(metal[0] == cpu)
     #expect(metal[1] == Array(repeating: 0, count: PyrowaveBlockStats.candidateCount))
-    #endif
 }
 
 @Test func metalSparsePacketEncodingMatchesCPUReferenceWhenDeviceExists() throws {
-    #if canImport(Metal)
     let backend: MetalPyrowaveBackend
     do {
         backend = try MetalPyrowaveBackend()
@@ -1156,11 +1130,9 @@ import CoreVideo
     #expect(metal.count == descriptors.count)
     #expect(metal[0] == cpu)
     #expect(metal[1] == nil)
-    #endif
 }
 
 @Test func metalRateControlBucketsMatchCPUReferenceWhenDeviceExists() throws {
-    #if canImport(Metal)
     let backend: MetalPyrowaveBackend
     do {
         backend = try MetalPyrowaveBackend()
@@ -1235,11 +1207,9 @@ import CoreVideo
     for index in 1..<metalSavings.count {
         #expect(metalSavings[index] >= metalSavings[index - 1])
     }
-    #endif
 }
 
 @Test func metalCodecMatchesCPUReferenceWhenDeviceExists() throws {
-    #if canImport(Metal)
     do {
         _ = try MetalPyrowaveBackend()
     } catch PyrowaveError.externalToolUnavailable {
@@ -1254,19 +1224,17 @@ import CoreVideo
     ]
 
     for frame in frames {
-        let cpu = try PyrowaveCodec(useMetalAcceleration: false).encode(frame, configuration: configuration)
-        let metal = try PyrowaveCodec(useMetalAcceleration: true).encode(frame, configuration: configuration)
+        let cpu = try PyrowaveCodec().encode(frame, configuration: configuration)
+        let metal = try PyrowaveCodec().encode(frame, configuration: configuration)
         #expect(metal.data == cpu.data)
 
-        let decodedCPU = try PyrowaveCodec(useMetalAcceleration: false).decode(cpu)
-        let decodedMetal = try PyrowaveCodec(useMetalAcceleration: true).decode(metal)
+        let decodedCPU = try PyrowaveCodec().decode(cpu)
+        let decodedMetal = try PyrowaveCodec().decode(metal)
         #expect(decodedMetal == decodedCPU)
     }
-    #endif
 }
 
 @Test func metalCappedRateControlMatchesCPUReferenceWhenDeviceExists() throws {
-    #if canImport(Metal)
     do {
         _ = try MetalPyrowaveBackend()
     } catch PyrowaveError.externalToolUnavailable {
@@ -1274,7 +1242,7 @@ import CoreVideo
     }
 
     let frame = try TestFrames.synthetic420(width: 160, height: 96)
-    let baseline = try PyrowaveCodec(useMetalAcceleration: false).encode(
+    let baseline = try PyrowaveCodec().encode(
         frame,
         configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0)
     )
@@ -1282,15 +1250,13 @@ import CoreVideo
         quantizationStep: 1.0 / 2048.0,
         maximumEncodedBytes: baseline.data.count - 200
     )
-    let cpu = try PyrowaveCodec(useMetalAcceleration: false).encode(frame, configuration: configuration)
-    let metal = try PyrowaveCodec(useMetalAcceleration: true).encode(frame, configuration: configuration)
+    let cpu = try PyrowaveCodec().encode(frame, configuration: configuration)
+    let metal = try PyrowaveCodec().encode(frame, configuration: configuration)
     #expect(cpu.data.count <= configuration.maximumEncodedBytes!)
     #expect(metal.data == cpu.data)
-    #endif
 }
 
 @Test func metalWaveletMatchesCPUReferenceWhenDeviceExists() throws {
-    #if canImport(Metal)
     let backend: MetalPyrowaveBackend
     do {
         backend = try MetalPyrowaveBackend()
@@ -1321,12 +1287,11 @@ import CoreVideo
 
     let inverseError = zip(cpuInverse, metalInverse).map { abs($0 - $1) }.max() ?? 0
     #expect(inverseError < 0.0001)
-    #endif
 }
 
 @Test func sparseRateControlCapsEncodedFrameSize() throws {
     let frame = try TestFrames.synthetic420(width: 256, height: 144)
-    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec()
     let uncapped = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
     let cap = max(512, uncapped.data.count / 2)
     let capped = try codec.encode(
@@ -1347,7 +1312,7 @@ import CoreVideo
 
 @Test func codecUsesPyrowaveSequenceHeaderStreamOnly() throws {
     let frame = try TestFrames.synthetic420(width: 64, height: 64)
-    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec()
     var encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)).data
 
     var reader = BinaryReader(encoded)
@@ -1366,7 +1331,7 @@ import CoreVideo
 
 @Test func codecAdvancesPyrowaveSequenceCounterModuloEight() throws {
     let frame = try TestFrames.synthetic420(width: 64, height: 64)
-    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec()
     var observedSequences = [UInt8]()
 
     for _ in 0..<9 {
@@ -1386,7 +1351,7 @@ import CoreVideo
 
 @Test func encodedFramePacketizesOnPyrowavePacketBoundaries() throws {
     let frame = try TestFrames.synthetic420(width: 64, height: 64)
-    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+    let encoded = try PyrowaveCodec().encode(
         frame,
         configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
     )
@@ -1405,11 +1370,11 @@ import CoreVideo
 
 @Test func packetStreamDecoderReconstructsCompletePacketizedFrame() throws {
     let frame = try TestFrames.synthetic420(width: 96, height: 64)
-    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec()
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
     let expected = try codec.decode(encoded)
     let packets = try encoded.packetized(maximumPacketBytes: 8)
-    let stream = try PyrowavePacketStreamDecoder(useMetalAcceleration: false)
+    let stream = try PyrowavePacketStreamDecoder()
 
     for packet in packets.dropLast() {
         try stream.pushPacket(packet)
@@ -1423,11 +1388,11 @@ import CoreVideo
 
 @Test func packetStreamDecoderReconstructsComplete444Frame() throws {
     let frame = try TestFrames.synthetic444(width: 96, height: 64)
-    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec()
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
     let expected = try codec.decode(encoded)
     let packets = try encoded.packetized(maximumPacketBytes: 64)
-    let stream = try PyrowavePacketStreamDecoder(useMetalAcceleration: false)
+    let stream = try PyrowavePacketStreamDecoder()
 
     for packet in packets {
         try stream.pushPacket(packet)
@@ -1445,7 +1410,7 @@ import CoreVideo
         try TestFrames.synthetic420(width: 96, height: 64, frameIndex: 0),
         try TestFrames.synthetic420(width: 96, height: 64, frameIndex: 1)
     ]
-    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec()
     let encoded = try frames.map { try codec.encode($0, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)) }
 
     var writer = try PyrowaveStreamWriter(
@@ -1484,7 +1449,7 @@ import CoreVideo
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     let url = directory.appendingPathComponent("high-depth.pwks")
     let frame = try TestFrames.synthetic420(width: 96, height: 64)
-    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+    let encoded = try PyrowaveCodec().encode(
         frame,
         configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
     )
@@ -1520,7 +1485,7 @@ import CoreVideo
             chromaSiting: .left
         )
     )
-    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+    let encoded = try PyrowaveCodec().encode(
         frame,
         configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
     )
@@ -1549,7 +1514,7 @@ import CoreVideo
     let url = directory.appendingPathComponent("mismatch-write.pwks")
     let headerFrame = try TestFrames.synthetic420(width: 96, height: 64)
     let mismatchedFrame = try TestFrames.synthetic444(width: 96, height: 64)
-    let mismatchedEncoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+    let mismatchedEncoded = try PyrowaveCodec().encode(
         mismatchedFrame,
         configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
     )
@@ -1566,7 +1531,7 @@ import CoreVideo
     let url = directory.appendingPathComponent("mismatch-read.pwks")
     let header = try PyrowaveStreamHeader(width: 96, height: 64, chroma: .yuv420)
     let mismatchedFrame = try TestFrames.synthetic444(width: 96, height: 64)
-    let mismatchedEncoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+    let mismatchedEncoded = try PyrowaveCodec().encode(
         mismatchedFrame,
         configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
     )
@@ -1601,7 +1566,7 @@ import CoreVideo
 
 @Test func packetStreamDecoderAllowsPartialFrameAfterHalfTheBlocks() throws {
     let frame = try TestFrames.synthetic420(width: 96, height: 64)
-    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+    let encoded = try PyrowaveCodec().encode(
         frame,
         configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
     )
@@ -1609,7 +1574,7 @@ import CoreVideo
     let sequencePacket = try #require(packets.first)
     var sequenceReader = BinaryReader(sequencePacket.data)
     let sequence = try PyrowaveSequenceHeader(reader: &sequenceReader)
-    let stream = try PyrowavePacketStreamDecoder(useMetalAcceleration: false)
+    let stream = try PyrowavePacketStreamDecoder()
 
     try stream.pushPacket(sequencePacket)
     for packet in packets.dropFirst().prefix(sequence.totalBlocks / 2) {
@@ -1630,7 +1595,7 @@ import CoreVideo
     let height = 64
     let layout = try PyrowaveBlockLayout(width: width, height: height, chroma: .yuv420)
     let requiredPackets = layout.descriptors.count / 2 + 1
-    let stream = try PyrowavePacketStreamDecoder(width: width, height: height, chroma: .yuv420, useMetalAcceleration: false)
+    let stream = try PyrowavePacketStreamDecoder(width: width, height: height, chroma: .yuv420)
     var coefficients = Array(repeating: Int16(0), count: PyrowaveBitstream.coefficientBlockSize * PyrowaveBitstream.coefficientBlockSize)
     coefficients[0] = 1
 
@@ -1659,7 +1624,7 @@ import CoreVideo
 }
 
 @Test func geometryAwarePacketStreamDecoderRejectsMismatchedSequenceHeader() throws {
-    let stream = try PyrowavePacketStreamDecoder(width: 64, height: 64, chroma: .yuv420, useMetalAcceleration: false)
+    let stream = try PyrowavePacketStreamDecoder(width: 64, height: 64, chroma: .yuv420)
     var writer = BinaryWriter()
     try PyrowaveSequenceHeader(
         width: 96,
@@ -1675,7 +1640,7 @@ import CoreVideo
 }
 
 @Test func packetStreamDecoderRejectsCoefficientPacketShorterThanHeader() throws {
-    let stream = try PyrowavePacketStreamDecoder(width: 64, height: 64, chroma: .yuv420, useMetalAcceleration: false)
+    let stream = try PyrowavePacketStreamDecoder(width: 64, height: 64, chroma: .yuv420)
     var writer = BinaryWriter()
     try PyrowavePacketHeader(
         ballot: 1,
@@ -1693,7 +1658,7 @@ import CoreVideo
 
 @Test func packetStreamDecoderRejectsSameSequenceHeaderMutation() throws {
     let frame = try TestFrames.synthetic420(width: 64, height: 64)
-    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+    let encoded = try PyrowaveCodec().encode(
         frame,
         configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
     )
@@ -1701,7 +1666,7 @@ import CoreVideo
     let sequencePacket = try #require(packets.first)
     var sequenceReader = BinaryReader(sequencePacket.data)
     let sequence = try PyrowaveSequenceHeader(reader: &sequenceReader)
-    let stream = try PyrowavePacketStreamDecoder(useMetalAcceleration: false)
+    let stream = try PyrowavePacketStreamDecoder()
 
     try stream.pushPacket(sequencePacket)
     try stream.pushPacket(try #require(packets.dropFirst().first))
@@ -1738,7 +1703,7 @@ import CoreVideo
         )
     )
 
-    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec()
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
     let decoded = try codec.decode(encoded)
 
@@ -1747,7 +1712,7 @@ import CoreVideo
 
 @Test func codecPacketsUseGlobalPyrowaveBlockOrder() throws {
     let frame = try TestFrames.synthetic420(width: 160, height: 96)
-    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+    let encoded = try PyrowaveCodec().encode(
         frame,
         configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
     )
@@ -1775,7 +1740,7 @@ import CoreVideo
 @Test func codecPacketsUsePerBandPyrowaveQuantCodes() throws {
     let frame = try TestFrames.synthetic420(width: 160, height: 96)
     let configuration = CodecConfiguration(quantizationStep: 1.0 / 1024.0)
-    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(frame, configuration: configuration)
+    let encoded = try PyrowaveCodec().encode(frame, configuration: configuration)
 
     var reader = BinaryReader(encoded.data)
     let sequence = try PyrowaveSequenceHeader(reader: &reader)
@@ -1805,7 +1770,7 @@ import CoreVideo
 
 @Test func codecRequiresSpecDecompositionLevelCount() throws {
     let frame = try TestFrames.synthetic420(width: 64, height: 64)
-    let codec = try PyrowaveCodec(useMetalAcceleration: false)
+    let codec = try PyrowaveCodec()
     #expect(throws: PyrowaveError.invalidDimensions) {
         _ = try codec.encode(frame, configuration: CodecConfiguration(decompositionLevels: 4))
     }

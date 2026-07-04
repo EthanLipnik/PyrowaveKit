@@ -1,6 +1,4 @@
 import Foundation
-
-#if canImport(CoreVideo)
 import CoreVideo
 
 extension YUVFrame {
@@ -152,4 +150,3 @@ extension PyrowavePacketStreamDecoder {
         try decode(allowPartialFrame: allowPartialFrame).makeCVPixelBuffer(pixelFormat: pixelFormat)
     }
 }
-#endif
