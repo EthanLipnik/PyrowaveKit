@@ -764,6 +764,77 @@ import CoreVideo
     #endif
 }
 
+@Test func metalTexturesRoundTripYUVFramesWhenDeviceExists() throws {
+    #if canImport(Metal)
+    do {
+        let backend = try MetalPyrowaveBackend()
+        let frame420 = try TestFrames.synthetic420(width: 64, height: 64)
+        let textures420 = try frame420.makeMetalTextures(device: backend.device)
+        let imported420 = try YUVFrame(
+            yTexture: textures420.y,
+            cbTexture: textures420.cb,
+            crTexture: textures420.cr,
+            videoSignal: frame420.videoSignal
+        )
+        #expect(imported420 == frame420)
+
+        let frame444 = try TestFrames.synthetic444(width: 32, height: 24)
+        let textures444 = try frame444.makeMetalTextures(device: backend.device)
+        let imported444 = try YUVFrame(
+            yTexture: textures444.y,
+            cbTexture: textures444.cb,
+            crTexture: textures444.cr,
+            videoSignal: frame444.videoSignal
+        )
+        #expect(imported444 == frame444)
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+    #endif
+}
+
+@Test func codecEncodesAndDecodesMetalTexturesWhenDeviceExists() throws {
+    #if canImport(Metal)
+    do {
+        let backend = try MetalPyrowaveBackend()
+        let source = try TestFrames.synthetic420(width: 64, height: 64)
+        let sourceTextures = try source.makeMetalTextures(device: backend.device)
+        let codec = try PyrowaveCodec(useMetalAcceleration: false)
+        let encoded = try codec.encode(
+            yTexture: sourceTextures.y,
+            cbTexture: sourceTextures.cb,
+            crTexture: sourceTextures.cr,
+            configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0),
+            videoSignal: source.videoSignal
+        )
+        let decodedTextures = try codec.decodeToMetalTextures(encoded, device: backend.device)
+        let decoded = try YUVFrame(
+            yTexture: decodedTextures.y,
+            cbTexture: decodedTextures.cb,
+            crTexture: decodedTextures.cr,
+            videoSignal: source.videoSignal
+        )
+        #expect(try Metrics.compare(source, decoded).weightedPSNR > 44.0)
+
+        let packets = try encoded.packetized(maximumPacketBytes: 64)
+        let stream = try PyrowavePacketStreamDecoder(width: source.width, height: source.height, chroma: source.chroma, useMetalAcceleration: false)
+        for packet in packets {
+            try stream.pushPacket(packet)
+        }
+        let streamedTextures = try stream.decodeToMetalTextures(device: backend.device)
+        let streamed = try YUVFrame(
+            yTexture: streamedTextures.y,
+            cbTexture: streamedTextures.cb,
+            crTexture: streamedTextures.cr,
+            videoSignal: source.videoSignal
+        )
+        #expect(try Metrics.compare(source, streamed).weightedPSNR > 44.0)
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+    #endif
+}
+
 @Test func metalPlanePaddingMatchesCPUReferenceWhenDeviceExists() throws {
     #if canImport(Metal)
     let backend: MetalPyrowaveBackend
