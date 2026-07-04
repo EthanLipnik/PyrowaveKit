@@ -140,3 +140,50 @@ import Testing
     let metrics = try Metrics.compare(frame, decoded)
     #expect(metrics.weightedPSNR > 20.0)
 }
+
+@Test func pyrowavePacketHeadersRoundTripPackedFields() throws {
+    var writer = BinaryWriter()
+    let packet = try PyrowavePacketHeader(
+        ballot: 0x8421,
+        payloadWords: 37,
+        sequence: 5,
+        extended: false,
+        quantCode: 19,
+        blockIndex: 0x00ab_cdef
+    )
+    packet.write(to: &writer)
+    #expect(writer.data.count == 8)
+
+    var reader = BinaryReader(writer.data)
+    let decoded = try PyrowavePacketHeader(reader: &reader)
+    #expect(decoded == packet)
+
+    var sequenceWriter = BinaryWriter()
+    let sequence = try PyrowaveSequenceHeader(width: 6144, height: 3456, sequence: 7, totalBlocks: 12345, chroma: .yuv420)
+    sequence.write(to: &sequenceWriter)
+    #expect(sequenceWriter.data.count == 8)
+
+    var sequenceReader = BinaryReader(sequenceWriter.data)
+    #expect(try PyrowaveSequenceHeader(reader: &sequenceReader) == sequence)
+}
+
+@Test func pyrowaveBlockLayoutFollowsSpecOrdering() throws {
+    let layout = try PyrowaveBlockLayout(width: 256, height: 256, chroma: .yuv420)
+    let first = try #require(layout.descriptors.first)
+    #expect(first.blockIndex == 0)
+    #expect(first.level == 4)
+    #expect(first.component == 0)
+    #expect(first.band == 0)
+    #expect(first.originX == 0)
+    #expect(first.originY == 0)
+
+    let firstLevel4Chroma = try #require(layout.descriptors.first { $0.level == 4 && $0.component == 1 })
+    #expect(firstLevel4Chroma.band == 0)
+
+    #expect(layout.descriptors.contains { $0.level == 0 && $0.component == 0 && $0.band == 1 })
+    #expect(!layout.descriptors.contains { $0.level == 0 && $0.component == 1 })
+    #expect(!layout.descriptors.contains { $0.level == 0 && $0.component == 2 })
+
+    let blockIndices = layout.descriptors.map(\.blockIndex)
+    #expect(blockIndices == Array(0..<layout.descriptors.count))
+}
