@@ -7,6 +7,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
     public let library: MTLLibrary
+    private let padPlanePipeline: MTLComputePipelineState
     private let quantizePipeline: MTLComputePipelineState
     private let dequantizePipeline: MTLComputePipelineState
     private let quantizePlaneTilesPipeline: MTLComputePipelineState
@@ -40,6 +41,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("missing Metal kernel resource")
         }
 
+        padPlanePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_pad_plane", library: library))
         quantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize", library: library))
         dequantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dequantize", library: library))
         quantizePlaneTilesPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize_plane_tiles", library: library))
@@ -57,6 +59,58 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
 
     public func makeFunction(named name: String) throws -> MTLFunction {
         try Self.makeFunction(named: name, library: library)
+    }
+
+    func padPlane(_ plane: Plane8, paddedWidth: Int, paddedHeight: Int) throws -> [Float] {
+        guard paddedWidth > 0,
+              paddedHeight > 0,
+              paddedWidth <= Int(UInt32.max),
+              paddedHeight <= Int(UInt32.max),
+              plane.width <= Int(UInt32.max),
+              plane.height <= Int(UInt32.max) else {
+            throw PyrowaveError.invalidDimensions
+        }
+        let sampleCount = paddedWidth * paddedHeight
+        guard sampleCount > 0, sampleCount <= Int(UInt32.max) else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        guard let input = device.makeBuffer(bytes: plane.data, length: plane.data.count * MemoryLayout<UInt8>.stride, options: .storageModeShared),
+              let output = device.makeBuffer(length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal plane padding buffers")
+        }
+
+        var constants = PadPlaneConstants(
+            sourceWidth: UInt32(plane.width),
+            sourceHeight: UInt32(plane.height),
+            paddedWidth: UInt32(paddedWidth),
+            paddedHeight: UInt32(paddedHeight)
+        )
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal plane padding command encoder")
+        }
+
+        encoder.setComputePipelineState(padPlanePipeline)
+        encoder.setBuffer(input, offset: 0, index: 0)
+        encoder.setBuffer(output, offset: 0, index: 1)
+        encoder.setBytes(&constants, length: MemoryLayout<PadPlaneConstants>.stride, index: 2)
+        let width = min(16, padPlanePipeline.maxTotalThreadsPerThreadgroup)
+        let height = max(1, min(16, padPlanePipeline.maxTotalThreadsPerThreadgroup / width))
+        encoder.dispatchThreads(
+            MTLSize(width: paddedWidth, height: paddedHeight, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: height, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal plane padding command failed: \(error)")
+        }
+
+        let pointer = output.contents().bindMemory(to: Float.self, capacity: sampleCount)
+        return Array(UnsafeBufferPointer(start: pointer, count: sampleCount))
     }
 
     public func quantize(_ samples: [Float], quantizationStep: Float) throws -> [Int16] {
@@ -677,6 +731,13 @@ struct MetalRateControlTileStats {
     var stats: [MetalRateControlQuantStats]
 }
 
+private struct PadPlaneConstants {
+    var sourceWidth: UInt32
+    var sourceHeight: UInt32
+    var paddedWidth: UInt32
+    var paddedHeight: UInt32
+}
+
 private struct PlaneQuantizationConstants {
     var descriptorCount: UInt32
 }
@@ -699,6 +760,10 @@ private struct DWTConstants {
 #else
 public final class MetalPyrowaveBackend: @unchecked Sendable {
     public init() throws {
+        throw PyrowaveError.externalToolUnavailable("Metal")
+    }
+
+    func padPlane(_ plane: Plane8, paddedWidth: Int, paddedHeight: Int) throws -> [Float] {
         throw PyrowaveError.externalToolUnavailable("Metal")
     }
 

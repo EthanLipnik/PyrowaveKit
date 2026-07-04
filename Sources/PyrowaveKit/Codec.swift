@@ -404,7 +404,11 @@ public final class PyrowaveCodec: Sendable {
         configuration: CodecConfiguration
     ) throws -> EncodedPlane {
         let geometry = planeGeometry(component: component, frameWidth: frameWidth, frameHeight: frameHeight, chroma: chroma, requestedLevels: configuration.decompositionLevels)
-        var padded = Wavelet.padPlane(plane, paddedWidth: geometry.paddedWidth, paddedHeight: geometry.paddedHeight)
+        var padded = (
+            samples: try padPlane(plane, paddedWidth: geometry.paddedWidth, paddedHeight: geometry.paddedHeight),
+            width: geometry.paddedWidth,
+            height: geometry.paddedHeight
+        )
         let requestedLevels = geometry.requestedLevels
         let levels = Wavelet.usableLevels(width: padded.width, height: padded.height, requested: requestedLevels)
         padded.samples = try forwardWavelet(padded.samples, width: padded.width, height: padded.height, levels: levels)
@@ -821,6 +825,14 @@ public final class PyrowaveCodec: Sendable {
         default:
             return (0, 0)
         }
+    }
+
+    private func padPlane(_ plane: Plane8, paddedWidth: Int, paddedHeight: Int) throws -> [Float] {
+        if let metalBackend {
+            return try metalBackend.padPlane(plane, paddedWidth: paddedWidth, paddedHeight: paddedHeight)
+        }
+
+        return Wavelet.padPlane(plane, paddedWidth: paddedWidth, paddedHeight: paddedHeight).samples
     }
 
     private func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {

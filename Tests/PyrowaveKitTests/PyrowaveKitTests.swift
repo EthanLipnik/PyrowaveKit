@@ -295,6 +295,7 @@ import Testing
     #if canImport(Metal)
     do {
         let backend = try MetalPyrowaveBackend()
+        _ = try backend.makeFunction(named: "pyrowave_pad_plane")
         _ = try backend.makeFunction(named: "pyrowave_quantize")
         _ = try backend.makeFunction(named: "pyrowave_dequantize")
         _ = try backend.makeFunction(named: "pyrowave_quantize_plane_tiles")
@@ -303,6 +304,27 @@ import Testing
     } catch PyrowaveError.externalToolUnavailable {
         return
     }
+    #endif
+}
+
+@Test func metalPlanePaddingMatchesCPUReferenceWhenDeviceExists() throws {
+    #if canImport(Metal)
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let plane = try Plane8(width: 3, height: 2, data: [
+        0, 64, 128,
+        192, 224, 255
+    ])
+    let cpu = Wavelet.padPlane(plane, paddedWidth: 9, paddedHeight: 7).samples
+    let metal = try backend.padPlane(plane, paddedWidth: 9, paddedHeight: 7)
+    #expect(metal.count == cpu.count)
+    let maxError = zip(metal, cpu).map { abs($0 - $1) }.max() ?? 0
+    #expect(maxError < 0.000001)
     #endif
 }
 

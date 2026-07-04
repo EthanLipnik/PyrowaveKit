@@ -6,6 +6,13 @@ struct QuantizationConstants {
     float quantizationStep;
 };
 
+struct PadPlaneConstants {
+    uint sourceWidth;
+    uint sourceHeight;
+    uint paddedWidth;
+    uint paddedHeight;
+};
+
 struct PlaneQuantizationDescriptor {
     uint originX;
     uint originY;
@@ -77,6 +84,33 @@ static inline int mirrorIndex(int index, int count) {
         return 2 * count - index - 2;
     }
     return index;
+}
+
+static inline uint mirrorPadIndex(uint index, uint count) {
+    if (count <= 1u) {
+        return 0u;
+    }
+
+    uint period = 2u * count - 2u;
+    uint wrapped = index % period;
+    return wrapped < count ? wrapped : period - wrapped;
+}
+
+kernel void pyrowave_pad_plane(
+    device const uchar *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant PadPlaneConstants &constants [[buffer(2)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    uint x = position.x;
+    uint y = position.y;
+    if (x >= constants.paddedWidth || y >= constants.paddedHeight) {
+        return;
+    }
+
+    uint sourceX = mirrorPadIndex(x, constants.sourceWidth);
+    uint sourceY = mirrorPadIndex(y, constants.sourceHeight);
+    output[y * constants.paddedWidth + x] = float(input[sourceY * constants.sourceWidth + sourceX]) / 255.0f - 0.5f;
 }
 
 kernel void pyrowave_quantize(
