@@ -158,7 +158,7 @@ import CoreVideo
     #expect(metrics.weightedPSNR > 38.0)
 }
 
-@Test func waveletPaddingUsesMirroredRepeat() throws {
+@Test func waveletPaddingExtendsSourceEdgesBeforeDWTMirrorFiltering() throws {
     let plane = try Plane8(width: 3, height: 2, data: [
         0, 50, 100,
         150, 200, 250
@@ -168,12 +168,12 @@ import CoreVideo
 
     #expect(padded.width == 6)
     #expect(padded.height == 5)
-    #expect(Array(denormalized[0..<6]) == [0, 50, 100, 50, 0, 50])
-    #expect(Array(denormalized[6..<12]) == [150, 200, 250, 200, 150, 200])
-    #expect(Array(denormalized[12..<18]) == [0, 50, 100, 50, 0, 50])
+    #expect(Array(denormalized[0..<6]) == [0, 50, 100, 100, 100, 100])
+    #expect(Array(denormalized[6..<12]) == [150, 200, 250, 250, 250, 250])
+    #expect(Array(denormalized[12..<18]) == [150, 200, 250, 250, 250, 250])
 }
 
-@Test func roundTripNonAlignedSynthetic420UsesMirroredPadding() throws {
+@Test func roundTripNonAlignedSynthetic420UsesEdgeExtendedPadding() throws {
     let frame = try TestFrames.synthetic420(width: 130, height: 74)
     let codec = try PyrowaveCodec(useMetalAcceleration: false)
     let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))

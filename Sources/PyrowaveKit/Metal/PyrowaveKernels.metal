@@ -108,16 +108,6 @@ static inline int mirrorIndex(int index, int count) {
     return index;
 }
 
-static inline uint mirrorPadIndex(uint index, uint count) {
-    if (count <= 1u) {
-        return 0u;
-    }
-
-    uint period = 2u * count - 2u;
-    uint wrapped = index % period;
-    return wrapped < count ? wrapped : period - wrapped;
-}
-
 kernel void pyrowave_pad_plane(
     device const uchar *input [[buffer(0)]],
     device float *output [[buffer(1)]],
@@ -130,8 +120,8 @@ kernel void pyrowave_pad_plane(
         return;
     }
 
-    uint sourceX = mirrorPadIndex(x, constants.sourceWidth);
-    uint sourceY = mirrorPadIndex(y, constants.sourceHeight);
+    uint sourceX = min(x, constants.sourceWidth - 1u);
+    uint sourceY = min(y, constants.sourceHeight - 1u);
     output[y * constants.paddedWidth + x] = float(input[sourceY * constants.sourceWidth + sourceX]) / 255.0f - 0.5f;
 }
 

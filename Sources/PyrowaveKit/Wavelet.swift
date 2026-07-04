@@ -34,9 +34,9 @@ enum Wavelet {
         var samples = Array(repeating: Float(0), count: paddedWidth * paddedHeight)
 
         for y in 0..<paddedHeight {
-            let sourceY = mirror(y, count: plane.height)
+            let sourceY = min(y, plane.height - 1)
             for x in 0..<paddedWidth {
-                let sourceX = mirror(x, count: plane.width)
+                let sourceX = min(x, plane.width - 1)
                 samples[y * paddedWidth + x] = Float(plane.data[sourceY * plane.width + sourceX]) / 255.0 - 0.5
             }
         }
