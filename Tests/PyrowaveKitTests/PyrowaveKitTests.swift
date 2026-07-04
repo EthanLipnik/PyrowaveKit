@@ -262,3 +262,83 @@ import Testing
     #expect(abs(positive - 2.5 / 1024.0) < 0.000001)
     #expect(abs(negative + 2.5 / 1024.0) < 0.000001)
 }
+
+@Test func pyrowaveBlockStatsUseOriginalPackedShape() throws {
+    let stats = PyrowaveBlockStats(
+        numPlanes: 3,
+        stats: (0..<PyrowaveBlockStats.candidateCount).map {
+            PyrowaveQuantStats(squareError: Float($0 * $0), encodeCostBits: 100 - $0)
+        }
+    )
+
+    let packed = stats.packedData()
+    #expect(packed.count == PyrowaveBlockStats.packedByteCount)
+    #expect(stats.stats.count == 15)
+    #expect(stats.stats[4].encodeCostBits == 96)
+}
+
+@Test func pyrowaveRateControlBuildsMonotonicPacketCandidates() throws {
+    let stride = 32
+    var coefficients = Array(repeating: Int16(0), count: stride * stride)
+    coefficients[0] = 1
+    coefficients[1] = -2
+    coefficients[9] = 4
+    coefficients[8 * stride + 2] = -8
+    coefficients[15 * stride + 15] = 14
+
+    let block = try PyrowaveRateController.makeBlock(
+        blockIndex: 0,
+        coefficients: coefficients,
+        stride: stride,
+        originX: 0,
+        originY: 0,
+        validWidth: 32,
+        validHeight: 32,
+        quantCode: PyrowaveQuantization.identityQScaleCode,
+        qScaleCode: PyrowaveQuantization.identityQScaleCode
+    )
+
+    #expect(block.eightByEightStats.count == 16)
+    #expect(block.packetByteCosts[0] > block.packetByteCosts[14])
+    #expect(block.distortion(threshold: 14) > block.distortion(threshold: 0))
+    for threshold in 1..<PyrowaveBlockStats.candidateCount {
+        #expect(block.packetByteCosts[threshold] <= block.packetByteCosts[threshold - 1])
+    }
+}
+
+@Test func pyrowaveRateControllerSelectsThresholdsToMeetCap() throws {
+    let stride = 32
+    var coefficients = Array(repeating: Int16(0), count: stride * stride)
+    coefficients[0] = 1
+    coefficients[1] = 2
+    coefficients[2] = 4
+    coefficients[3] = 8
+    coefficients[4] = 14
+
+    let block = try PyrowaveRateController.makeBlock(
+        blockIndex: 0,
+        coefficients: coefficients,
+        stride: stride,
+        originX: 0,
+        originY: 0,
+        validWidth: 32,
+        validHeight: 32,
+        quantCode: PyrowaveQuantization.identityQScaleCode,
+        qScaleCode: PyrowaveQuantization.identityQScaleCode
+    )
+
+    let targetBytes = block.packetByteCosts[14]
+    let thresholds = try #require(PyrowaveRateController.selectThresholds(
+        blocksByPlane: [[block]],
+        fixedHeaderBytes: 0,
+        maximumEncodedBytes: targetBytes
+    ))
+    let estimatedBytes = PyrowaveRateController.estimateFrameBytes(
+        blocksByPlane: [[block]],
+        thresholdsByPlane: thresholds,
+        fixedHeaderBytes: 0
+    )
+
+    #expect(estimatedBytes <= targetBytes)
+    #expect((thresholds.first?.first ?? 0) > 0)
+}
