@@ -68,7 +68,8 @@ enum PyrowaveRateController {
         validWidth: Int,
         validHeight: Int,
         quantCode: UInt8,
-        qScaleCode: UInt8
+        qScaleCode: UInt8 = PyrowaveQuantization.identityQScaleCode,
+        qScaleCodes: [UInt8]? = nil
     ) throws -> PyrowaveRateControlBlock {
         var stats = [PyrowaveBlockStats]()
         stats.reserveCapacity(16)
@@ -99,7 +100,8 @@ enum PyrowaveRateController {
                 validHeight: validHeight,
                 threshold: threshold,
                 quantCode: quantCode,
-                qScaleCode: qScaleCode
+                qScaleCode: qScaleCode,
+                qScaleCodes: qScaleCodes
             )
             packetByteCosts.append(packet?.count ?? 0)
         }

@@ -106,8 +106,8 @@ public final class PyrowaveCodec: Sendable {
         var paddedWidth: Int
         var paddedHeight: Int
         var levels: Int
-        var qScaleCode: UInt8
         var quantCodesByBlockIndex: [Int: UInt8]
+        var qScaleCodesByBlockIndex: [Int: [UInt8]]
         var coefficients: [Int16]
     }
 
@@ -179,8 +179,8 @@ public final class PyrowaveCodec: Sendable {
             paddedWidth: padded.width,
             paddedHeight: padded.height,
             levels: levels,
-            qScaleCode: PyrowaveQuantization.identityQScaleCode,
             quantCodesByBlockIndex: quantized.quantCodesByBlockIndex,
+            qScaleCodesByBlockIndex: quantized.qScaleCodesByBlockIndex,
             coefficients: quantized.coefficients
         )
     }
@@ -258,7 +258,7 @@ public final class PyrowaveCodec: Sendable {
                 validHeight: descriptor.validHeight,
                 threshold: threshold,
                 quantCode: try quantCode(for: descriptor, plane: plane),
-                qScaleCode: plane.qScaleCode
+                qScaleCodes: try qScaleCodes(for: descriptor, plane: plane)
             ) {
                 blocks.append(SparseBlock(blockIndex: descriptor.blockIndex, data: data))
             }
@@ -279,7 +279,7 @@ public final class PyrowaveCodec: Sendable {
                 validWidth: descriptor.validWidth,
                 validHeight: descriptor.validHeight,
                 quantCode: try quantCode(for: descriptor, plane: plane),
-                qScaleCode: plane.qScaleCode
+                qScaleCodes: try qScaleCodes(for: descriptor, plane: plane)
             )
         }
     }
@@ -292,8 +292,8 @@ public final class PyrowaveCodec: Sendable {
             paddedWidth: geometry.paddedWidth,
             paddedHeight: geometry.paddedHeight,
             levels: levels,
-            qScaleCode: PyrowaveQuantization.identityQScaleCode,
             quantCodesByBlockIndex: [:],
+            qScaleCodesByBlockIndex: [:],
             coefficients: []
         )
         let descriptors = planeBlockDescriptors(plane: scratchPlane, layout: layout)
@@ -392,6 +392,13 @@ public final class PyrowaveCodec: Sendable {
         return quantCode
     }
 
+    private func qScaleCodes(for descriptor: PlaneBlockDescriptor, plane: EncodedPlane) throws -> [UInt8] {
+        guard let qScaleCodes = plane.qScaleCodesByBlockIndex[descriptor.blockIndex] else {
+            throw PyrowaveError.processFailed("missing 8x8 quant scale codes for block \(descriptor.blockIndex)")
+        }
+        return qScaleCodes
+    }
+
     private func planeGeometry(component: Int, frameWidth: Int, frameHeight: Int, chroma: ChromaSubsampling, requestedLevels: Int) -> PlaneGeometry {
         let alignedWidth = Wavelet.alignedDimension(frameWidth)
         let alignedHeight = Wavelet.alignedDimension(frameHeight)
@@ -450,32 +457,64 @@ public final class PyrowaveCodec: Sendable {
         descriptors: [PlaneBlockDescriptor],
         component: Int,
         configuration: CodecConfiguration
-    ) throws -> (coefficients: [Int16], quantCodesByBlockIndex: [Int: UInt8]) {
+    ) throws -> (coefficients: [Int16], quantCodesByBlockIndex: [Int: UInt8], qScaleCodesByBlockIndex: [Int: [UInt8]]) {
         var coefficients = Array(repeating: Int16(0), count: samples.count)
         var quantCodes = [Int: UInt8]()
+        var qScaleCodes = [Int: [UInt8]]()
         quantCodes.reserveCapacity(descriptors.count)
+        qScaleCodes.reserveCapacity(descriptors.count)
 
         for descriptor in descriptors {
-            let step = PyrowaveQuantization.quantizationStep(
+            let requestedStep = PyrowaveQuantization.quantizationStep(
                 level: descriptor.globalLevel,
                 component: component,
                 band: descriptor.band,
                 baseStep: configuration.quantizationStep
             )
-            let invStep = 1.0 / step
-            quantCodes[descriptor.blockIndex] = try PyrowaveQuantization.encodeBlockScale(step)
+            let quantCode = try PyrowaveQuantization.encodeBlockScale(requestedStep)
+            let decodedStep = PyrowaveQuantization.decodeBlockScale(quantCode)
+            let baseScale = 1.0 / decodedStep
+            quantCodes[descriptor.blockIndex] = quantCode
 
-            for y in 0..<descriptor.validHeight {
-                let row = (descriptor.originY + y) * stride + descriptor.originX
-                for x in 0..<descriptor.validWidth {
-                    let index = row + x
-                    let quantized = Int((samples[index] * invStep).rounded())
-                    coefficients[index] = Int16(max(Int(Int16.min), min(Int(Int16.max), quantized)))
+            var blockQScaleCodes = Array(repeating: PyrowaveQuantization.identityQScaleCode, count: 16)
+            for smallBlockY in 0..<4 {
+                for smallBlockX in 0..<4 {
+                    let smallBlock = smallBlockY * 4 + smallBlockX
+                    let smallOriginX = descriptor.originX + smallBlockX * PyrowaveBitstream.smallBlockSize
+                    let smallOriginY = descriptor.originY + smallBlockY * PyrowaveBitstream.smallBlockSize
+                    let smallValidWidth = max(0, min(PyrowaveBitstream.smallBlockSize, descriptor.validWidth - smallBlockX * PyrowaveBitstream.smallBlockSize))
+                    let smallValidHeight = max(0, min(PyrowaveBitstream.smallBlockSize, descriptor.validHeight - smallBlockY * PyrowaveBitstream.smallBlockSize))
+                    guard smallValidWidth > 0, smallValidHeight > 0 else {
+                        continue
+                    }
+
+                    var maxScaledCoefficient = Float(0)
+                    for y in 0..<smallValidHeight {
+                        let row = (smallOriginY + y) * stride + smallOriginX
+                        for x in 0..<smallValidWidth {
+                            maxScaledCoefficient = max(maxScaledCoefficient, abs(samples[row + x] * baseScale))
+                        }
+                    }
+
+                    let qScaleCode = PyrowaveQuantization.encode8x8ScaleCode(maxScaledCoefficient: maxScaledCoefficient)
+                    let quantScale = PyrowaveQuantization.quantScale(for8x8ScaleCode: qScaleCode)
+                    blockQScaleCodes[smallBlock] = qScaleCode
+
+                    for y in 0..<smallValidHeight {
+                        let row = (smallOriginY + y) * stride + smallOriginX
+                        for x in 0..<smallValidWidth {
+                            let index = row + x
+                            let quantized = Int((samples[index] * baseScale * quantScale).rounded(.towardZero))
+                            coefficients[index] = Int16(max(Int(Int16.min), min(Int(Int16.max), quantized)))
+                        }
+                    }
                 }
             }
+
+            qScaleCodes[descriptor.blockIndex] = blockQScaleCodes
         }
 
-        return (coefficients, quantCodes)
+        return (coefficients, quantCodes, qScaleCodes)
     }
 
 }

@@ -196,6 +196,7 @@ import Testing
     let sequence = try PyrowaveSequenceHeader(reader: &reader)
     let layout = try PyrowaveBlockLayout(width: sequence.width, height: sequence.height, chroma: sequence.chroma)
     var observedQuantCodes = Set<UInt8>()
+    var observedQScaleCodes = Set<UInt8>()
 
     while reader.offset < encoded.data.count {
         let packetStart = reader.offset
@@ -209,10 +210,12 @@ import Testing
         )
         #expect(block.quantCode == (try PyrowaveQuantization.encodeBlockScale(expectedStep)))
         observedQuantCodes.insert(block.quantCode)
+        observedQScaleCodes.formUnion(block.qScaleCodes)
         #expect(reader.offset > packetStart)
     }
 
     #expect(observedQuantCodes.count > 1)
+    #expect(observedQScaleCodes.contains { $0 != PyrowaveQuantization.identityQScaleCode })
 }
 
 @Test func codecRequiresSpecDecompositionLevelCount() throws {
@@ -316,6 +319,37 @@ import Testing
     #expect(decodeReader.offset == payload.count)
 }
 
+@Test func pyrowaveCoefficientBlockPayloadCarriesPer8x8QScales() throws {
+    let stride = 32
+    var coefficients = Array(repeating: Int16(0), count: stride * stride)
+    coefficients[0] = 4
+    coefficients[9] = 5
+    coefficients[16] = 6
+
+    var qScaleCodes = Array(repeating: PyrowaveQuantization.identityQScaleCode, count: 16)
+    qScaleCodes[0] = 7
+    qScaleCodes[2] = 8
+
+    let payload = try #require(try PyrowaveCoefficientBlockCodec.encodeBlock(
+        blockIndex: 3,
+        coefficients: coefficients,
+        stride: stride,
+        originX: 0,
+        originY: 0,
+        validWidth: 32,
+        validHeight: 32,
+        threshold: 0,
+        quantCode: 11,
+        qScaleCodes: qScaleCodes
+    ))
+
+    var reader = BinaryReader(payload)
+    let decoded = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
+    #expect(decoded.qScaleCodes == [7, PyrowaveQuantization.identityQScaleCode, 8])
+    #expect(decoded.coefficients.contains { $0.offset == 0 && $0.qScaleCode == 7 })
+    #expect(decoded.coefficients.contains { $0.offset == 16 && $0.qScaleCode == 8 })
+}
+
 @Test func pyrowaveQuantizationHelpersMatchSpecFormulas() throws {
     let code = try PyrowaveQuantization.encodeBlockScale(1.0 / 1024.0)
     #expect(code == 112)
@@ -333,6 +367,10 @@ import Testing
     #expect(PyrowaveQuantization.quantizationResolution(level: 4, component: 0, band: 0) == 512)
     #expect(PyrowaveQuantization.quantizationResolution(level: 1, component: 1, band: 1) == 128)
     #expect(PyrowaveQuantization.quantizationStep(level: 4, component: 0, band: 0, baseStep: 1.0 / 1024.0) == 1.0 / 512.0)
+    #expect(PyrowaveQuantization.encode8x8ScaleCode(maxScaledCoefficient: 0.999) == PyrowaveQuantization.identityQScaleCode)
+    #expect(PyrowaveQuantization.encode8x8ScaleCode(maxScaledCoefficient: 1.75) == PyrowaveQuantization.identityQScaleCode)
+    #expect(PyrowaveQuantization.encode8x8ScaleCode(maxScaledCoefficient: 2.0) == 8)
+    #expect(abs(PyrowaveQuantization.quantScale(for8x8ScaleCode: 8) - (1.0 / 1.25)) < 0.000001)
 }
 
 @Test func pyrowaveBlockStatsUseOriginalPackedShape() throws {

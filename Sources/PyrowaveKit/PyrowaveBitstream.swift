@@ -41,7 +41,21 @@ enum PyrowaveQuantization {
     }
 
     static func encode8x8Scale(_ scale: Float) -> UInt8 {
-        UInt8(clamping: Int(ceil((scale - 0.25) * 8.0)))
+        UInt8(clamping: min(15, max(0, Int(ceil((scale - 0.25) * 8.0)))))
+    }
+
+    static func encode8x8ScaleCode(maxScaledCoefficient: Float) -> UInt8 {
+        guard maxScaledCoefficient >= 1.0 else {
+            return identityQScaleCode
+        }
+
+        let exponent = Int(floor(log2(maxScaledCoefficient - 0.25))) + 1
+        let targetMax = powf(2.0, Float(exponent)) - 0.25
+        return encode8x8Scale(maxScaledCoefficient / targetMax)
+    }
+
+    static func quantScale(for8x8ScaleCode code: UInt8) -> Float {
+        1.0 / decode8x8Scale(code)
     }
 
     static func dequantize(coefficient: Int16, quantCode: UInt8, qScaleCode: UInt8) -> Float {
@@ -305,8 +319,13 @@ struct PyrowaveCoefficientBlockCodec {
         threshold: Int,
         sequence: UInt8 = 0,
         quantCode: UInt8 = 0,
-        qScaleCode: UInt8 = PyrowaveQuantization.identityQScaleCode
+        qScaleCode: UInt8 = PyrowaveQuantization.identityQScaleCode,
+        qScaleCodes: [UInt8]? = nil
     ) throws -> Data? {
+        if let qScaleCodes, qScaleCodes.count != 16 {
+            throw PyrowaveError.invalidBitstream("expected sixteen 8x8 quant scale codes")
+        }
+
         var blockValues = Array(repeating: Int16(0), count: PyrowaveBitstream.coefficientBlockSize * PyrowaveBitstream.coefficientBlockSize)
         var ballot = UInt16(0)
 
@@ -373,7 +392,8 @@ struct PyrowaveCoefficientBlockCodec {
             }
 
             codeWords.append(codeWord)
-            qScales.append((qScaleCode << 4) | UInt8(basePlanes & 0x0f))
+            let smallBlockQScaleCode = qScaleCodes?[smallBlock] ?? qScaleCode
+            qScales.append((smallBlockQScaleCode << 4) | UInt8(basePlanes & 0x0f))
 
             for subblock in 0..<subblockCount {
                 for pixel in 0..<pixelsPerSubblock {
