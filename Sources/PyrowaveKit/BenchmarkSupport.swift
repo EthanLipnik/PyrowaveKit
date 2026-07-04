@@ -1,5 +1,6 @@
 import Foundation
 import CoreVideo
+import Metal
 
 public enum PyrowaveBenchmarkArtifactNames {
     public static let referenceY4M = "reference.y4m"
@@ -209,8 +210,16 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
 
 enum PyrowaveBenchmarkRunner {
     static let pyrowaveCodecName = "pyrowavekit-swift-metal"
-    static let timedBenchmarkScopeNote = "Timed encode/decode excludes input loading, pixel-buffer preparation, artifact writes, report serialization, and quality metric generation; encode starts from reusable CoreVideo-backed Metal texture views and decode stops at CVPixelBuffer output."
+    static let timedBenchmarkScopeNote = "Timed encode/decode excludes input loading, pixel-buffer preparation, reusable output allocation, artifact writes, report serialization, and quality metric generation; encode starts from reusable CoreVideo-backed Metal texture views and decode writes into reusable CVPixelBuffer-backed Metal texture views."
     static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane, texture, and NV12 texture-channel pad, crop, DWT/iDWT, block quantization, sparse packet byte-cost prefiltering, sparse packet emission, sparse decode apply, rate-control stats, bucket resolve, and savings prefix, 32x32 sparse packets, and optional frame-size cap. \(timedBenchmarkScopeNote)"
+
+    private struct DecodeTarget {
+        var pixelBuffer: CVPixelBuffer
+        var yTextureReference: CVMetalTexture
+        var cbCrTextureReference: CVMetalTexture
+        var yTexture: MTLTexture
+        var cbCrTexture: MTLTexture
+    }
 
     static func loadFrames(arguments: PyrowaveBenchmarkArguments) throws -> PyrowaveBenchmarkFrames {
         if let input = arguments.input {
@@ -255,14 +264,23 @@ enum PyrowaveBenchmarkRunner {
         }
         let encodeSeconds = stopwatch.lapSeconds()
 
-        var decodedPixelBuffers = [CVPixelBuffer]()
-        decodedPixelBuffers.reserveCapacity(frames.count)
-        for frame in encodedFrames {
-            decodedPixelBuffers.append(try codec.decodeToCVPixelBuffer(frame))
+        let decodeTargets = try makeDecodeTargets(
+            codec: codec,
+            width: frames[0].width,
+            height: frames[0].height,
+            pixelFormat: YUVFrame.cvPixelFormat(for: frames[0].videoSignal),
+            count: frames.count
+        )
+        for index in encodedFrames.indices {
+            try codec.decodeToNV12Textures(
+                encodedFrames[index],
+                yTexture: decodeTargets[index].yTexture,
+                cbCrTexture: decodeTargets[index].cbCrTexture
+            )
         }
         let decodeSeconds = stopwatch.lapSeconds()
-        let decodedFrames = try decodedPixelBuffers.map {
-            try YUVFrame(cvPixelBuffer: $0, videoSignal: frames[0].videoSignal)
+        let decodedFrames = try decodeTargets.map {
+            try YUVFrame(cvPixelBuffer: $0.pixelBuffer, videoSignal: frames[0].videoSignal)
         }
 
         let encodedBytes = encodedFrames.reduce(0) { $0 + $1.data.count }
@@ -296,6 +314,97 @@ enum PyrowaveBenchmarkRunner {
             metrics: metric,
             note: pyrowaveImplementationNote
         )
+    }
+
+    private static func makeDecodeTargets(
+        codec: PyrowaveCodec,
+        width: Int,
+        height: Int,
+        pixelFormat: OSType,
+        count: Int
+    ) throws -> [DecodeTarget] {
+        guard count > 0, width > 0, height > 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        return try (0..<count).map { _ in
+            try makeDecodeTarget(codec: codec, width: width, height: height, pixelFormat: pixelFormat)
+        }
+    }
+
+    private static func makeDecodeTarget(
+        codec: PyrowaveCodec,
+        width: Int,
+        height: Int,
+        pixelFormat: OSType
+    ) throws -> DecodeTarget {
+        var pixelBuffer: CVPixelBuffer?
+        let attributes = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            kCVPixelBufferMetalCompatibilityKey as String: true
+        ] as CFDictionary
+        let status = CVPixelBufferCreate(
+            nil,
+            width,
+            height,
+            pixelFormat,
+            attributes,
+            &pixelBuffer
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer else {
+            throw PyrowaveError.processFailed("failed to allocate benchmark decode CVPixelBuffer")
+        }
+
+        let y = try makeMetalTexture(
+            codec: codec,
+            pixelBuffer: pixelBuffer,
+            pixelFormat: .r8Unorm,
+            width: width,
+            height: height,
+            planeIndex: 0
+        )
+        let cbCr = try makeMetalTexture(
+            codec: codec,
+            pixelBuffer: pixelBuffer,
+            pixelFormat: .rg8Unorm,
+            width: width / 2,
+            height: height / 2,
+            planeIndex: 1
+        )
+        return DecodeTarget(
+            pixelBuffer: pixelBuffer,
+            yTextureReference: y.reference,
+            cbCrTextureReference: cbCr.reference,
+            yTexture: y.texture,
+            cbCrTexture: cbCr.texture
+        )
+    }
+
+    private static func makeMetalTexture(
+        codec: PyrowaveCodec,
+        pixelBuffer: CVPixelBuffer,
+        pixelFormat: MTLPixelFormat,
+        width: Int,
+        height: Int,
+        planeIndex: Int
+    ) throws -> (texture: MTLTexture, reference: CVMetalTexture) {
+        var textureReference: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            nil,
+            codec.coreVideoTextureCache,
+            pixelBuffer,
+            nil,
+            pixelFormat,
+            width,
+            height,
+            planeIndex,
+            &textureReference
+        )
+        guard status == kCVReturnSuccess,
+              let textureReference,
+              let texture = CVMetalTextureGetTexture(textureReference) else {
+            throw PyrowaveError.processFailed("failed to create benchmark decode Metal texture for plane \(planeIndex)")
+        }
+        return (texture, textureReference)
     }
 }
 
