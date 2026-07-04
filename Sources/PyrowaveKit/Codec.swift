@@ -1097,16 +1097,28 @@ public final class PyrowaveCodec: @unchecked Sendable {
         }
 
         let fixedHeaderBytes = frameHeaderSize
-        let rateControlInputs = try makeSparseRateControlInputs(
-            planes,
-            layout: layout,
-            packetByteCostsByPlane: packetByteCostsByPlane
-        )
-        let selectedPacketByteCostsByPlane = rateControlInputs.packetByteCostsByPlane
-        let metalBucketData = try metalRateControlBucketData(
-            distortionsByPlane: rateControlInputs.distortionsByPlane,
-            packetByteCostsByPlane: selectedPacketByteCostsByPlane
-        )
+        let selectedPacketByteCostsByPlane: [[[Int]]]
+        let metalBucketData: MetalRateControlBucketData
+        if let packetByteCostsByPlane,
+           planes.allSatisfy({ $0.coefficientBuffer != nil }) {
+            selectedPacketByteCostsByPlane = packetByteCostsByPlane
+            metalBucketData = try metalRateControlBucketDataFromTileStats(
+                planes,
+                layout: layout,
+                packetByteCostsByPlane: selectedPacketByteCostsByPlane
+            )
+        } else {
+            let rateControlInputs = try makeSparseRateControlInputs(
+                planes,
+                layout: layout,
+                packetByteCostsByPlane: packetByteCostsByPlane
+            )
+            selectedPacketByteCostsByPlane = rateControlInputs.packetByteCostsByPlane
+            metalBucketData = try metalRateControlBucketData(
+                distortionsByPlane: rateControlInputs.distortionsByPlane,
+                packetByteCostsByPlane: selectedPacketByteCostsByPlane
+            )
+        }
         if let thresholdsByPlane = selectThresholds(
             packetByteCostsByPlane: selectedPacketByteCostsByPlane,
             fixedHeaderBytes: fixedHeaderBytes,
@@ -1213,6 +1225,78 @@ public final class PyrowaveCodec: @unchecked Sendable {
             packetByteCosts: flatPacketByteCosts
         )
         return MetalRateControlBucketData(indicesByPlane: bucketsByPlane, cumulativeSavings: cumulativeSavings)
+    }
+
+    private func metalRateControlBucketDataFromTileStats(
+        _ planes: [EncodedPlane],
+        layout: PyrowaveBlockLayout,
+        packetByteCostsByPlane: [[[Int]]]
+    ) throws -> MetalRateControlBucketData {
+        guard packetByteCostsByPlane.count == planes.count else {
+            throw PyrowaveError.processFailed("packet byte-cost plane count \(packetByteCostsByPlane.count) does not match plane count \(planes.count)")
+        }
+        guard planes.allSatisfy({ $0.coefficientBuffer != nil }) else {
+            throw PyrowaveError.processFailed("resident rate-control bucket path requires Metal coefficient buffers")
+        }
+
+        let descriptorsByPlane = planes.map { planeBlockDescriptors(plane: $0, layout: layout) }
+        var statsDescriptorsByPlane = [[MetalRateControlStatsDescriptor]]()
+        statsDescriptorsByPlane.reserveCapacity(planes.count)
+
+        for (planeIndex, plane) in planes.enumerated() {
+            let descriptors = descriptorsByPlane[planeIndex]
+            guard packetByteCostsByPlane[planeIndex].count == descriptors.count else {
+                throw PyrowaveError.processFailed("packet byte-cost count \(packetByteCostsByPlane[planeIndex].count) does not match block count \(descriptors.count)")
+            }
+
+            var statsDescriptors = [MetalRateControlStatsDescriptor]()
+            statsDescriptors.reserveCapacity(descriptors.count * 16)
+            for (descriptorIndex, descriptor) in descriptors.enumerated() {
+                let quantCode = try quantCode(for: descriptor, descriptorIndex: descriptorIndex, plane: plane)
+                let qScaleCodes = try qScaleCodes(for: descriptor, descriptorIndex: descriptorIndex, plane: plane)
+                let rdoDistortionScale = PyrowaveQuantization.rdoDistortionScale(
+                    level: descriptor.globalLevel,
+                    component: plane.component,
+                    band: descriptor.band,
+                    chroma: layout.chroma
+                )
+                for tileY in 0..<4 {
+                    for tileX in 0..<4 {
+                        let tileIndex = tileY * 4 + tileX
+                        statsDescriptors.append(MetalRateControlStatsDescriptor(
+                            originX: UInt32(descriptor.originX + tileX * PyrowaveBitstream.smallBlockSize),
+                            originY: UInt32(descriptor.originY + tileY * PyrowaveBitstream.smallBlockSize),
+                            validWidth: UInt32(max(0, min(PyrowaveBitstream.smallBlockSize, descriptor.validWidth - tileX * PyrowaveBitstream.smallBlockSize))),
+                            validHeight: UInt32(max(0, min(PyrowaveBitstream.smallBlockSize, descriptor.validHeight - tileY * PyrowaveBitstream.smallBlockSize))),
+                            stride: UInt32(plane.paddedWidth),
+                            quantCode: UInt32(quantCode),
+                            qScaleCode: UInt32(qScaleCodes[tileIndex]),
+                            distortionScale: rdoDistortionScale
+                        ))
+                    }
+                }
+            }
+            statsDescriptorsByPlane.append(statsDescriptors)
+        }
+
+        let bucketData = try metalBackend.rateControlBucketDataFromTileStatsBatch(planes.indices.map { index in
+            (
+                coefficientBuffer: planes[index].coefficientBuffer!,
+                coefficientCount: planes[index].coefficientCount,
+                statsDescriptors: statsDescriptorsByPlane[index],
+                packetByteCosts: packetByteCostsByPlane[index]
+            )
+        })
+        let bucketsByPlane = bucketData.bucketIndicesByPlane
+        guard bucketsByPlane.count == packetByteCostsByPlane.count else {
+            throw PyrowaveError.processFailed("Metal rate-control tile bucket batch returned \(bucketsByPlane.count) planes for \(packetByteCostsByPlane.count) inputs")
+        }
+        for planeIndex in packetByteCostsByPlane.indices {
+            guard bucketsByPlane[planeIndex].count == packetByteCostsByPlane[planeIndex].count else {
+                throw PyrowaveError.processFailed("Metal rate-control tile bucket pass returned \(bucketsByPlane[planeIndex].count) blocks for \(packetByteCostsByPlane[planeIndex].count) inputs")
+            }
+        }
+        return MetalRateControlBucketData(indicesByPlane: bucketsByPlane, cumulativeSavings: bucketData.cumulativeSavings)
     }
 
     private var frameHeaderSize: Int {

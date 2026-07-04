@@ -744,6 +744,64 @@ kernel void pyrowave_rate_control_bucket_indices(
     }
 }
 
+static inline float pyrowave_quantized_square_error(float squareError) {
+    return float(half(clamp(squareError, 0.0f, 60000.0f)));
+}
+
+kernel void pyrowave_rate_control_tile_stats_bucket_indices(
+    device const RateControlQuantStats *tileStats [[buffer(0)]],
+    device const uint *packetByteCosts [[buffer(1)]],
+    device uint *bucketIndices [[buffer(2)]],
+    constant RateControlBucketConstants &constants [[buffer(3)]],
+    uint blockIndex [[thread_position_in_grid]]
+) {
+    if (blockIndex >= constants.blockCount) {
+        return;
+    }
+
+    constexpr uint candidateCount = 15u;
+    constexpr uint tileCount = 16u;
+    constexpr uint bucketCount = 128u;
+    constexpr uint bucketClusterWidth = 16u;
+    uint outputOffset = blockIndex * candidateCount;
+    uint tileStatsOffset = blockIndex * tileCount * candidateCount;
+    float distortions[candidateCount];
+
+    for (uint quantLevel = 0u; quantLevel < candidateCount; ++quantLevel) {
+        float distortion = 0.0f;
+        for (uint tile = 0u; tile < tileCount; ++tile) {
+            distortion += pyrowave_quantized_square_error(tileStats[tileStatsOffset + tile * candidateCount + quantLevel].squareError);
+        }
+        distortions[quantLevel] = distortion;
+    }
+
+    float baseDistortion = distortions[0];
+    uint baseCost = packetByteCosts[outputOffset];
+    uint raw[candidateCount];
+
+    for (uint quantLevel = 0u; quantLevel < candidateCount; ++quantLevel) {
+        uint bucket = 0u;
+        if (quantLevel != 0u && packetByteCosts[outputOffset + quantLevel] != baseCost) {
+            float distortionDelta = max(distortions[quantLevel] - baseDistortion, 0.0f);
+            int saving = int(baseCost) - int(packetByteCosts[outputOffset + quantLevel]);
+            float costSaving = saving > 0 ? float(saving) : 1.40129846e-45f;
+            float index = 60.0f + 2.0f * log2(distortionDelta / costSaving);
+            if (isfinite(index)) {
+                bucket = uint(clamp(floor(index + 0.5f), 0.0f, 127.0f));
+            }
+        }
+        raw[quantLevel] = min(bucket, bucketCount - bucketClusterWidth + quantLevel);
+    }
+
+    for (uint quantLevel = 0u; quantLevel < candidateCount; ++quantLevel) {
+        uint bucket = raw[quantLevel];
+        for (uint previous = 0u; previous < quantLevel; ++previous) {
+            bucket = max(bucket, raw[previous] + quantLevel - previous);
+        }
+        bucketIndices[outputOffset + quantLevel] = min(bucketCount - 1u, bucket);
+    }
+}
+
 kernel void pyrowave_rate_control_bucket_savings(
     device const uint *bucketIndices [[buffer(0)]],
     device const uint *packetByteCosts [[buffer(1)]],

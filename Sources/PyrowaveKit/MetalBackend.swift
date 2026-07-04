@@ -39,6 +39,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     private let packetByteCostsPipeline: MTLComputePipelineState
     private let sparsePacketEncodePipeline: MTLComputePipelineState
     private let rateControlBucketPipeline: MTLComputePipelineState
+    private let rateControlTileStatsBucketPipeline: MTLComputePipelineState
     private let rateControlBucketSavingsPipeline: MTLComputePipelineState
     private let rateControlBucketSavingsPrefixPipeline: MTLComputePipelineState
     private let dwtLiftRowsPipeline: MTLComputePipelineState
@@ -86,6 +87,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         packetByteCostsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_packet_byte_costs", library: library))
         sparsePacketEncodePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_encode_sparse_packets", library: library))
         rateControlBucketPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_bucket_indices", library: library))
+        rateControlTileStatsBucketPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_tile_stats_bucket_indices", library: library))
         rateControlBucketSavingsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_bucket_savings", library: library))
         rateControlBucketSavingsPrefixPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_bucket_savings_prefix", library: library))
         dwtLiftRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_rows", library: library))
@@ -1418,6 +1420,193 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             }
         }
         return results
+    }
+
+    func rateControlBucketDataFromTileStatsBatch(
+        _ planes: [(
+            coefficientBuffer: MTLBuffer,
+            coefficientCount: Int,
+            statsDescriptors: [MetalRateControlStatsDescriptor],
+            packetByteCosts: [[Int]]
+        )]
+    ) throws -> MetalRateControlBucketBatchResult {
+        guard !planes.isEmpty else {
+            return MetalRateControlBucketBatchResult(bucketIndicesByPlane: [], cumulativeSavings: Array(repeating: 0, count: 128))
+        }
+
+        var results = Array(repeating: [[Int]](), count: planes.count)
+        var work = [(
+            planeIndex: Int,
+            coefficientBuffer: MTLBuffer,
+            statsDescriptorBuffer: MTLBuffer,
+            numPlanesBuffer: MTLBuffer,
+            statsBuffer: MTLBuffer,
+            packetByteCostBuffer: MTLBuffer,
+            bucketIndexBuffer: MTLBuffer,
+            statsDescriptorCount: Int,
+            blockCount: Int
+        )]()
+        work.reserveCapacity(planes.count)
+
+        for (planeIndex, plane) in planes.enumerated() {
+            guard plane.coefficientCount > 0,
+                  plane.coefficientBuffer.length >= plane.coefficientCount * MemoryLayout<Int16>.stride,
+                  plane.packetByteCosts.count <= Int(UInt32.max),
+                  plane.statsDescriptors.count == plane.packetByteCosts.count * 16 else {
+                throw PyrowaveError.invalidDimensions
+            }
+            guard !plane.packetByteCosts.isEmpty else {
+                continue
+            }
+
+            var flatPacketByteCosts = [UInt32]()
+            flatPacketByteCosts.reserveCapacity(plane.packetByteCosts.count * PyrowaveBlockStats.candidateCount)
+            for blockCosts in plane.packetByteCosts {
+                guard blockCosts.count == PyrowaveBlockStats.candidateCount else {
+                    throw PyrowaveError.processFailed("rate-control bucket input must contain \(PyrowaveBlockStats.candidateCount) candidates per block")
+                }
+                for cost in blockCosts {
+                    guard cost >= 0, cost <= Int(UInt32.max) else {
+                        throw PyrowaveError.invalidDimensions
+                    }
+                    flatPacketByteCosts.append(UInt32(cost))
+                }
+            }
+
+            let statsDescriptorCount = plane.statsDescriptors.count
+            let numPlanesByteLength = statsDescriptorCount * MemoryLayout<UInt32>.stride
+            let statsByteLength = statsDescriptorCount * PyrowaveBlockStats.candidateCount * MemoryLayout<MetalRateControlQuantStats>.stride
+            let bucketIndexByteLength = flatPacketByteCosts.count * MemoryLayout<UInt32>.stride
+            let statsDescriptorBuffer = try reusableSharedBuffer(bytes: plane.statsDescriptors, purpose: .rateStatsDescriptor, planeIndex: planeIndex)
+            let numPlanesBuffer = try reusableSharedBuffer(byteLength: numPlanesByteLength, purpose: .rateStatsNumPlanes, planeIndex: planeIndex)
+            let statsBuffer = try reusableSharedBuffer(byteLength: statsByteLength, purpose: .rateStats, planeIndex: planeIndex)
+            guard let packetByteCostBuffer = device.makeBuffer(
+                bytes: flatPacketByteCosts,
+                length: flatPacketByteCosts.count * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            ),
+                  let bucketIndexBuffer = device.makeBuffer(
+                    length: bucketIndexByteLength,
+                    options: .storageModeShared
+                  ) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal rate-control tile bucket buffers")
+            }
+
+            work.append((
+                planeIndex: planeIndex,
+                coefficientBuffer: plane.coefficientBuffer,
+                statsDescriptorBuffer: statsDescriptorBuffer,
+                numPlanesBuffer: numPlanesBuffer,
+                statsBuffer: statsBuffer,
+                packetByteCostBuffer: packetByteCostBuffer,
+                bucketIndexBuffer: bucketIndexBuffer,
+                statsDescriptorCount: statsDescriptorCount,
+                blockCount: plane.packetByteCosts.count
+            ))
+        }
+
+        guard !work.isEmpty else {
+            return MetalRateControlBucketBatchResult(bucketIndicesByPlane: results, cumulativeSavings: Array(repeating: 0, count: 128))
+        }
+
+        let bucketSavings = Array(repeating: UInt32(0), count: 128)
+        let cumulativeSavings = Array(repeating: UInt32(0), count: 128)
+        guard let bucketSavingsBuffer = device.makeBuffer(bytes: bucketSavings, length: bucketSavings.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let cumulativeSavingsBuffer = device.makeBuffer(bytes: cumulativeSavings, length: cumulativeSavings.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw PyrowaveError.processFailed("failed to allocate Metal fused rate-control tile bucket buffers")
+        }
+
+        guard let statsEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal rate-control stats command encoder")
+        }
+        statsEncoder.setComputePipelineState(rateControlStatsPipeline)
+        let statsWidth = min(rateControlStatsPipeline.maxTotalThreadsPerThreadgroup, 256)
+        let statsThreads = MTLSize(width: statsWidth, height: 1, depth: 1)
+        for item in work {
+            var constants = RateControlStatsConstants(descriptorCount: UInt32(item.statsDescriptorCount))
+            statsEncoder.setBuffer(item.coefficientBuffer, offset: 0, index: 0)
+            statsEncoder.setBuffer(item.statsDescriptorBuffer, offset: 0, index: 1)
+            statsEncoder.setBuffer(item.numPlanesBuffer, offset: 0, index: 2)
+            statsEncoder.setBuffer(item.statsBuffer, offset: 0, index: 3)
+            statsEncoder.setBytes(&constants, length: MemoryLayout<RateControlStatsConstants>.stride, index: 4)
+            statsEncoder.dispatchThreads(
+                MTLSize(width: item.statsDescriptorCount, height: 1, depth: 1),
+                threadsPerThreadgroup: statsThreads
+            )
+        }
+        statsEncoder.endEncoding()
+
+        guard let bucketEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal rate-control tile bucket command encoder")
+        }
+        bucketEncoder.setComputePipelineState(rateControlTileStatsBucketPipeline)
+        let bucketWidth = min(rateControlTileStatsBucketPipeline.maxTotalThreadsPerThreadgroup, 256)
+        let bucketThreads = MTLSize(width: bucketWidth, height: 1, depth: 1)
+        for item in work {
+            var constants = RateControlBucketConstants(blockCount: UInt32(item.blockCount))
+            bucketEncoder.setBuffer(item.statsBuffer, offset: 0, index: 0)
+            bucketEncoder.setBuffer(item.packetByteCostBuffer, offset: 0, index: 1)
+            bucketEncoder.setBuffer(item.bucketIndexBuffer, offset: 0, index: 2)
+            bucketEncoder.setBytes(&constants, length: MemoryLayout<RateControlBucketConstants>.stride, index: 3)
+            bucketEncoder.dispatchThreads(
+                MTLSize(width: item.blockCount, height: 1, depth: 1),
+                threadsPerThreadgroup: bucketThreads
+            )
+        }
+        bucketEncoder.endEncoding()
+
+        guard let savingsEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal rate-control savings command encoder")
+        }
+        savingsEncoder.setComputePipelineState(rateControlBucketSavingsPipeline)
+        let savingsWidth = min(rateControlBucketSavingsPipeline.maxTotalThreadsPerThreadgroup, 256)
+        let savingsThreads = MTLSize(width: savingsWidth, height: 1, depth: 1)
+        for item in work {
+            var constants = RateControlBucketSavingsConstants(blockCount: UInt32(item.blockCount))
+            savingsEncoder.setBuffer(item.bucketIndexBuffer, offset: 0, index: 0)
+            savingsEncoder.setBuffer(item.packetByteCostBuffer, offset: 0, index: 1)
+            savingsEncoder.setBuffer(bucketSavingsBuffer, offset: 0, index: 2)
+            savingsEncoder.setBytes(&constants, length: MemoryLayout<RateControlBucketSavingsConstants>.stride, index: 3)
+            savingsEncoder.dispatchThreads(
+                MTLSize(width: item.blockCount, height: 1, depth: 1),
+                threadsPerThreadgroup: savingsThreads
+            )
+        }
+        savingsEncoder.endEncoding()
+
+        guard let prefixEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal rate-control savings prefix command encoder")
+        }
+        prefixEncoder.setComputePipelineState(rateControlBucketSavingsPrefixPipeline)
+        prefixEncoder.setBuffer(bucketSavingsBuffer, offset: 0, index: 0)
+        prefixEncoder.setBuffer(cumulativeSavingsBuffer, offset: 0, index: 1)
+        let prefixWidth = min(rateControlBucketSavingsPrefixPipeline.maxTotalThreadsPerThreadgroup, 128)
+        prefixEncoder.dispatchThreads(
+            MTLSize(width: 128, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: prefixWidth, height: 1, depth: 1)
+        )
+        prefixEncoder.endEncoding()
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal fused rate-control tile bucket command failed: \(error)")
+        }
+
+        for item in work {
+            let bucketIndexCount = item.blockCount * PyrowaveBlockStats.candidateCount
+            let pointer = item.bucketIndexBuffer.contents().bindMemory(to: UInt32.self, capacity: bucketIndexCount)
+            let flatBuckets = Array(UnsafeBufferPointer(start: pointer, count: bucketIndexCount))
+            results[item.planeIndex] = Swift.stride(from: 0, to: flatBuckets.count, by: PyrowaveBlockStats.candidateCount).map {
+                flatBuckets[$0..<$0 + PyrowaveBlockStats.candidateCount].map(Int.init)
+            }
+        }
+
+        let savingsPointer = cumulativeSavingsBuffer.contents().bindMemory(to: UInt32.self, capacity: cumulativeSavings.count)
+        let metalSavings = Array(UnsafeBufferPointer(start: savingsPointer, count: cumulativeSavings.count)).map(Int.init)
+        return MetalRateControlBucketBatchResult(bucketIndicesByPlane: results, cumulativeSavings: metalSavings)
     }
 
     func rateControlBucketDataBatch(
