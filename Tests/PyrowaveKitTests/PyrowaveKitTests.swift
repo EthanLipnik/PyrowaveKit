@@ -2,6 +2,10 @@ import Foundation
 import Testing
 @testable import PyrowaveKit
 
+#if canImport(CoreVideo)
+import CoreVideo
+#endif
+
 @Test func hardCutoverSourceTreeContainsOnlySwiftAndMetalSources() throws {
     let packageRoot = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()
@@ -38,6 +42,59 @@ import Testing
 
     #expect(forbiddenFiles.isEmpty, "Original-language or Vulkan-era files remain: \(forbiddenFiles.sorted())")
 }
+
+#if canImport(CoreVideo)
+@Test func yuvFrameImportsCoreVideoNV12PixelBuffer() throws {
+    var pixelBuffer: CVPixelBuffer?
+    let attributes = [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary
+    let status = CVPixelBufferCreate(
+        nil,
+        4,
+        4,
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        attributes,
+        &pixelBuffer
+    )
+    #expect(status == kCVReturnSuccess)
+    let importedPixelBuffer = try #require(pixelBuffer)
+
+    CVPixelBufferLockBaseAddress(importedPixelBuffer, [])
+    let yStride = CVPixelBufferGetBytesPerRowOfPlane(importedPixelBuffer, 0)
+    let cbCrStride = CVPixelBufferGetBytesPerRowOfPlane(importedPixelBuffer, 1)
+    let yBase = try #require(CVPixelBufferGetBaseAddressOfPlane(importedPixelBuffer, 0)?.assumingMemoryBound(to: UInt8.self))
+    let cbCrBase = try #require(CVPixelBufferGetBaseAddressOfPlane(importedPixelBuffer, 1)?.assumingMemoryBound(to: UInt8.self))
+    let yRows: [[UInt8]] = [
+        [0, 1, 2, 3],
+        [10, 11, 12, 13],
+        [20, 21, 22, 23],
+        [30, 31, 32, 33]
+    ]
+    let cbCrRows: [[UInt8]] = [
+        [100, 150, 101, 151],
+        [102, 152, 103, 153]
+    ]
+    for row in 0..<4 {
+        let destination = yBase.advanced(by: row * yStride)
+        for column in 0..<4 {
+            destination[column] = yRows[row][column]
+        }
+    }
+    for row in 0..<2 {
+        let destination = cbCrBase.advanced(by: row * cbCrStride)
+        for column in 0..<4 {
+            destination[column] = cbCrRows[row][column]
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(importedPixelBuffer, [])
+
+    let frame = try YUVFrame(cvPixelBuffer: importedPixelBuffer)
+    #expect(frame.chroma == ChromaSubsampling.yuv420)
+    #expect(frame.y.data == yRows.flatMap { $0 })
+    #expect(frame.cb.data == [100, 101, 102, 103])
+    #expect(frame.cr.data == [150, 151, 152, 153])
+    #expect(frame.videoSignal.yCbCrRange == YCbCrRange.limited)
+}
+#endif
 
 @Test func roundTripSynthetic420() throws {
     let frame = try TestFrames.synthetic420(width: 160, height: 96)
@@ -538,6 +595,8 @@ import Testing
     #expect(report.artifacts.hevcMovie == PyrowaveBenchmarkArtifactNames.hevcMovie)
     #expect(report.artifacts.hevcDecodedY4M == PyrowaveBenchmarkArtifactNames.hevcDecodedY4M)
     #expect(PyrowaveBenchmarkArtifactNames.report == "benchmark-report.json")
+    #expect(PyrowaveBenchmarkRunner.timedBenchmarkScopeNote.contains("artifact writes"))
+    #expect(HEVCComparison.avKitTimingNote.contains("planar conversion"))
 
     let encoded = try JSONEncoder().encode(report)
     let decoded = try JSONDecoder().decode(PyrowaveBenchmarkReport.self, from: encoded)

@@ -73,6 +73,7 @@ public struct CodecBenchmarkComparison: Codable, Equatable, Sendable {
 
 public enum HEVCComparison {
     private static let maximumQualityReferenceFrameRate = 60
+    public static let avKitTimingNote = "Timed HEVC encode/decode stops at AVFoundation pixel-buffer append/read; planar conversion, PSNR, Y4M artifacts, and report writing are excluded."
 
     public static func runAVKitHEVCComparison(
         referenceFrames: [YUVFrame],
@@ -110,21 +111,27 @@ public enum HEVCComparison {
             try FileManager.default.removeItem(at: decodedURL)
         }
 
-        var stopwatch = Stopwatch()
-        try writeHEVCMovie(
+        let inputPixelBuffers = try makePixelBuffers(
             referenceFrames,
+            pixelFormat: pixelFormat(for: firstFrame.videoSignal)
+        )
+        let encodeSeconds = try writeHEVCMovie(
+            inputPixelBuffers,
+            frameSize: (width: firstFrame.width, height: firstFrame.height),
             to: hevcURL,
             bitrate: bitrate,
             frameDuration: frameDuration
         )
-        let encodeSeconds = stopwatch.lapSeconds()
 
-        let decodedFrames = try readHEVCMovie(
+        let decoded = try readHEVCMoviePixelBuffers(
             hevcURL,
             expectedFrames: referenceFrames.count,
             videoSignal: firstFrame.videoSignal
         )
-        let decodeSeconds = stopwatch.lapSeconds()
+        let decodeSeconds = decoded.decodeSeconds
+        let decodedFrames = try decoded.pixelBuffers.map {
+            try YUVFrame(cvPixelBuffer: $0, videoSignal: firstFrame.videoSignal)
+        }
         try YUV4MPEGWriter.write(
             frames: decodedFrames,
             to: decodedURL,
@@ -145,7 +152,7 @@ public enum HEVCComparison {
             encodeSeconds: encodeSeconds,
             decodeSeconds: decodeSeconds,
             metrics: metrics,
-            note: decodedFrames.count == referenceFrames.count ? nil : "decoded \(decodedFrames.count) of \(referenceFrames.count) frames"
+            note: decodedFrames.count == referenceFrames.count ? avKitTimingNote : "\(avKitTimingNote) Decoded \(decodedFrames.count) of \(referenceFrames.count) frames."
         )
         #else
         return CodecBenchmarkResult(
@@ -206,12 +213,15 @@ public enum HEVCComparison {
 
     #if canImport(AVFoundation)
     private static func writeHEVCMovie(
-        _ frames: [YUVFrame],
+        _ pixelBuffers: [CVPixelBuffer],
+        frameSize: (width: Int, height: Int),
         to url: URL,
         bitrate: Int,
         frameDuration: CMTime
-    ) throws {
-        let firstFrame = try requireFirstFrame(frames)
+    ) throws -> Double {
+        guard !pixelBuffers.isEmpty else {
+            throw PyrowaveError.truncatedInput
+        }
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         let compressionProperties: [String: Any] = [
             AVVideoAverageBitRateKey: bitrate,
@@ -219,8 +229,8 @@ public enum HEVCComparison {
         ]
         let outputSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.hevc,
-            AVVideoWidthKey: firstFrame.width,
-            AVVideoHeightKey: firstFrame.height,
+            AVVideoWidthKey: frameSize.width,
+            AVVideoHeightKey: frameSize.height,
             AVVideoCompressionPropertiesKey: compressionProperties
         ]
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
@@ -231,9 +241,9 @@ public enum HEVCComparison {
         writer.add(input)
 
         let pixelAttributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: pixelFormat(for: firstFrame.videoSignal),
-            kCVPixelBufferWidthKey as String: firstFrame.width,
-            kCVPixelBufferHeightKey as String: firstFrame.height,
+            kCVPixelBufferPixelFormatTypeKey as String: CVPixelBufferGetPixelFormatType(pixelBuffers[0]),
+            kCVPixelBufferWidthKey as String: frameSize.width,
+            kCVPixelBufferHeightKey as String: frameSize.height,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:]
         ]
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
@@ -241,16 +251,16 @@ public enum HEVCComparison {
             sourcePixelBufferAttributes: pixelAttributes
         )
 
+        var stopwatch = Stopwatch()
         guard writer.startWriting() else {
             throw PyrowaveError.processFailed(writer.error?.localizedDescription ?? "failed to start AVAssetWriter")
         }
         writer.startSession(atSourceTime: .zero)
 
-        for (index, frame) in frames.enumerated() {
+        for (index, pixelBuffer) in pixelBuffers.enumerated() {
             while !input.isReadyForMoreMediaData {
                 Thread.sleep(forTimeInterval: 0.001)
             }
-            let pixelBuffer = try makePixelBuffer(frame, adaptor: adaptor)
             let presentationTime = CMTimeMultiply(frameDuration, multiplier: Int32(index))
             guard adaptor.append(pixelBuffer, withPresentationTime: presentationTime) else {
                 throw PyrowaveError.processFailed(writer.error?.localizedDescription ?? "failed to append HEVC frame")
@@ -263,16 +273,18 @@ public enum HEVCComparison {
             semaphore.signal()
         }
         semaphore.wait()
+        let encodeSeconds = stopwatch.lapSeconds()
         guard writer.status == .completed else {
             throw PyrowaveError.processFailed(writer.error?.localizedDescription ?? "failed to finish HEVC movie")
         }
+        return encodeSeconds
     }
 
-    private static func readHEVCMovie(
+    private static func readHEVCMoviePixelBuffers(
         _ url: URL,
         expectedFrames: Int,
         videoSignal: VideoSignalMetadata
-    ) throws -> [YUVFrame] {
+    ) throws -> (pixelBuffers: [CVPixelBuffer], decodeSeconds: Double) {
         let asset = AVURLAsset(url: url)
         let track = try firstVideoTrack(in: asset)
         let outputSettings: [String: Any] = [
@@ -285,22 +297,24 @@ public enum HEVCComparison {
             throw PyrowaveError.processFailed("AVAssetReader rejected HEVC output")
         }
         reader.add(output)
+        var stopwatch = Stopwatch()
         guard reader.startReading() else {
             throw PyrowaveError.processFailed(reader.error?.localizedDescription ?? "failed to start AVAssetReader")
         }
 
-        var frames = [YUVFrame]()
-        frames.reserveCapacity(expectedFrames)
+        var pixelBuffers = [CVPixelBuffer]()
+        pixelBuffers.reserveCapacity(expectedFrames)
         while let sampleBuffer = output.copyNextSampleBuffer() {
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
                 throw PyrowaveError.truncatedInput
             }
-            frames.append(try makeFrame(pixelBuffer, videoSignal: videoSignal))
+            pixelBuffers.append(pixelBuffer)
         }
+        let decodeSeconds = stopwatch.lapSeconds()
         guard reader.status == .completed else {
             throw PyrowaveError.processFailed(reader.error?.localizedDescription ?? "failed to read HEVC movie")
         }
-        return frames
+        return (pixelBuffers, decodeSeconds)
     }
 
     private static func firstVideoTrack(in asset: AVURLAsset) throws -> AVAssetTrack {
@@ -329,20 +343,29 @@ public enum HEVCComparison {
         }
     }
 
-    private static func makePixelBuffer(
-        _ frame: YUVFrame,
-        adaptor: AVAssetWriterInputPixelBufferAdaptor
-    ) throws -> CVPixelBuffer {
-        guard let pool = adaptor.pixelBufferPool else {
-            throw PyrowaveError.processFailed("missing AVAssetWriter pixel buffer pool")
+    private static func makePixelBuffers(_ frames: [YUVFrame], pixelFormat: OSType) throws -> [CVPixelBuffer] {
+        var pixelBuffers = [CVPixelBuffer]()
+        pixelBuffers.reserveCapacity(frames.count)
+        for frame in frames {
+            let attributes = [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ] as CFDictionary
+            var pixelBuffer: CVPixelBuffer?
+            let status = CVPixelBufferCreate(
+                nil,
+                frame.width,
+                frame.height,
+                pixelFormat,
+                attributes,
+                &pixelBuffer
+            )
+            guard status == kCVReturnSuccess, let pixelBuffer else {
+                throw PyrowaveError.processFailed("failed to allocate CVPixelBuffer")
+            }
+            try fill(pixelBuffer, with: frame)
+            pixelBuffers.append(pixelBuffer)
         }
-        var pixelBuffer: CVPixelBuffer?
-        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer)
-        guard status == kCVReturnSuccess, let pixelBuffer else {
-            throw PyrowaveError.processFailed("failed to allocate CVPixelBuffer")
-        }
-        try fill(pixelBuffer, with: frame)
-        return pixelBuffer
+        return pixelBuffers
     }
 
     private static func fill(_ pixelBuffer: CVPixelBuffer, with frame: YUVFrame) throws {
@@ -377,54 +400,6 @@ public enum HEVCComparison {
                 destinationRow[column * 2 + 1] = frame.cr.data[cbStart + column]
             }
         }
-    }
-
-    private static func makeFrame(_ pixelBuffer: CVPixelBuffer, videoSignal: VideoSignalMetadata) throws -> YUVFrame {
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
-        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
-        guard width > 0, height > 0,
-              CVPixelBufferGetPlaneCount(pixelBuffer) >= 2,
-              CVPixelBufferGetWidthOfPlane(pixelBuffer, 1) == width / 2,
-              CVPixelBufferGetHeightOfPlane(pixelBuffer, 1) == height / 2,
-              let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
-              let uvBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else {
-            throw PyrowaveError.invalidDimensions
-        }
-
-        let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
-        let uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
-        let ySource = yBase.assumingMemoryBound(to: UInt8.self)
-        let uvSource = uvBase.assumingMemoryBound(to: UInt8.self)
-        var y = [UInt8]()
-        var cb = [UInt8]()
-        var cr = [UInt8]()
-        y.reserveCapacity(width * height)
-        cb.reserveCapacity((width / 2) * (height / 2))
-        cr.reserveCapacity((width / 2) * (height / 2))
-
-        for row in 0..<height {
-            let source = ySource.advanced(by: row * yStride)
-            y.append(contentsOf: UnsafeBufferPointer(start: source, count: width))
-        }
-        for row in 0..<(height / 2) {
-            let source = uvSource.advanced(by: row * uvStride)
-            for column in 0..<(width / 2) {
-                cb.append(source[column * 2])
-                cr.append(source[column * 2 + 1])
-            }
-        }
-
-        return try YUVFrame(
-            width: width,
-            height: height,
-            chroma: .yuv420,
-            y: Plane8(width: width, height: height, data: y),
-            cb: Plane8(width: width / 2, height: height / 2, data: cb),
-            cr: Plane8(width: width / 2, height: height / 2, data: cr),
-            videoSignal: videoSignal
-        )
     }
 
     private static func pixelFormat(for videoSignal: VideoSignalMetadata) -> OSType {
