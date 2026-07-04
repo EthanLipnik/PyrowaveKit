@@ -113,7 +113,7 @@ public enum HEVCComparison {
 
         let inputPixelBuffers = try makePixelBuffers(
             referenceFrames,
-            pixelFormat: pixelFormat(for: firstFrame.videoSignal)
+            pixelFormat: YUVFrame.cvPixelFormat(for: firstFrame.videoSignal)
         )
         let encodeSeconds = try writeHEVCMovie(
             inputPixelBuffers,
@@ -288,7 +288,7 @@ public enum HEVCComparison {
         let asset = AVURLAsset(url: url)
         let track = try firstVideoTrack(in: asset)
         let outputSettings: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: pixelFormat(for: videoSignal)
+            kCVPixelBufferPixelFormatTypeKey as String: YUVFrame.cvPixelFormat(for: videoSignal)
         ]
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
@@ -347,63 +347,9 @@ public enum HEVCComparison {
         var pixelBuffers = [CVPixelBuffer]()
         pixelBuffers.reserveCapacity(frames.count)
         for frame in frames {
-            let attributes = [
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-            ] as CFDictionary
-            var pixelBuffer: CVPixelBuffer?
-            let status = CVPixelBufferCreate(
-                nil,
-                frame.width,
-                frame.height,
-                pixelFormat,
-                attributes,
-                &pixelBuffer
-            )
-            guard status == kCVReturnSuccess, let pixelBuffer else {
-                throw PyrowaveError.processFailed("failed to allocate CVPixelBuffer")
-            }
-            try fill(pixelBuffer, with: frame)
-            pixelBuffers.append(pixelBuffer)
+            pixelBuffers.append(try frame.makeCVPixelBuffer(pixelFormat: pixelFormat))
         }
         return pixelBuffers
-    }
-
-    private static func fill(_ pixelBuffer: CVPixelBuffer, with frame: YUVFrame) throws {
-        CVPixelBufferLockBaseAddress(pixelBuffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
-        guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2,
-              CVPixelBufferGetWidthOfPlane(pixelBuffer, 0) == frame.width,
-              CVPixelBufferGetHeightOfPlane(pixelBuffer, 0) == frame.height,
-              CVPixelBufferGetWidthOfPlane(pixelBuffer, 1) == frame.width / 2,
-              CVPixelBufferGetHeightOfPlane(pixelBuffer, 1) == frame.height / 2,
-              let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
-              let uvBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else {
-            throw PyrowaveError.invalidDimensions
-        }
-
-        let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
-        let uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
-        let yDestination = yBase.assumingMemoryBound(to: UInt8.self)
-        frame.y.data.withUnsafeBufferPointer { source in
-            for row in 0..<frame.height {
-                let sourceStart = row * frame.width
-                yDestination.advanced(by: row * yStride).update(from: source.baseAddress!.advanced(by: sourceStart), count: frame.width)
-            }
-        }
-
-        let uvDestination = uvBase.assumingMemoryBound(to: UInt8.self)
-        for row in 0..<(frame.height / 2) {
-            let cbStart = row * (frame.width / 2)
-            let destinationRow = uvDestination.advanced(by: row * uvStride)
-            for column in 0..<(frame.width / 2) {
-                destinationRow[column * 2] = frame.cb.data[cbStart + column]
-                destinationRow[column * 2 + 1] = frame.cr.data[cbStart + column]
-            }
-        }
-    }
-
-    private static func pixelFormat(for videoSignal: VideoSignalMetadata) -> OSType {
-        videoSignal.yCbCrRange == .limited ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
     }
 
     private static func requireFirstFrame(_ frames: [YUVFrame]) throws -> YUVFrame {

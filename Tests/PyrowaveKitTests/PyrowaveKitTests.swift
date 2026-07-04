@@ -93,6 +93,11 @@ import CoreVideo
     #expect(frame.cb.data == [100, 101, 102, 103])
     #expect(frame.cr.data == [150, 151, 152, 153])
     #expect(frame.videoSignal.yCbCrRange == YCbCrRange.limited)
+
+    let exportedPixelBuffer = try frame.makeCVPixelBuffer()
+    #expect(CVPixelBufferGetPixelFormatType(exportedPixelBuffer) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    let exportedFrame = try YUVFrame(cvPixelBuffer: exportedPixelBuffer)
+    #expect(exportedFrame == frame)
 }
 #endif
 
@@ -239,6 +244,18 @@ import CoreVideo
     #expect(frame.cr.data == [150, 151, 152, 153])
     #expect(frame.videoSignal == videoSignal)
 
+    let exported = try frame.nv12Planes(yRowStride: 6, cbCrRowStride: 8)
+    #expect(exported.y == [
+        0, 1, 2, 3, 0, 0,
+        10, 11, 12, 13, 0, 0,
+        20, 21, 22, 23, 0, 0,
+        30, 31, 32, 33, 0, 0
+    ])
+    #expect(exported.cbCr == [
+        100, 150, 101, 151, 0, 0, 0, 0,
+        102, 152, 103, 153, 0, 0, 0, 0
+    ])
+
     #expect(throws: PyrowaveError.invalidDimensions) {
         _ = try YUVFrame(width: 3, height: 4, nv12Y: y, nv12CbCr: cbCr)
     }
@@ -250,6 +267,10 @@ import CoreVideo
     }
     #expect(throws: PyrowaveError.invalidDimensions) {
         _ = try YUVFrame(width: 4, height: 4, nv12Y: y, nv12CbCr: Array(cbCr.dropLast(5)), cbCrRowStride: 8)
+    }
+    let yuv444 = try TestFrames.synthetic444(width: 4, height: 4)
+    #expect(throws: PyrowaveError.unsupportedFormat("NV12 export expects yuv420 frames")) {
+        _ = try yuv444.nv12Planes()
     }
 }
 

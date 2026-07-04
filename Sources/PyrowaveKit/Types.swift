@@ -212,6 +212,43 @@ public struct YUVFrame: Equatable, Sendable {
             videoSignal: videoSignal
         )
     }
+
+    public func nv12Planes(
+        yRowStride: Int? = nil,
+        cbCrRowStride: Int? = nil
+    ) throws -> (y: [UInt8], cbCr: [UInt8]) {
+        guard chroma == .yuv420 else {
+            throw PyrowaveError.unsupportedFormat("NV12 export expects yuv420 frames")
+        }
+
+        let yStride = yRowStride ?? width
+        let cbCrStride = cbCrRowStride ?? width
+        let chromaWidth = width / 2
+        let chromaHeight = height / 2
+        guard yStride >= width, cbCrStride >= width else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        var yPlane = Array(repeating: UInt8(0), count: yStride * height)
+        for row in 0..<height {
+            let sourceStart = row * width
+            let destinationStart = row * yStride
+            yPlane[destinationStart..<(destinationStart + width)] = y.data[sourceStart..<(sourceStart + width)]
+        }
+
+        var cbCrPlane = Array(repeating: UInt8(0), count: cbCrStride * chromaHeight)
+        for row in 0..<chromaHeight {
+            let sourceStart = row * chromaWidth
+            let destinationStart = row * cbCrStride
+            for column in 0..<chromaWidth {
+                let destinationOffset = destinationStart + column * 2
+                cbCrPlane[destinationOffset] = cb.data[sourceStart + column]
+                cbCrPlane[destinationOffset + 1] = cr.data[sourceStart + column]
+            }
+        }
+
+        return (yPlane, cbCrPlane)
+    }
 }
 
 public struct EncodedFrame: Equatable, Sendable {

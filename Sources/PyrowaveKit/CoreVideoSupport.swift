@@ -51,5 +51,76 @@ extension YUVFrame {
             videoSignal: videoSignal ?? inferredSignal
         )
     }
+
+    public func makeCVPixelBuffer(pixelFormat: OSType? = nil) throws -> CVPixelBuffer {
+        let format = pixelFormat ?? Self.cvPixelFormat(for: videoSignal)
+        var pixelBuffer: CVPixelBuffer?
+        let attributes = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ] as CFDictionary
+        let status = CVPixelBufferCreate(
+            nil,
+            width,
+            height,
+            format,
+            attributes,
+            &pixelBuffer
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer else {
+            throw PyrowaveError.processFailed("failed to allocate CVPixelBuffer")
+        }
+        try copy(to: pixelBuffer)
+        return pixelBuffer
+    }
+
+    public func copy(to cvPixelBuffer: CVPixelBuffer) throws {
+        let pixelFormat = CVPixelBufferGetPixelFormatType(cvPixelBuffer)
+        let supportedFormats: Set<OSType> = [
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        ]
+        guard supportedFormats.contains(pixelFormat) else {
+            throw PyrowaveError.unsupportedFormat("CVPixelBuffer pixel format \(pixelFormat)")
+        }
+        guard chroma == .yuv420 else {
+            throw PyrowaveError.unsupportedFormat("CVPixelBuffer export expects yuv420 frames")
+        }
+
+        CVPixelBufferLockBaseAddress(cvPixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(cvPixelBuffer, []) }
+        guard CVPixelBufferGetPlaneCount(cvPixelBuffer) >= 2,
+              CVPixelBufferGetWidthOfPlane(cvPixelBuffer, 0) == width,
+              CVPixelBufferGetHeightOfPlane(cvPixelBuffer, 0) == height,
+              CVPixelBufferGetWidthOfPlane(cvPixelBuffer, 1) == width / 2,
+              CVPixelBufferGetHeightOfPlane(cvPixelBuffer, 1) == height / 2,
+              let yBase = CVPixelBufferGetBaseAddressOfPlane(cvPixelBuffer, 0),
+              let cbCrBase = CVPixelBufferGetBaseAddressOfPlane(cvPixelBuffer, 1) else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(cvPixelBuffer, 0)
+        let cbCrStride = CVPixelBufferGetBytesPerRowOfPlane(cvPixelBuffer, 1)
+        let yDestination = yBase.assumingMemoryBound(to: UInt8.self)
+        y.data.withUnsafeBufferPointer { source in
+            for row in 0..<height {
+                let sourceStart = row * width
+                yDestination.advanced(by: row * yStride).update(from: source.baseAddress!.advanced(by: sourceStart), count: width)
+            }
+        }
+
+        let cbCrDestination = cbCrBase.assumingMemoryBound(to: UInt8.self)
+        for row in 0..<(height / 2) {
+            let sourceStart = row * (width / 2)
+            let destinationRow = cbCrDestination.advanced(by: row * cbCrStride)
+            for column in 0..<(width / 2) {
+                destinationRow[column * 2] = cb.data[sourceStart + column]
+                destinationRow[column * 2 + 1] = cr.data[sourceStart + column]
+            }
+        }
+    }
+
+    public static func cvPixelFormat(for videoSignal: VideoSignalMetadata) -> OSType {
+        videoSignal.yCbCrRange == .limited ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+    }
 }
 #endif
