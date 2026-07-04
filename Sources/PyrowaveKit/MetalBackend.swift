@@ -16,6 +16,9 @@ private enum ReusableBufferPurpose: Hashable {
     case packetCostDescriptor
     case packetCostOutput
     case packetCostSignCount
+    case sparsePacketDescriptor
+    case sparsePacketQScale
+    case sparsePacketSize
 }
 
 private struct ReusableBufferKey: Hashable {
@@ -1261,11 +1264,11 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
 
             let outputByteCount = plane.descriptors.count * maxPacketBytes
             let outputSizeByteCount = plane.descriptors.count * MemoryLayout<UInt32>.stride
-            guard let descriptorBuffer = device.makeBuffer(bytes: plane.descriptors, length: plane.descriptors.count * MemoryLayout<MetalSparsePacketEncodeDescriptor>.stride, options: .storageModeShared),
-                  let qScaleBuffer = device.makeBuffer(bytes: flatQScaleCodes, length: flatQScaleCodes.count * MemoryLayout<UInt8>.stride, options: .storageModeShared),
-                  let outputBuffer = device.makeBuffer(length: outputByteCount, options: .storageModeShared),
-                  let sizeBuffer = device.makeBuffer(length: outputSizeByteCount, options: .storageModeShared) else {
-                throw PyrowaveError.processFailed("failed to allocate Metal sparse packet encode buffers")
+            let descriptorBuffer = try reusableSharedBuffer(bytes: plane.descriptors, purpose: .sparsePacketDescriptor, planeIndex: planeIndex)
+            let qScaleBuffer = try reusableSharedBuffer(bytes: flatQScaleCodes, purpose: .sparsePacketQScale, planeIndex: planeIndex)
+            let sizeBuffer = try reusableSharedBuffer(byteLength: outputSizeByteCount, purpose: .sparsePacketSize, planeIndex: planeIndex)
+            guard let outputBuffer = device.makeBuffer(length: outputByteCount, options: .storageModeShared) else {
+                throw PyrowaveError.processFailed("failed to allocate Metal sparse packet encode output")
             }
             work.append((
                 planeIndex: planeIndex,
