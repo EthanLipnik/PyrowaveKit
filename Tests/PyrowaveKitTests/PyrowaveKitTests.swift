@@ -1724,6 +1724,21 @@ import Metal
     #expect(metrics.weightedPSNR > 20.0)
 }
 
+@Test func generousSparseRateControlCapKeepsDefaultSparseFrame() throws {
+    let frame = try TestFrames.synthetic420(width: 160, height: 96)
+    let configuration = CodecConfiguration(quantizationStep: 1.0 / 1024.0)
+    let uncapped = try PyrowaveCodec().encode(frame, configuration: configuration)
+    let generouslyCapped = try PyrowaveCodec().encode(
+        frame,
+        configuration: CodecConfiguration(
+            quantizationStep: configuration.quantizationStep,
+            maximumEncodedBytes: uncapped.data.count
+        )
+    )
+
+    #expect(generouslyCapped.data == uncapped.data)
+}
+
 @Test func codecUsesPyrowaveSequenceHeaderStreamOnly() throws {
     let frame = try TestFrames.synthetic420(width: 64, height: 64)
     let codec = try PyrowaveCodec()

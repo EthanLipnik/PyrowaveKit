@@ -259,41 +259,16 @@ public final class PyrowaveCodec: @unchecked Sendable {
             try encodePlane(frame.cb, component: 1, frameWidth: frame.width, frameHeight: frame.height, chroma: frame.chroma, layout: layout, configuration: configuration),
             try encodePlane(frame.cr, component: 2, frameWidth: frame.width, frameHeight: frame.height, chroma: frame.chroma, layout: layout, configuration: configuration)
         ]
-
-        let rateControlPlan = try selectSparseRateControlPlan(
-            planes: encodedPlanes,
+        return try encodeFrame(
+            width: frame.width,
+            height: frame.height,
+            chroma: frame.chroma,
+            videoSignal: frame.videoSignal,
+            sequenceNumber: sequenceNumber,
+            encodedPlanes: encodedPlanes,
             layout: layout,
             configuration: configuration
         )
-        let planeBlocks = try sparseBlocks(
-            encodedPlanes,
-            layout: layout,
-            sequence: sequenceNumber,
-            quantLevelsByPlane: rateControlPlan.quantLevelsByPlane,
-            packetByteCostsByPlane: rateControlPlan.packetByteCostsByPlane,
-            defaultQuantLevel: rateControlPlan.defaultQuantLevel
-        ).flatMap { $0 }
-        let sortedBlocks = planeBlocks.sorted { $0.blockIndex < $1.blockIndex }
-
-        var writer = BinaryWriter()
-        let sequence = try PyrowaveSequenceHeader(
-            width: frame.width,
-            height: frame.height,
-            sequence: sequenceNumber,
-            totalBlocks: sortedBlocks.count,
-            chroma: frame.chroma,
-            videoSignal: frame.videoSignal
-        )
-        sequence.write(to: &writer)
-        for block in sortedBlocks {
-            writer.append(data: block.data)
-        }
-
-        if let maximumEncodedBytes = configuration.maximumEncodedBytes, writer.data.count > maximumEncodedBytes {
-            throw PyrowaveError.processFailed("minimum sparse frame size \(writer.data.count) exceeds maximumEncodedBytes \(maximumEncodedBytes)")
-        }
-
-        return EncodedFrame(data: writer.data)
     }
 
     public func encode(
@@ -409,6 +384,51 @@ public final class PyrowaveCodec: @unchecked Sendable {
         configuration: CodecConfiguration
     ) throws -> EncodedFrame {
         let sequenceNumber = sequenceCounter.next()
+        return try encodeFrame(
+            width: width,
+            height: height,
+            chroma: chroma,
+            videoSignal: videoSignal,
+            sequenceNumber: sequenceNumber,
+            encodedPlanes: encodedPlanes,
+            layout: layout,
+            configuration: configuration
+        )
+    }
+
+    private func encodeFrame(
+        width: Int,
+        height: Int,
+        chroma: ChromaSubsampling,
+        videoSignal: VideoSignalMetadata,
+        sequenceNumber: UInt8,
+        encodedPlanes: [EncodedPlane],
+        layout: PyrowaveBlockLayout,
+        configuration: CodecConfiguration
+    ) throws -> EncodedFrame {
+        let defaultBlocks = try sparseBlocks(
+            encodedPlanes,
+            layout: layout,
+            sequence: sequenceNumber,
+            quantLevelsByPlane: nil,
+            packetByteCostsByPlane: nil,
+            defaultQuantLevel: 0
+        ).flatMap { $0 }
+        let defaultFrame = try assembleEncodedFrame(
+            width: width,
+            height: height,
+            chroma: chroma,
+            videoSignal: videoSignal,
+            sequenceNumber: sequenceNumber,
+            blocks: defaultBlocks
+        )
+        guard let maximumEncodedBytes = configuration.maximumEncodedBytes else {
+            return defaultFrame
+        }
+        if defaultFrame.data.count <= maximumEncodedBytes {
+            return defaultFrame
+        }
+
         let rateControlPlan = try selectSparseRateControlPlan(
             planes: encodedPlanes,
             layout: layout,
@@ -422,8 +442,31 @@ public final class PyrowaveCodec: @unchecked Sendable {
             packetByteCostsByPlane: rateControlPlan.packetByteCostsByPlane,
             defaultQuantLevel: rateControlPlan.defaultQuantLevel
         ).flatMap { $0 }
-        let sortedBlocks = planeBlocks.sorted { $0.blockIndex < $1.blockIndex }
+        let rateControlledFrame = try assembleEncodedFrame(
+            width: width,
+            height: height,
+            chroma: chroma,
+            videoSignal: videoSignal,
+            sequenceNumber: sequenceNumber,
+            blocks: planeBlocks
+        )
 
+        if rateControlledFrame.data.count > maximumEncodedBytes {
+            throw PyrowaveError.processFailed("minimum sparse frame size \(rateControlledFrame.data.count) exceeds maximumEncodedBytes \(maximumEncodedBytes)")
+        }
+
+        return rateControlledFrame
+    }
+
+    private func assembleEncodedFrame(
+        width: Int,
+        height: Int,
+        chroma: ChromaSubsampling,
+        videoSignal: VideoSignalMetadata,
+        sequenceNumber: UInt8,
+        blocks: [SparseBlock]
+    ) throws -> EncodedFrame {
+        let sortedBlocks = blocks.sorted { $0.blockIndex < $1.blockIndex }
         var writer = BinaryWriter()
         let sequence = try PyrowaveSequenceHeader(
             width: width,
@@ -437,14 +480,8 @@ public final class PyrowaveCodec: @unchecked Sendable {
         for block in sortedBlocks {
             writer.append(data: block.data)
         }
-
-        if let maximumEncodedBytes = configuration.maximumEncodedBytes, writer.data.count > maximumEncodedBytes {
-            throw PyrowaveError.processFailed("minimum sparse frame size \(writer.data.count) exceeds maximumEncodedBytes \(maximumEncodedBytes)")
-        }
-
         return EncodedFrame(data: writer.data)
     }
-
     func decode(_ frame: EncodedFrame) throws -> YUVFrame {
         try decode(frame, allowPartialFrame: false)
     }
