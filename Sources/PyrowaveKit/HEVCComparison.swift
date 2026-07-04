@@ -29,11 +29,14 @@ public enum HEVCComparison {
     public static func runFFmpegVideoToolboxComparison(
         reference: YUVFrame,
         workingDirectory: URL,
-        bitrate: Int
+        bitrate: Int,
+        frameRateNumerator: Int = 60,
+        frameRateDenominator: Int = 1
     ) throws -> CodecBenchmarkResult {
         guard reference.chroma == .yuv420 else {
             throw PyrowaveError.unsupportedFormat("HEVC comparison currently expects yuv420p")
         }
+        let frameRate = try frameRateArgument(numerator: frameRateNumerator, denominator: frameRateDenominator)
         guard let ffmpeg = findExecutable("ffmpeg") else {
             return CodecBenchmarkResult(
                 codec: "hevc_videotoolbox",
@@ -57,7 +60,7 @@ public enum HEVCComparison {
             "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "yuv420p",
             "-s", "\(reference.width)x\(reference.height)",
-            "-r", "60",
+            "-r", frameRate,
             "-i", rawURL.path,
             "-c:v", "hevc_videotoolbox",
             "-b:v", "\(bitrate)",
@@ -85,6 +88,13 @@ public enum HEVCComparison {
             metrics: Metrics.compare(reference, decoded),
             note: nil
         )
+    }
+
+    static func frameRateArgument(numerator: Int, denominator: Int) throws -> String {
+        guard numerator > 0, denominator > 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        return denominator == 1 ? "\(numerator)" : "\(numerator)/\(denominator)"
     }
 
     static func writeRaw420(_ frame: YUVFrame, to url: URL) throws {

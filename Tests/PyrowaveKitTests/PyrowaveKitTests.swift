@@ -150,6 +150,17 @@ import Testing
     }
 }
 
+@Test func hevcComparisonUsesExactFrameRateArgument() throws {
+    #expect(try HEVCComparison.frameRateArgument(numerator: 60, denominator: 1) == "60")
+    #expect(try HEVCComparison.frameRateArgument(numerator: 30000, denominator: 1001) == "30000/1001")
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try HEVCComparison.frameRateArgument(numerator: 0, denominator: 1)
+    }
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try HEVCComparison.frameRateArgument(numerator: 60, denominator: 0)
+    }
+}
+
 @Test func metalBackendCompilesKernelsWhenDeviceExists() throws {
     #if canImport(Metal)
     do {

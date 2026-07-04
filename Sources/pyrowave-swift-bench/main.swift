@@ -176,7 +176,9 @@ do {
     let hevc = try HEVCComparison.runFFmpegVideoToolboxComparison(
         reference: frames[0],
         workingDirectory: arguments.outputDirectory,
-        bitrate: arguments.bitrate
+        bitrate: arguments.bitrate,
+        frameRateNumerator: loaded.frameRateNumerator,
+        frameRateDenominator: loaded.frameRateDenominator
     )
 
     let report = BenchmarkReport(
