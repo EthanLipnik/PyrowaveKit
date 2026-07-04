@@ -1186,10 +1186,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         for item in work {
             let byteCostCount = item.descriptorCount * PyrowaveBlockStats.candidateCount
             let pointer = item.byteCostBuffer.contents().bindMemory(to: UInt32.self, capacity: byteCostCount)
-            let flatCosts = Array(UnsafeBufferPointer(start: pointer, count: byteCostCount))
-            emptyResults[item.planeIndex] = Swift.stride(from: 0, to: flatCosts.count, by: PyrowaveBlockStats.candidateCount).map {
-                flatCosts[$0..<$0 + PyrowaveBlockStats.candidateCount].map(Int.init)
-            }
+            emptyResults[item.planeIndex] = readCandidateRows(pointer, rowCount: item.descriptorCount)
         }
         return emptyResults
     }
@@ -1638,10 +1635,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         for item in work {
             let bucketIndexCount = item.blockCount * PyrowaveBlockStats.candidateCount
             let pointer = item.bucketIndexBuffer.contents().bindMemory(to: UInt32.self, capacity: bucketIndexCount)
-            let flatBuckets = Array(UnsafeBufferPointer(start: pointer, count: bucketIndexCount))
-            results[item.planeIndex] = Swift.stride(from: 0, to: flatBuckets.count, by: PyrowaveBlockStats.candidateCount).map {
-                flatBuckets[$0..<$0 + PyrowaveBlockStats.candidateCount].map(Int.init)
-            }
+            results[item.planeIndex] = readCandidateRows(pointer, rowCount: item.blockCount)
         }
 
         let savingsPointer = cumulativeSavingsBuffer.contents().bindMemory(to: UInt32.self, capacity: cumulativeSavings.count)
@@ -1795,10 +1789,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         for item in work {
             let bucketIndexCount = item.blockCount * PyrowaveBlockStats.candidateCount
             let pointer = item.bucketIndexBuffer.contents().bindMemory(to: UInt32.self, capacity: bucketIndexCount)
-            let flatBuckets = Array(UnsafeBufferPointer(start: pointer, count: bucketIndexCount))
-            results[item.planeIndex] = Swift.stride(from: 0, to: flatBuckets.count, by: PyrowaveBlockStats.candidateCount).map {
-                flatBuckets[$0..<$0 + PyrowaveBlockStats.candidateCount].map(Int.init)
-            }
+            results[item.planeIndex] = readCandidateRows(pointer, rowCount: item.blockCount)
         }
 
         let savingsPointer = cumulativeSavingsBuffer.contents().bindMemory(to: UInt32.self, capacity: cumulativeSavings.count)
@@ -2113,6 +2104,21 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     ) -> Bool {
         let largestPlaneSamples = planes.map(\.sampleCount).max() ?? 0
         return largestPlaneSamples >= 6144 * 3456
+    }
+
+    private func readCandidateRows(_ pointer: UnsafePointer<UInt32>, rowCount: Int) -> [[Int]] {
+        var rows = [[Int]]()
+        rows.reserveCapacity(rowCount)
+        for row in 0..<rowCount {
+            let base = row * PyrowaveBlockStats.candidateCount
+            var candidates = [Int]()
+            candidates.reserveCapacity(PyrowaveBlockStats.candidateCount)
+            for candidate in 0..<PyrowaveBlockStats.candidateCount {
+                candidates.append(Int(pointer[base + candidate]))
+            }
+            rows.append(candidates)
+        }
+        return rows
     }
 
     private static func makeFunction(named name: String, library: MTLLibrary) throws -> MTLFunction {
