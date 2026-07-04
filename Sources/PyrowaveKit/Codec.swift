@@ -652,6 +652,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         var decodedPlanes = try (0..<PyrowaveBitstream.componentCount).map { component in
             try makeDecodedPlane(component: component, width: sequence.width, height: sequence.height, chroma: sequence.chroma, layout: layout)
         }
+        let blockTargets = try sparseBlockTargets(decodedPlanes: decodedPlanes, totalBlocks: layout.descriptors.count)
         var pendingSparseBlocks = Array(repeating: [PendingSparseBlock](), count: PyrowaveBitstream.componentCount)
         var seenBlocks = Set<Int>()
 
@@ -663,11 +664,10 @@ public final class PyrowaveCodec: @unchecked Sendable {
             guard block.blockIndex >= 0, block.blockIndex < layout.descriptors.count, seenBlocks.insert(block.blockIndex).inserted else {
                 throw PyrowaveError.invalidBitstream("bad sparse block index")
             }
-            guard let target = decodedPlanes.indices.first(where: { decodedPlanes[$0].descriptorsByBlockIndex[block.blockIndex] != nil }),
-                  let descriptor = decodedPlanes[target].descriptorsByBlockIndex[block.blockIndex] else {
+            guard let target = blockTargets[block.blockIndex] else {
                 throw PyrowaveError.invalidBitstream("sparse block index has no plane mapping")
             }
-            pendingSparseBlocks[target].append(PendingSparseBlock(block: block, descriptor: descriptor))
+            pendingSparseBlocks[target.planeIndex].append(PendingSparseBlock(block: block, descriptor: target.descriptor))
         }
 
         if seenBlocks.count < sequence.totalBlocks {
@@ -696,6 +696,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         var decodedPlanes = try (0..<PyrowaveBitstream.componentCount).map { component in
             try makeGPUDecodedPlane(component: component, width: sequence.width, height: sequence.height, chroma: sequence.chroma, layout: layout)
         }
+        let blockTargets = try sparseBlockTargets(decodedPlanes: decodedPlanes, totalBlocks: layout.descriptors.count)
         var pendingSparseBlocks = Array(repeating: [PendingSparseBlock](), count: PyrowaveBitstream.componentCount)
         var seenBlocks = Set<Int>()
 
@@ -707,11 +708,10 @@ public final class PyrowaveCodec: @unchecked Sendable {
             guard block.blockIndex >= 0, block.blockIndex < layout.descriptors.count, seenBlocks.insert(block.blockIndex).inserted else {
                 throw PyrowaveError.invalidBitstream("bad sparse block index")
             }
-            guard let target = decodedPlanes.indices.first(where: { decodedPlanes[$0].descriptorsByBlockIndex[block.blockIndex] != nil }),
-                  let descriptor = decodedPlanes[target].descriptorsByBlockIndex[block.blockIndex] else {
+            guard let target = blockTargets[block.blockIndex] else {
                 throw PyrowaveError.invalidBitstream("sparse block index has no plane mapping")
             }
-            pendingSparseBlocks[target].append(PendingSparseBlock(block: block, descriptor: descriptor))
+            pendingSparseBlocks[target.planeIndex].append(PendingSparseBlock(block: block, descriptor: target.descriptor))
         }
 
         if seenBlocks.count < sequence.totalBlocks {
@@ -783,6 +783,11 @@ public final class PyrowaveCodec: @unchecked Sendable {
 
     private struct PendingSparseBlock {
         var block: PyrowaveCoefficientBlockCodec.DecodedBlock
+        var descriptor: PlaneBlockDescriptor
+    }
+
+    private struct SparseBlockTarget {
+        var planeIndex: Int
         var descriptor: PlaneBlockDescriptor
     }
 
@@ -1759,6 +1764,38 @@ public final class PyrowaveCodec: @unchecked Sendable {
             samples: samples,
             descriptorsByBlockIndex: Dictionary(uniqueKeysWithValues: descriptors.map { ($0.blockIndex, $0) })
         )
+    }
+
+    private func sparseBlockTargets(decodedPlanes: [DecodedPlane], totalBlocks: Int) throws -> [SparseBlockTarget?] {
+        var targets = Array<SparseBlockTarget?>(repeating: nil, count: totalBlocks)
+        for (planeIndex, plane) in decodedPlanes.enumerated() {
+            for (blockIndex, descriptor) in plane.descriptorsByBlockIndex {
+                guard blockIndex >= 0, blockIndex < totalBlocks else {
+                    throw PyrowaveError.invalidBitstream("sparse block index has no plane mapping")
+                }
+                guard targets[blockIndex] == nil else {
+                    throw PyrowaveError.invalidBitstream("duplicate sparse block plane mapping")
+                }
+                targets[blockIndex] = SparseBlockTarget(planeIndex: planeIndex, descriptor: descriptor)
+            }
+        }
+        return targets
+    }
+
+    private func sparseBlockTargets(decodedPlanes: [GPUDecodedPlane], totalBlocks: Int) throws -> [SparseBlockTarget?] {
+        var targets = Array<SparseBlockTarget?>(repeating: nil, count: totalBlocks)
+        for (planeIndex, plane) in decodedPlanes.enumerated() {
+            for (blockIndex, descriptor) in plane.descriptorsByBlockIndex {
+                guard blockIndex >= 0, blockIndex < totalBlocks else {
+                    throw PyrowaveError.invalidBitstream("sparse block index has no plane mapping")
+                }
+                guard targets[blockIndex] == nil else {
+                    throw PyrowaveError.invalidBitstream("duplicate sparse block plane mapping")
+                }
+                targets[blockIndex] = SparseBlockTarget(planeIndex: planeIndex, descriptor: descriptor)
+            }
+        }
+        return targets
     }
 
     private func applySparseBlocks(
