@@ -560,7 +560,6 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             guard let output = device.makeBuffer(length: coefficientByteLength, options: .storageModeShared) else {
                 throw PyrowaveError.processFailed("failed to allocate Metal plane quantization output buffer")
             }
-            memset(output.contents(), 0, coefficientByteLength)
 
             let resultIndex = results.count
             results.append(MetalPlaneQuantizationBufferResult(
