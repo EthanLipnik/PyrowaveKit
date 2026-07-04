@@ -1354,59 +1354,56 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("failed to create Metal DWT command buffer")
         }
 
-        for (planeIndex, plane) in planes.enumerated() where plane.sampleCount > 0 {
-            let primary = plane.buffer
-            let scratch = scratchBuffers[planeIndex]
-            var activeWidth = plane.width
-            var activeHeight = plane.height
-            for _ in 0..<plane.levels {
-                for phase in 0...4 {
-                    try encodeDWTInPlace(
-                        commandBuffer: commandBuffer,
-                        pipeline: dwtLiftRowsPipeline,
-                        buffer: primary,
-                        activeWidth: activeWidth,
-                        activeHeight: activeHeight,
-                        stride: plane.width,
-                        phase: phase
-                    )
-                }
-                try encodeDWTCopy(
-                    commandBuffer: commandBuffer,
-                    pipeline: dwtPackRowsPipeline,
-                    input: primary,
-                    output: scratch,
-                    activeWidth: activeWidth,
-                    activeHeight: activeHeight,
-                    stride: plane.width,
-                    phase: 0
-                )
-
-                for phase in 0...4 {
-                    try encodeDWTInPlace(
-                        commandBuffer: commandBuffer,
-                        pipeline: dwtLiftColumnsPipeline,
-                        buffer: scratch,
-                        activeWidth: activeWidth,
-                        activeHeight: activeHeight,
-                        stride: plane.width,
-                        phase: phase
-                    )
-                }
-                try encodeDWTCopy(
-                    commandBuffer: commandBuffer,
-                    pipeline: dwtPackColumnsPipeline,
-                    input: scratch,
-                    output: primary,
-                    activeWidth: activeWidth,
-                    activeHeight: activeHeight,
-                    stride: plane.width,
-                    phase: 0
-                )
-
-                activeWidth /= 2
-                activeHeight /= 2
+        let maxLevels = planes.map(\.levels).max() ?? 0
+        for level in 0..<maxLevels {
+            var active = [DWTBatchDispatch]()
+            active.reserveCapacity(planes.count)
+            for (planeIndex, plane) in planes.enumerated() where plane.sampleCount > 0 && level < plane.levels {
+                active.append(DWTBatchDispatch(
+                    primary: plane.buffer,
+                    scratch: scratchBuffers[planeIndex],
+                    activeWidth: plane.width >> level,
+                    activeHeight: plane.height >> level,
+                    stride: plane.width
+                ))
             }
+            guard !active.isEmpty else {
+                continue
+            }
+
+            for phase in 0...4 {
+                try encodeDWTInPlaceBatch(
+                    commandBuffer: commandBuffer,
+                    pipeline: dwtLiftRowsPipeline,
+                    dispatches: active.map {
+                        (buffer: $0.primary, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: phase)
+                    }
+                )
+            }
+            try encodeDWTCopyBatch(
+                commandBuffer: commandBuffer,
+                pipeline: dwtPackRowsPipeline,
+                dispatches: active.map {
+                    (input: $0.primary, output: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: 0)
+                }
+            )
+
+            for phase in 0...4 {
+                try encodeDWTInPlaceBatch(
+                    commandBuffer: commandBuffer,
+                    pipeline: dwtLiftColumnsPipeline,
+                    dispatches: active.map {
+                        (buffer: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: phase)
+                    }
+                )
+            }
+            try encodeDWTCopyBatch(
+                commandBuffer: commandBuffer,
+                pipeline: dwtPackColumnsPipeline,
+                dispatches: active.map {
+                    (input: $0.scratch, output: $0.primary, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: 0)
+                }
+            )
         }
 
         try finish(commandBuffer: commandBuffer, context: "Metal DWT")
@@ -1466,62 +1463,59 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("failed to create Metal iDWT command buffer")
         }
 
-        for (planeIndex, plane) in planes.enumerated() where plane.sampleCount > 0 {
-            var sizes = [(Int, Int)]()
-            var activeWidth = plane.width
-            var activeHeight = plane.height
-            for _ in 0..<plane.levels {
-                sizes.append((activeWidth, activeHeight))
-                activeWidth /= 2
-                activeHeight /= 2
+        let maxLevels = planes.map(\.levels).max() ?? 0
+        guard maxLevels > 0 else {
+            try finish(commandBuffer: commandBuffer, context: "Metal iDWT")
+            return planes.map(\.buffer)
+        }
+        for level in stride(from: maxLevels - 1, through: 0, by: -1) {
+            var active = [DWTBatchDispatch]()
+            active.reserveCapacity(planes.count)
+            for (planeIndex, plane) in planes.enumerated() where plane.sampleCount > 0 && level < plane.levels {
+                active.append(DWTBatchDispatch(
+                    primary: plane.buffer,
+                    scratch: scratchBuffers[planeIndex],
+                    activeWidth: plane.width >> level,
+                    activeHeight: plane.height >> level,
+                    stride: plane.width
+                ))
+            }
+            guard !active.isEmpty else {
+                continue
             }
 
-            let primary = plane.buffer
-            let scratch = scratchBuffers[planeIndex]
-            for (levelWidth, levelHeight) in sizes.reversed() {
-                try encodeDWTCopy(
-                    commandBuffer: commandBuffer,
-                    pipeline: dwtUnpackColumnsPipeline,
-                    input: primary,
-                    output: scratch,
-                    activeWidth: levelWidth,
-                    activeHeight: levelHeight,
-                    stride: plane.width,
-                    phase: 0
-                )
-                for phase in 0...4 {
-                    try encodeDWTInPlace(
-                        commandBuffer: commandBuffer,
-                        pipeline: idwtLiftColumnsPipeline,
-                        buffer: scratch,
-                        activeWidth: levelWidth,
-                        activeHeight: levelHeight,
-                        stride: plane.width,
-                        phase: phase
-                    )
+            try encodeDWTCopyBatch(
+                commandBuffer: commandBuffer,
+                pipeline: dwtUnpackColumnsPipeline,
+                dispatches: active.map {
+                    (input: $0.primary, output: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: 0)
                 }
+            )
+            for phase in 0...4 {
+                try encodeDWTInPlaceBatch(
+                    commandBuffer: commandBuffer,
+                    pipeline: idwtLiftColumnsPipeline,
+                    dispatches: active.map {
+                        (buffer: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: phase)
+                    }
+                )
+            }
 
-                try encodeDWTCopy(
-                    commandBuffer: commandBuffer,
-                    pipeline: dwtUnpackRowsPipeline,
-                    input: scratch,
-                    output: primary,
-                    activeWidth: levelWidth,
-                    activeHeight: levelHeight,
-                    stride: plane.width,
-                    phase: 0
-                )
-                for phase in 0...4 {
-                    try encodeDWTInPlace(
-                        commandBuffer: commandBuffer,
-                        pipeline: idwtLiftRowsPipeline,
-                        buffer: primary,
-                        activeWidth: levelWidth,
-                        activeHeight: levelHeight,
-                        stride: plane.width,
-                        phase: phase
-                    )
+            try encodeDWTCopyBatch(
+                commandBuffer: commandBuffer,
+                pipeline: dwtUnpackRowsPipeline,
+                dispatches: active.map {
+                    (input: $0.scratch, output: $0.primary, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: 0)
                 }
+            )
+            for phase in 0...4 {
+                try encodeDWTInPlaceBatch(
+                    commandBuffer: commandBuffer,
+                    pipeline: idwtLiftRowsPipeline,
+                    dispatches: active.map {
+                        (buffer: $0.primary, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: phase)
+                    }
+                )
             }
         }
 
@@ -1607,6 +1601,39 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         }
     }
 
+    private func encodeDWTInPlaceBatch(
+        commandBuffer: MTLCommandBuffer,
+        pipeline: MTLComputePipelineState,
+        dispatches: [(buffer: MTLBuffer, activeWidth: Int, activeHeight: Int, stride: Int, phase: Int)]
+    ) throws {
+        guard !dispatches.isEmpty else {
+            return
+        }
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal DWT command encoder")
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        let width = min(16, pipeline.maxTotalThreadsPerThreadgroup)
+        let height = max(1, min(16, pipeline.maxTotalThreadsPerThreadgroup / width))
+        let threadsPerThreadgroup = MTLSize(width: width, height: height, depth: 1)
+        for dispatch in dispatches {
+            var constants = DWTConstants(
+                activeWidth: UInt32(dispatch.activeWidth),
+                activeHeight: UInt32(dispatch.activeHeight),
+                stride: UInt32(dispatch.stride),
+                phase: UInt32(dispatch.phase)
+            )
+            encoder.setBuffer(dispatch.buffer, offset: 0, index: 0)
+            encoder.setBytes(&constants, length: MemoryLayout<DWTConstants>.stride, index: 1)
+            encoder.dispatchThreads(
+                MTLSize(width: dispatch.activeWidth, height: dispatch.activeHeight, depth: 1),
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
+        encoder.endEncoding()
+    }
+
     private func dispatchDWTCopy(
         pipeline: MTLComputePipelineState,
         input: MTLBuffer,
@@ -1650,6 +1677,40 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             encoder.setBuffer(output, offset: 0, index: 1)
             encoder.setBytes(&constants, length: MemoryLayout<DWTConstants>.stride, index: 2)
         }
+    }
+
+    private func encodeDWTCopyBatch(
+        commandBuffer: MTLCommandBuffer,
+        pipeline: MTLComputePipelineState,
+        dispatches: [(input: MTLBuffer, output: MTLBuffer, activeWidth: Int, activeHeight: Int, stride: Int, phase: Int)]
+    ) throws {
+        guard !dispatches.isEmpty else {
+            return
+        }
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal DWT command encoder")
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        let width = min(16, pipeline.maxTotalThreadsPerThreadgroup)
+        let height = max(1, min(16, pipeline.maxTotalThreadsPerThreadgroup / width))
+        let threadsPerThreadgroup = MTLSize(width: width, height: height, depth: 1)
+        for dispatch in dispatches {
+            var constants = DWTConstants(
+                activeWidth: UInt32(dispatch.activeWidth),
+                activeHeight: UInt32(dispatch.activeHeight),
+                stride: UInt32(dispatch.stride),
+                phase: UInt32(dispatch.phase)
+            )
+            encoder.setBuffer(dispatch.input, offset: 0, index: 0)
+            encoder.setBuffer(dispatch.output, offset: 0, index: 1)
+            encoder.setBytes(&constants, length: MemoryLayout<DWTConstants>.stride, index: 2)
+            encoder.dispatchThreads(
+                MTLSize(width: dispatch.activeWidth, height: dispatch.activeHeight, depth: 1),
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
+        encoder.endEncoding()
     }
 
     private func dispatchDWT(
@@ -1849,6 +1910,14 @@ private struct PacketByteCostConstants {
 private struct SparsePacketEncodeConstants {
     var descriptorCount: UInt32
     var maxPacketBytes: UInt32
+}
+
+private struct DWTBatchDispatch {
+    var primary: MTLBuffer
+    var scratch: MTLBuffer
+    var activeWidth: Int
+    var activeHeight: Int
+    var stride: Int
 }
 
 private struct RateControlBucketConstants {
