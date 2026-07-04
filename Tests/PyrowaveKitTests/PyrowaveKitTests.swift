@@ -42,6 +42,18 @@ import Metal
     #expect(forbiddenFiles.isEmpty, "Original-language or Vulkan-era files remain: \(forbiddenFiles.sorted())")
 }
 
+@Test func publicCodecSurfaceExcludesCPUFrameFallbacks() throws {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let codecSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Codec.swift"), encoding: .utf8)
+
+    #expect(!codecSource.contains("public func encode(_ frame: YUVFrame"))
+    #expect(!codecSource.contains("public func decode(_ frame: EncodedFrame) throws -> YUVFrame"))
+    #expect(!codecSource.contains("public func decode(allowPartialFrame: Bool = false) throws -> YUVFrame"))
+}
+
 @Test func yuvFrameImportsCoreVideoNV12PixelBuffer() throws {
     var pixelBuffer: CVPixelBuffer?
     let attributes = [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary

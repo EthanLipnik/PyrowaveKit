@@ -139,7 +139,7 @@ public final class PyrowavePacketStreamDecoder {
         return true
     }
 
-    public func decode(allowPartialFrame: Bool = false) throws -> YUVFrame {
+    func decode(allowPartialFrame: Bool = false) throws -> YUVFrame {
         try codec.decode(try assembledFrame(allowPartialFrame: allowPartialFrame), allowPartialFrame: allowPartialFrame)
     }
 
@@ -245,7 +245,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         coreVideoTextureCache = textureCache
     }
 
-    public func encode(_ frame: YUVFrame, configuration: CodecConfiguration = CodecConfiguration()) throws -> EncodedFrame {
+    func encode(_ frame: YUVFrame, configuration: CodecConfiguration = CodecConfiguration()) throws -> EncodedFrame {
         guard configuration.decompositionLevels == PyrowaveBitstream.decompositionLevels,
               configuration.quantizationStep > 0,
               configuration.maximumEncodedBytes == nil || configuration.maximumEncodedBytes! > 0 else {
@@ -435,7 +435,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
         return EncodedFrame(data: writer.data)
     }
 
-    public func decode(_ frame: EncodedFrame) throws -> YUVFrame {
+    func decode(_ frame: EncodedFrame) throws -> YUVFrame {
         try decode(frame, allowPartialFrame: false)
     }
 
