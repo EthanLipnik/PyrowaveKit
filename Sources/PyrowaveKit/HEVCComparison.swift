@@ -101,8 +101,8 @@ public enum HEVCComparison {
 
         let frameDuration = try Self.frameDuration(numerator: frameRateNumerator, denominator: frameRateDenominator)
         try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
-        let hevcURL = workingDirectory.appendingPathComponent("hevc-avkit.mov")
-        let decodedURL = workingDirectory.appendingPathComponent("hevc-decoded.y4m")
+        let hevcURL = workingDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.hevcMovie)
+        let decodedURL = workingDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.hevcDecodedY4M)
         if FileManager.default.fileExists(atPath: hevcURL.path) {
             try FileManager.default.removeItem(at: hevcURL)
         }

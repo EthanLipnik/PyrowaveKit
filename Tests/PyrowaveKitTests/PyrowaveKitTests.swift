@@ -261,6 +261,42 @@ import Testing
     }
 }
 
+@Test func hevcComparisonRejectsInvalidInputsBeforeEncoding() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let frame = try TestFrames.synthetic420(width: 64, height: 64)
+    let mismatched = try TestFrames.synthetic420(width: 96, height: 64)
+    let yuv444 = try TestFrames.synthetic444(width: 64, height: 64)
+
+    #expect(throws: PyrowaveError.truncatedInput) {
+        _ = try HEVCComparison.runAVKitHEVCComparison(
+            referenceFrames: [],
+            workingDirectory: directory,
+            bitrate: 1
+        )
+    }
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try HEVCComparison.runAVKitHEVCComparison(
+            referenceFrames: [frame],
+            workingDirectory: directory,
+            bitrate: 0
+        )
+    }
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try HEVCComparison.runAVKitHEVCComparison(
+            referenceFrames: [frame, mismatched],
+            workingDirectory: directory,
+            bitrate: 1
+        )
+    }
+    #expect(throws: PyrowaveError.unsupportedFormat("HEVC comparison expects yuv420 frames")) {
+        _ = try HEVCComparison.runAVKitHEVCComparison(
+            referenceFrames: [yuv444],
+            workingDirectory: directory,
+            bitrate: 1
+        )
+    }
+}
+
 @Test func codecBenchmarkResultReportsPerFrameNormalization() throws {
     let result = CodecBenchmarkResult(
         codec: "sample",
