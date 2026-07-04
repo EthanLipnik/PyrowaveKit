@@ -6,6 +6,22 @@ private struct SparseCoefficientOutputKey: Hashable {
     var sampleCount: Int
 }
 
+private enum ReusableBufferPurpose: Hashable {
+    case quantizeDescriptor
+    case quantizeQScale
+    case sparseEntries
+    case rateStatsDescriptor
+    case rateStatsNumPlanes
+    case rateStats
+    case packetCostDescriptor
+    case packetCostOutput
+}
+
+private struct ReusableBufferKey: Hashable {
+    var purpose: ReusableBufferPurpose
+    var planeIndex: Int
+}
+
 final class MetalPyrowaveBackend: @unchecked Sendable {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
@@ -36,6 +52,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     private let idwtLiftRowsPipeline: MTLComputePipelineState
     private let idwtLiftColumnsPipeline: MTLComputePipelineState
     private var sparseCoefficientOutputs: [SparseCoefficientOutputKey: MTLBuffer] = [:]
+    private var reusableSharedBuffers: [ReusableBufferKey: MTLBuffer] = [:]
 
     init(device: MTLDevice? = MTLCreateSystemDefaultDevice()) throws {
         guard let device else {
@@ -572,16 +589,9 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 continue
             }
 
-            let descriptorByteLength = plane.descriptors.count * MemoryLayout<MetalPlaneQuantizationDescriptor>.stride
             let qScaleByteLength = plane.descriptors.count * 16 * MemoryLayout<UInt8>.stride
-            guard let descriptorBuffer = device.makeBuffer(
-                bytes: plane.descriptors,
-                length: descriptorByteLength,
-                options: .storageModeShared
-            ),
-                  let qScaleBuffer = device.makeBuffer(length: qScaleByteLength, options: .storageModeShared) else {
-                throw PyrowaveError.processFailed("failed to allocate Metal plane quantization buffers")
-            }
+            let descriptorBuffer = try reusableSharedBuffer(bytes: plane.descriptors, purpose: .quantizeDescriptor, planeIndex: resultIndex)
+            let qScaleBuffer = try reusableSharedBuffer(byteLength: qScaleByteLength, purpose: .quantizeQScale, planeIndex: resultIndex)
 
             work.append((
                 resultIndex: resultIndex,
@@ -684,9 +694,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             guard !plane.entries.isEmpty else {
                 continue
             }
-            guard let entryBuffer = device.makeBuffer(bytes: plane.entries, length: plane.entries.count * MemoryLayout<MetalSparseCoefficientEntry>.stride, options: .storageModeShared) else {
-                throw PyrowaveError.processFailed("failed to allocate Metal sparse coefficient buffers")
-            }
+            let entryBuffer = try reusableSharedBuffer(bytes: plane.entries, purpose: .sparseEntries, planeIndex: planeIndex)
             dispatches.append((
                 planeIndex: planeIndex,
                 entryBuffer: entryBuffer,
@@ -753,6 +761,38 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         }
         sparseCoefficientOutputs[key] = output
         return output
+    }
+
+    private func reusableSharedBuffer<T>(
+        bytes values: [T],
+        purpose: ReusableBufferPurpose,
+        planeIndex: Int
+    ) throws -> MTLBuffer {
+        let byteLength = values.count * MemoryLayout<T>.stride
+        let buffer = try reusableSharedBuffer(byteLength: byteLength, purpose: purpose, planeIndex: planeIndex)
+        values.withUnsafeBytes { rawBuffer in
+            if let baseAddress = rawBuffer.baseAddress, byteLength > 0 {
+                buffer.contents().copyMemory(from: baseAddress, byteCount: byteLength)
+            }
+        }
+        return buffer
+    }
+
+    private func reusableSharedBuffer(
+        byteLength: Int,
+        purpose: ReusableBufferPurpose,
+        planeIndex: Int
+    ) throws -> MTLBuffer {
+        let key = ReusableBufferKey(purpose: purpose, planeIndex: planeIndex)
+        let length = max(byteLength, 1)
+        if let buffer = reusableSharedBuffers[key], buffer.length >= length {
+            return buffer
+        }
+        guard let buffer = device.makeBuffer(length: length, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate reusable Metal buffer")
+        }
+        reusableSharedBuffers[key] = buffer
+        return buffer
     }
 
     func rateControlTileStats(
@@ -823,11 +863,9 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
 
             let numPlanesByteLength = plane.descriptors.count * MemoryLayout<UInt32>.stride
             let statsByteLength = plane.descriptors.count * PyrowaveBlockStats.candidateCount * MemoryLayout<MetalRateControlQuantStats>.stride
-            guard let descriptorBuffer = device.makeBuffer(bytes: plane.descriptors, length: plane.descriptors.count * MemoryLayout<MetalRateControlStatsDescriptor>.stride, options: .storageModeShared),
-                  let numPlanesBuffer = device.makeBuffer(length: numPlanesByteLength, options: .storageModeShared),
-                  let statsBuffer = device.makeBuffer(length: statsByteLength, options: .storageModeShared) else {
-                throw PyrowaveError.processFailed("failed to allocate Metal rate-control buffers")
-            }
+            let descriptorBuffer = try reusableSharedBuffer(bytes: plane.descriptors, purpose: .rateStatsDescriptor, planeIndex: planeIndex)
+            let numPlanesBuffer = try reusableSharedBuffer(byteLength: numPlanesByteLength, purpose: .rateStatsNumPlanes, planeIndex: planeIndex)
+            let statsBuffer = try reusableSharedBuffer(byteLength: statsByteLength, purpose: .rateStats, planeIndex: planeIndex)
             work.append((
                 planeIndex: planeIndex,
                 coefficientBuffer: plane.coefficientBuffer,
@@ -935,10 +973,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             }
 
             let byteCostByteLength = plane.descriptors.count * PyrowaveBlockStats.candidateCount * MemoryLayout<UInt32>.stride
-            guard let descriptorBuffer = device.makeBuffer(bytes: plane.descriptors, length: plane.descriptors.count * MemoryLayout<MetalPacketByteCostDescriptor>.stride, options: .storageModeShared),
-                  let byteCostBuffer = device.makeBuffer(length: byteCostByteLength, options: .storageModeShared) else {
-                throw PyrowaveError.processFailed("failed to allocate Metal packet byte-cost buffers")
-            }
+            let descriptorBuffer = try reusableSharedBuffer(bytes: plane.descriptors, purpose: .packetCostDescriptor, planeIndex: planeIndex)
+            let byteCostBuffer = try reusableSharedBuffer(byteLength: byteCostByteLength, purpose: .packetCostOutput, planeIndex: planeIndex)
             work.append((
                 planeIndex: planeIndex,
                 coefficientBuffer: plane.coefficientBuffer,
