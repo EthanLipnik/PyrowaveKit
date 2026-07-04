@@ -1025,12 +1025,12 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 flatQScaleCodes.append(contentsOf: codes)
             }
 
-            let outputBytes = Array(repeating: UInt8(0), count: plane.descriptors.count * maxPacketBytes)
-            let outputSizes = Array(repeating: UInt32(0), count: plane.descriptors.count)
+            let outputByteCount = plane.descriptors.count * maxPacketBytes
+            let outputSizeByteCount = plane.descriptors.count * MemoryLayout<UInt32>.stride
             guard let descriptorBuffer = device.makeBuffer(bytes: plane.descriptors, length: plane.descriptors.count * MemoryLayout<MetalSparsePacketEncodeDescriptor>.stride, options: .storageModeShared),
                   let qScaleBuffer = device.makeBuffer(bytes: flatQScaleCodes, length: flatQScaleCodes.count * MemoryLayout<UInt8>.stride, options: .storageModeShared),
-                  let outputBuffer = device.makeBuffer(bytes: outputBytes, length: outputBytes.count * MemoryLayout<UInt8>.stride, options: .storageModeShared),
-                  let sizeBuffer = device.makeBuffer(bytes: outputSizes, length: outputSizes.count * MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
+                  let outputBuffer = device.makeBuffer(length: outputByteCount, options: .storageModeShared),
+                  let sizeBuffer = device.makeBuffer(length: outputSizeByteCount, options: .storageModeShared) else {
                 throw PyrowaveError.processFailed("failed to allocate Metal sparse packet encode buffers")
             }
             work.append((
@@ -1084,10 +1084,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             let outputByteCount = item.descriptorCount * maxPacketBytes
             let bytesPointer = item.outputBuffer.contents().bindMemory(to: UInt8.self, capacity: outputByteCount)
             let sizePointer = item.sizeBuffer.contents().bindMemory(to: UInt32.self, capacity: item.descriptorCount)
-            let encodedBytes = Array(UnsafeBufferPointer(start: bytesPointer, count: outputByteCount))
-            let encodedSizes = Array(UnsafeBufferPointer(start: sizePointer, count: item.descriptorCount))
-            results[item.planeIndex] = encodedSizes.indices.map { index in
-                let size = Int(encodedSizes[index])
+            results[item.planeIndex] = (0..<item.descriptorCount).map { index in
+                let size = Int(sizePointer[index])
                 guard size > 0 else {
                     return nil
                 }
@@ -1095,7 +1093,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                     return nil
                 }
                 let start = index * maxPacketBytes
-                return Data(encodedBytes[start..<start + size])
+                return Data(bytes: bytesPointer.advanced(by: start), count: size)
             }
         }
         return results
