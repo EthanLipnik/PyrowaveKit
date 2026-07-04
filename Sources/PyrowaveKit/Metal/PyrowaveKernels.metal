@@ -146,6 +146,23 @@ kernel void pyrowave_pad_plane(
     output[y * constants.paddedWidth + x] = float(input[sourceY * constants.sourceWidth + sourceX]) / 255.0f - 0.5f;
 }
 
+kernel void pyrowave_pad_texture_plane(
+    texture2d<float, access::read> input [[texture(0)]],
+    device float *output [[buffer(0)]],
+    constant PadPlaneConstants &constants [[buffer(1)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    uint x = position.x;
+    uint y = position.y;
+    if (x >= constants.paddedWidth || y >= constants.paddedHeight) {
+        return;
+    }
+
+    uint sourceX = min(x, constants.sourceWidth - 1u);
+    uint sourceY = min(y, constants.sourceHeight - 1u);
+    output[y * constants.paddedWidth + x] = input.read(uint2(sourceX, sourceY)).r - 0.5f;
+}
+
 kernel void pyrowave_crop_plane(
     device const float *input [[buffer(0)]],
     device uchar *output [[buffer(1)]],

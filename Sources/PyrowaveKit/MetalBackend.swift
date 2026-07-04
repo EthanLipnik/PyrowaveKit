@@ -8,6 +8,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     public let commandQueue: MTLCommandQueue
     public let library: MTLLibrary
     private let padPlanePipeline: MTLComputePipelineState
+    private let padTexturePlanePipeline: MTLComputePipelineState
     private let cropPlanePipeline: MTLComputePipelineState
     private let quantizePipeline: MTLComputePipelineState
     private let dequantizePipeline: MTLComputePipelineState
@@ -48,6 +49,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         }
 
         padPlanePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_pad_plane", library: library))
+        padTexturePlanePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_pad_texture_plane", library: library))
         cropPlanePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_crop_plane", library: library))
         quantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize", library: library))
         dequantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dequantize", library: library))
@@ -119,6 +121,60 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
 
         if let error = commandBuffer.error {
             throw PyrowaveError.processFailed("Metal plane padding command failed: \(error)")
+        }
+
+        let pointer = output.contents().bindMemory(to: Float.self, capacity: sampleCount)
+        return Array(UnsafeBufferPointer(start: pointer, count: sampleCount))
+    }
+
+    func padTexturePlane(_ texture: MTLTexture, paddedWidth: Int, paddedHeight: Int) throws -> [Float] {
+        guard texture.pixelFormat == .r8Unorm,
+              texture.width > 0,
+              texture.height > 0,
+              paddedWidth > 0,
+              paddedHeight > 0,
+              texture.width <= Int(UInt32.max),
+              texture.height <= Int(UInt32.max),
+              paddedWidth <= Int(UInt32.max),
+              paddedHeight <= Int(UInt32.max) else {
+            throw PyrowaveError.invalidDimensions
+        }
+        let sampleCount = paddedWidth * paddedHeight
+        guard sampleCount > 0, sampleCount <= Int(UInt32.max) else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        guard let output = device.makeBuffer(length: sampleCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal texture padding buffer")
+        }
+
+        var constants = PadPlaneConstants(
+            sourceWidth: UInt32(texture.width),
+            sourceHeight: UInt32(texture.height),
+            paddedWidth: UInt32(paddedWidth),
+            paddedHeight: UInt32(paddedHeight)
+        )
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal texture padding command encoder")
+        }
+
+        encoder.setComputePipelineState(padTexturePlanePipeline)
+        encoder.setTexture(texture, index: 0)
+        encoder.setBuffer(output, offset: 0, index: 0)
+        encoder.setBytes(&constants, length: MemoryLayout<PadPlaneConstants>.stride, index: 1)
+        let width = min(16, padTexturePlanePipeline.maxTotalThreadsPerThreadgroup)
+        let height = max(1, min(16, padTexturePlanePipeline.maxTotalThreadsPerThreadgroup / width))
+        encoder.dispatchThreads(
+            MTLSize(width: paddedWidth, height: paddedHeight, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: height, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal texture padding command failed: \(error)")
         }
 
         let pointer = output.contents().bindMemory(to: Float.self, capacity: sampleCount)
@@ -1163,6 +1219,10 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     }
 
     func padPlane(_ plane: Plane8, paddedWidth: Int, paddedHeight: Int) throws -> [Float] {
+        throw PyrowaveError.externalToolUnavailable("Metal")
+    }
+
+    func padTexturePlane(_ texture: Any, paddedWidth: Int, paddedHeight: Int) throws -> [Float] {
         throw PyrowaveError.externalToolUnavailable("Metal")
     }
 

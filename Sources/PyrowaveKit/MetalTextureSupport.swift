@@ -116,19 +116,6 @@ extension YUVFrame {
 }
 
 extension PyrowaveCodec {
-    public func encode(
-        yTexture: MTLTexture,
-        cbTexture: MTLTexture,
-        crTexture: MTLTexture,
-        configuration: CodecConfiguration = CodecConfiguration(),
-        videoSignal: VideoSignalMetadata = .default
-    ) throws -> EncodedFrame {
-        try encode(
-            YUVFrame(yTexture: yTexture, cbTexture: cbTexture, crTexture: crTexture, videoSignal: videoSignal),
-            configuration: configuration
-        )
-    }
-
     public func decodeToMetalTextures(
         _ frame: EncodedFrame,
         device: MTLDevice? = MTLCreateSystemDefaultDevice(),

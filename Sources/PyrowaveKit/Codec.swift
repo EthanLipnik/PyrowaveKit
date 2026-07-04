@@ -1,5 +1,9 @@
 import Foundation
 
+#if canImport(Metal)
+import Metal
+#endif
+
 public extension EncodedFrame {
     func packetized(maximumPacketBytes: Int) throws -> [EncodedPacket] {
         guard maximumPacketBytes >= 8 else {
@@ -269,6 +273,89 @@ public final class PyrowaveCodec: Sendable {
         return EncodedFrame(data: writer.data)
     }
 
+    #if canImport(Metal)
+    public func encode(
+        yTexture: MTLTexture,
+        cbTexture: MTLTexture,
+        crTexture: MTLTexture,
+        configuration: CodecConfiguration = CodecConfiguration(),
+        videoSignal: VideoSignalMetadata = .default
+    ) throws -> EncodedFrame {
+        guard configuration.decompositionLevels == PyrowaveBitstream.decompositionLevels,
+              configuration.quantizationStep > 0,
+              configuration.maximumEncodedBytes == nil || configuration.maximumEncodedBytes! > 0 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard yTexture.pixelFormat == .r8Unorm,
+              cbTexture.pixelFormat == .r8Unorm,
+              crTexture.pixelFormat == .r8Unorm,
+              yTexture.width > 0,
+              yTexture.height > 0 else {
+            throw PyrowaveError.unsupportedFormat("Metal texture encode expects r8Unorm planes")
+        }
+
+        let chroma: ChromaSubsampling
+        if cbTexture.width == yTexture.width / 2,
+           cbTexture.height == yTexture.height / 2,
+           crTexture.width == cbTexture.width,
+           crTexture.height == cbTexture.height {
+            chroma = .yuv420
+        } else if cbTexture.width == yTexture.width,
+                  cbTexture.height == yTexture.height,
+                  crTexture.width == yTexture.width,
+                  crTexture.height == yTexture.height {
+            chroma = .yuv444
+        } else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        let sequenceNumber = sequenceCounter.next()
+        let layout = try PyrowaveBlockLayout(width: yTexture.width, height: yTexture.height, chroma: chroma)
+        let encodedPlanes = [
+            try encodeTexturePlane(yTexture, component: 0, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: chroma, layout: layout, configuration: configuration),
+            try encodeTexturePlane(cbTexture, component: 1, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: chroma, layout: layout, configuration: configuration),
+            try encodeTexturePlane(crTexture, component: 2, frameWidth: yTexture.width, frameHeight: yTexture.height, chroma: chroma, layout: layout, configuration: configuration)
+        ]
+
+        let rateControlPlan = try selectSparseRateControlPlan(
+            planes: encodedPlanes,
+            layout: layout,
+            configuration: configuration
+        )
+        let planeBlocks = try encodedPlanes.enumerated().flatMap { index, plane in
+            try sparseBlocks(
+                plane,
+                layout: layout,
+                sequence: sequenceNumber,
+                quantLevels: rateControlPlan.quantLevelsByPlane?[index],
+                packetByteCosts: rateControlPlan.packetByteCostsByPlane?[index],
+                defaultQuantLevel: rateControlPlan.defaultQuantLevel
+            )
+        }
+        let sortedBlocks = planeBlocks.sorted { $0.blockIndex < $1.blockIndex }
+
+        var writer = BinaryWriter()
+        let sequence = try PyrowaveSequenceHeader(
+            width: yTexture.width,
+            height: yTexture.height,
+            sequence: sequenceNumber,
+            totalBlocks: sortedBlocks.count,
+            chroma: chroma,
+            videoSignal: videoSignal
+        )
+        sequence.write(to: &writer)
+        for block in sortedBlocks {
+            writer.append(data: block.data)
+        }
+
+        if let maximumEncodedBytes = configuration.maximumEncodedBytes, writer.data.count > maximumEncodedBytes {
+            throw PyrowaveError.processFailed("minimum sparse frame size \(writer.data.count) exceeds maximumEncodedBytes \(maximumEncodedBytes)")
+        }
+
+        return EncodedFrame(data: writer.data)
+    }
+    #endif
+
     public func decode(_ frame: EncodedFrame) throws -> YUVFrame {
         try decode(frame, allowPartialFrame: false)
     }
@@ -411,28 +498,73 @@ public final class PyrowaveCodec: Sendable {
         configuration: CodecConfiguration
     ) throws -> EncodedPlane {
         let geometry = planeGeometry(component: component, frameWidth: frameWidth, frameHeight: frameHeight, chroma: chroma, requestedLevels: configuration.decompositionLevels)
-        var padded = (
+        return try encodePaddedPlane(
             samples: try padPlane(plane, paddedWidth: geometry.paddedWidth, paddedHeight: geometry.paddedHeight),
-            width: geometry.paddedWidth,
-            height: geometry.paddedHeight
+            paddedWidth: geometry.paddedWidth,
+            paddedHeight: geometry.paddedHeight,
+            requestedLevels: geometry.requestedLevels,
+            component: component,
+            layout: layout,
+            configuration: configuration
         )
-        let requestedLevels = geometry.requestedLevels
-        let levels = Wavelet.usableLevels(width: padded.width, height: padded.height, requested: requestedLevels)
-        padded.samples = try forwardWavelet(padded.samples, width: padded.width, height: padded.height, levels: levels)
+    }
+
+    #if canImport(Metal)
+    private func encodeTexturePlane(
+        _ texture: MTLTexture,
+        component: Int,
+        frameWidth: Int,
+        frameHeight: Int,
+        chroma: ChromaSubsampling,
+        layout: PyrowaveBlockLayout,
+        configuration: CodecConfiguration
+    ) throws -> EncodedPlane {
+        guard let metalBackend else {
+            throw PyrowaveError.externalToolUnavailable("Metal")
+        }
+        let geometry = planeGeometry(component: component, frameWidth: frameWidth, frameHeight: frameHeight, chroma: chroma, requestedLevels: configuration.decompositionLevels)
+        guard texture.width == geometry.visibleWidth,
+              texture.height == geometry.visibleHeight else {
+            throw PyrowaveError.invalidDimensions
+        }
+        return try encodePaddedPlane(
+            samples: try metalBackend.padTexturePlane(texture, paddedWidth: geometry.paddedWidth, paddedHeight: geometry.paddedHeight),
+            paddedWidth: geometry.paddedWidth,
+            paddedHeight: geometry.paddedHeight,
+            requestedLevels: geometry.requestedLevels,
+            component: component,
+            layout: layout,
+            configuration: configuration
+        )
+    }
+    #endif
+
+    private func encodePaddedPlane(
+        samples: [Float],
+        paddedWidth: Int,
+        paddedHeight: Int,
+        requestedLevels: Int,
+        component: Int,
+        layout: PyrowaveBlockLayout,
+        configuration: CodecConfiguration
+    ) throws -> EncodedPlane {
+        var transformed = samples
+        let levels = Wavelet.usableLevels(width: paddedWidth, height: paddedHeight, requested: requestedLevels)
+        transformed = try forwardWavelet(transformed, width: paddedWidth, height: paddedHeight, levels: levels)
 
         let descriptors = planeBlockDescriptors(
             component: component,
-            paddedWidth: padded.width,
-            paddedHeight: padded.height,
+            paddedWidth: paddedWidth,
+            paddedHeight: paddedHeight,
             levels: levels,
             layout: layout
         )
-        let quantized = try quantize(padded.samples, stride: padded.width, descriptors: descriptors, component: component, configuration: configuration)
+        let quantized = try quantize(transformed, stride: paddedWidth, descriptors: descriptors, component: component, configuration: configuration)
 
         return EncodedPlane(
             component: component,
-            paddedWidth: padded.width,
-            paddedHeight: padded.height,
+            paddedWidth: paddedWidth,
+            paddedHeight: paddedHeight,
             levels: levels,
             quantCodesByBlockIndex: quantized.quantCodesByBlockIndex,
             qScaleCodesByBlockIndex: quantized.qScaleCodesByBlockIndex,

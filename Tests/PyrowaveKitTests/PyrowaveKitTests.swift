@@ -751,6 +751,7 @@ import CoreVideo
     do {
         let backend = try MetalPyrowaveBackend()
         _ = try backend.makeFunction(named: "pyrowave_pad_plane")
+        _ = try backend.makeFunction(named: "pyrowave_pad_texture_plane")
         _ = try backend.makeFunction(named: "pyrowave_crop_plane")
         _ = try backend.makeFunction(named: "pyrowave_quantize")
         _ = try backend.makeFunction(named: "pyrowave_dequantize")
@@ -803,7 +804,9 @@ import CoreVideo
         let backend = try MetalPyrowaveBackend()
         let source = try TestFrames.synthetic420(width: 64, height: 64)
         let sourceTextures = try source.makeMetalTextures(device: backend.device)
-        let codec = try PyrowaveCodec(useMetalAcceleration: false)
+        let referenceCodec = try PyrowaveCodec(useMetalAcceleration: true)
+        let reference = try referenceCodec.encode(source, configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0))
+        let codec = try PyrowaveCodec(useMetalAcceleration: true)
         let encoded = try codec.encode(
             yTexture: sourceTextures.y,
             cbTexture: sourceTextures.cb,
@@ -811,6 +814,7 @@ import CoreVideo
             configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0),
             videoSignal: source.videoSignal
         )
+        #expect(encoded.data == reference.data)
         let decodedTextures = try codec.decodeToMetalTextures(encoded, device: backend.device)
         let decoded = try YUVFrame(
             yTexture: decodedTextures.y,
@@ -854,6 +858,28 @@ import CoreVideo
     ])
     let cpu = Wavelet.padPlane(plane, paddedWidth: 9, paddedHeight: 7).samples
     let metal = try backend.padPlane(plane, paddedWidth: 9, paddedHeight: 7)
+    #expect(metal.count == cpu.count)
+    let maxError = zip(metal, cpu).map { abs($0 - $1) }.max() ?? 0
+    #expect(maxError < 0.000001)
+    #endif
+}
+
+@Test func metalTexturePlanePaddingMatchesCPUReferenceWhenDeviceExists() throws {
+    #if canImport(Metal)
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let plane = try Plane8(width: 3, height: 2, data: [
+        0, 64, 128,
+        192, 224, 255
+    ])
+    let texture = try plane.makeMetalTexture(device: backend.device)
+    let cpu = Wavelet.padPlane(plane, paddedWidth: 9, paddedHeight: 7).samples
+    let metal = try backend.padTexturePlane(texture, paddedWidth: 9, paddedHeight: 7)
     #expect(metal.count == cpu.count)
     let maxError = zip(metal, cpu).map { abs($0 - $1) }.max() ?? 0
     #expect(maxError < 0.000001)
