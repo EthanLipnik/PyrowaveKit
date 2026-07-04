@@ -1,7 +1,7 @@
 import Foundation
 
-public enum TestFrames {
-    public static func synthetic420(width: Int, height: Int, frameIndex: Int = 0) throws -> YUVFrame {
+enum TestFrames {
+    static func synthetic420(width: Int, height: Int, frameIndex: Int = 0) throws -> YUVFrame {
         guard width > 0, height > 0, width % 2 == 0, height % 2 == 0 else {
             throw PyrowaveError.invalidDimensions
         }
@@ -35,7 +35,7 @@ public enum TestFrames {
         )
     }
 
-    public static func synthetic444(width: Int, height: Int, frameIndex: Int = 0) throws -> YUVFrame {
+    static func synthetic444(width: Int, height: Int, frameIndex: Int = 0) throws -> YUVFrame {
         guard width > 0, height > 0 else {
             throw PyrowaveError.invalidDimensions
         }

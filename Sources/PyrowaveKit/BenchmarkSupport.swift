@@ -10,13 +10,13 @@ public enum PyrowaveBenchmarkArtifactNames {
     public static let report = "benchmark-report.json"
 }
 
-public struct PyrowaveBenchmarkFrames: Equatable, Sendable {
-    public var frames: [YUVFrame]
-    public var frameRateNumerator: Int
-    public var frameRateDenominator: Int
-    public var bitDepth: Int
+struct PyrowaveBenchmarkFrames: Equatable, Sendable {
+    var frames: [YUVFrame]
+    var frameRateNumerator: Int
+    var frameRateDenominator: Int
+    var bitDepth: Int
 
-    public init(
+    init(
         frames: [YUVFrame],
         frameRateNumerator: Int,
         frameRateDenominator: Int,
@@ -207,12 +207,12 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
     }
 }
 
-public enum PyrowaveBenchmarkRunner {
-    public static let pyrowaveCodecName = "pyrowavekit-swift-metal"
-    public static let timedBenchmarkScopeNote = "Timed encode/decode excludes input loading, pixel-buffer preparation, artifact writes, report serialization, and quality metric generation; encode starts from reusable CoreVideo-backed Metal texture views and decode stops at CVPixelBuffer output."
-    public static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane, texture, and NV12 texture-channel pad, crop, DWT/iDWT, block quantization, sparse packet byte-cost prefiltering, sparse packet emission, sparse decode apply, rate-control stats, bucket resolve, and savings prefix, 32x32 sparse packets, and optional frame-size cap. \(timedBenchmarkScopeNote)"
+enum PyrowaveBenchmarkRunner {
+    static let pyrowaveCodecName = "pyrowavekit-swift-metal"
+    static let timedBenchmarkScopeNote = "Timed encode/decode excludes input loading, pixel-buffer preparation, artifact writes, report serialization, and quality metric generation; encode starts from reusable CoreVideo-backed Metal texture views and decode stops at CVPixelBuffer output."
+    static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane, texture, and NV12 texture-channel pad, crop, DWT/iDWT, block quantization, sparse packet byte-cost prefiltering, sparse packet emission, sparse decode apply, rate-control stats, bucket resolve, and savings prefix, 32x32 sparse packets, and optional frame-size cap. \(timedBenchmarkScopeNote)"
 
-    public static func loadFrames(arguments: PyrowaveBenchmarkArguments) throws -> PyrowaveBenchmarkFrames {
+    static func loadFrames(arguments: PyrowaveBenchmarkArguments) throws -> PyrowaveBenchmarkFrames {
         if let input = arguments.input {
             var reader = try YUV4MPEGReader(url: input)
             var frames = [YUVFrame]()
@@ -236,7 +236,7 @@ public enum PyrowaveBenchmarkRunner {
         return try PyrowaveBenchmarkFrames(frames: frames, frameRateNumerator: 60, frameRateDenominator: 1, bitDepth: 8)
     }
 
-    public static func runPyrowave(
+    static func runPyrowave(
         loaded: PyrowaveBenchmarkFrames,
         configuration: CodecConfiguration,
         outputDirectory: URL
@@ -296,5 +296,77 @@ public enum PyrowaveBenchmarkRunner {
             metrics: metric,
             note: pyrowaveImplementationNote
         )
+    }
+}
+
+public enum PyrowaveBenchmarkCLI {
+    public static func run(_ rawArguments: [String] = Array(CommandLine.arguments.dropFirst())) throws -> URL? {
+        let arguments = try PyrowaveBenchmarkArguments(rawArguments)
+        if arguments.shouldShowHelp {
+            print(PyrowaveBenchmarkArguments.usage)
+            return nil
+        }
+
+        try FileManager.default.createDirectory(at: arguments.outputDirectory, withIntermediateDirectories: true)
+        let loaded = try PyrowaveBenchmarkRunner.loadFrames(arguments: arguments)
+        let frames = loaded.frames
+        try YUV4MPEGWriter.write(
+            frames: frames,
+            to: arguments.outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.referenceY4M),
+            frameRateNumerator: loaded.frameRateNumerator,
+            frameRateDenominator: loaded.frameRateDenominator
+        )
+
+        let pyrowaveBudget: Int?
+        if let maximumPyrowaveBytes = arguments.maximumPyrowaveBytes {
+            pyrowaveBudget = maximumPyrowaveBytes
+        } else if arguments.matchHEVCFrameBudget {
+            pyrowaveBudget = try HEVCComparison.matchedFrameByteBudget(
+                bitrate: arguments.bitrate,
+                frameRateNumerator: loaded.frameRateNumerator,
+                frameRateDenominator: loaded.frameRateDenominator
+            )
+        } else {
+            pyrowaveBudget = nil
+        }
+
+        let configuration = CodecConfiguration(
+            quantizationStep: arguments.quantizationStep,
+            maximumEncodedBytes: pyrowaveBudget
+        )
+        let pyrowave = try PyrowaveBenchmarkRunner.runPyrowave(
+            loaded: loaded,
+            configuration: configuration,
+            outputDirectory: arguments.outputDirectory
+        )
+        let hevc = try HEVCComparison.runAVKitHEVCComparison(
+            referenceFrames: frames,
+            workingDirectory: arguments.outputDirectory,
+            bitrate: arguments.bitrate,
+            frameRateNumerator: loaded.frameRateNumerator,
+            frameRateDenominator: loaded.frameRateDenominator
+        )
+
+        let report = PyrowaveBenchmarkReport(
+            generatedAt: ISO8601DateFormatter().string(from: Date()),
+            width: frames[0].width,
+            height: frames[0].height,
+            frames: frames.count,
+            frameRateNumerator: loaded.frameRateNumerator,
+            frameRateDenominator: loaded.frameRateDenominator,
+            bitrate: arguments.bitrate,
+            pyrowaveFrameBudgetBytes: pyrowaveBudget,
+            artifacts: PyrowaveBenchmarkArtifacts(),
+            pyrowave: pyrowave,
+            hevc: hevc,
+            comparison: CodecBenchmarkComparison(pyrowave: pyrowave, hevc: hevc)
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let reportData = try encoder.encode(report)
+        let reportURL = arguments.outputDirectory.appendingPathComponent(PyrowaveBenchmarkArtifactNames.report)
+        try reportData.write(to: reportURL)
+        return reportURL
     }
 }

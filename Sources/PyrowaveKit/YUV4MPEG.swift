@@ -1,19 +1,19 @@
 import Foundation
 
-public struct YUV4MPEGReader {
+struct YUV4MPEGReader {
     private var handle: FileHandle
     private let bytesPerSample: Int
     private let sampleMax: Int
     private let videoSignal: VideoSignalMetadata
-    public let width: Int
-    public let height: Int
-    public let chroma: ChromaSubsampling
-    public let bitDepth: Int
-    public let frameRateNumerator: Int
-    public let frameRateDenominator: Int
-    public let headerParameters: String
+    let width: Int
+    let height: Int
+    let chroma: ChromaSubsampling
+    let bitDepth: Int
+    let frameRateNumerator: Int
+    let frameRateDenominator: Int
+    let headerParameters: String
 
-    public init(url: URL) throws {
+    init(url: URL) throws {
         handle = try FileHandle(forReadingFrom: url)
         guard let line = try handle.readLine(), line.hasPrefix("YUV4MPEG2 ") else {
             throw PyrowaveError.unsupportedFormat("missing YUV4MPEG2 header")
@@ -42,7 +42,7 @@ public struct YUV4MPEGReader {
         videoSignal = VideoSignalMetadata(yCbCrRange: range)
     }
 
-    public mutating func readFrame() throws -> YUVFrame? {
+    mutating func readFrame() throws -> YUVFrame? {
         guard let line = try handle.readLine() else {
             return nil
         }
@@ -129,13 +129,13 @@ public struct YUV4MPEGReader {
     }
 }
 
-public struct YUV4MPEGWriter {
+struct YUV4MPEGWriter {
     private var handle: FileHandle
-    public let width: Int
-    public let height: Int
-    public let chroma: ChromaSubsampling
+    let width: Int
+    let height: Int
+    let chroma: ChromaSubsampling
 
-    public init(url: URL, width: Int, height: Int, chroma: ChromaSubsampling, frameRate: String = "60:1") throws {
+    init(url: URL, width: Int, height: Int, chroma: ChromaSubsampling, frameRate: String = "60:1") throws {
         self.width = width
         self.height = height
         self.chroma = chroma
@@ -148,7 +148,7 @@ public struct YUV4MPEGWriter {
         try handle.write(contentsOf: Data("YUV4MPEG2 W\(width) H\(height) F\(frameRate) Ip A1:1 \(chromaTag) XCOLORRANGE=FULL\n".utf8))
     }
 
-    public mutating func writeFrame(_ frame: YUVFrame) throws {
+    mutating func writeFrame(_ frame: YUVFrame) throws {
         guard frame.width == width, frame.height == height, frame.chroma == chroma else {
             throw PyrowaveError.invalidDimensions
         }
@@ -158,7 +158,7 @@ public struct YUV4MPEGWriter {
         try handle.write(contentsOf: Data(frame.cr.data))
     }
 
-    public static func write(
+    static func write(
         frames: [YUVFrame],
         to url: URL,
         frameRateNumerator: Int = 60,

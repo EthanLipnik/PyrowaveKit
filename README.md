@@ -24,7 +24,7 @@ swift test
 swift test -c release
 ```
 
-The test suite covers the Swift packet format, packet stream decoding, edge-extended source padding plus mirrored wavelet filtering, 4:2:0 and 4:4:4 round trips, rate-control decisions, and Metal parity against the CPU reference path when a Metal device is available.
+The test suite covers the Swift packet format, packet stream decoding, edge-extended source padding plus mirrored wavelet filtering, 4:2:0 and 4:4:4 round trips, rate-control decisions, and Metal parity against internal reference routines when a Metal device is available. Normal codec entry points are Metal texture and CoreVideo pixel-buffer based.
 
 ## Benchmark
 

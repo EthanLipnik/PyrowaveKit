@@ -1,7 +1,7 @@
 import Foundation
 
-public enum Metrics {
-    public static func compare(_ reference: YUVFrame, _ candidate: YUVFrame) throws -> FrameMetrics {
+enum Metrics {
+    static func compare(_ reference: YUVFrame, _ candidate: YUVFrame) throws -> FrameMetrics {
         guard reference.width == candidate.width,
               reference.height == candidate.height,
               reference.chroma == candidate.chroma else {
@@ -19,7 +19,7 @@ public enum Metrics {
         return FrameMetrics(y: y, cb: cb, cr: cr, weightedPSNR: weightedPSNR)
     }
 
-    public static func compare(_ referenceFrames: [YUVFrame], _ candidateFrames: [YUVFrame]) throws -> FrameMetrics {
+    static func compare(_ referenceFrames: [YUVFrame], _ candidateFrames: [YUVFrame]) throws -> FrameMetrics {
         guard !referenceFrames.isEmpty else {
             throw PyrowaveError.truncatedInput
         }
@@ -62,7 +62,7 @@ public enum Metrics {
         )
     }
 
-    public static func comparePlane(_ reference: Plane8, _ candidate: Plane8) -> ComponentMetrics {
+    static func comparePlane(_ reference: Plane8, _ candidate: Plane8) -> ComponentMetrics {
         precondition(reference.width == candidate.width && reference.height == candidate.height)
         let mse = squaredError(reference, candidate) / Double(reference.data.count)
         return ComponentMetrics(mse: mse, psnr: psnr(mse: mse))

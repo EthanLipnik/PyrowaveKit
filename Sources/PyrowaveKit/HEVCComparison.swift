@@ -65,11 +65,11 @@ public struct CodecBenchmarkComparison: Codable, Equatable, Sendable {
     }
 }
 
-public enum HEVCComparison {
+enum HEVCComparison {
     private static let maximumQualityReferenceFrameRate = 60
-    public static let avKitTimingNote = "Timed HEVC encode/decode stops at AVFoundation pixel-buffer append/read; planar conversion, PSNR, Y4M artifacts, and report writing are excluded."
+    static let avKitTimingNote = "Timed HEVC encode/decode stops at AVFoundation pixel-buffer append/read; planar conversion, PSNR, Y4M artifacts, and report writing are excluded."
 
-    public static func runAVKitHEVCComparison(
+    static func runAVKitHEVCComparison(
         referenceFrames: [YUVFrame],
         workingDirectory: URL,
         bitrate: Int,
@@ -149,7 +149,7 @@ public enum HEVCComparison {
         )
     }
 
-    public static func matchedFrameByteBudget(
+    static func matchedFrameByteBudget(
         bitrate: Int,
         frameRateNumerator: Int,
         frameRateDenominator: Int
@@ -176,7 +176,7 @@ public enum HEVCComparison {
         return max(1, Int(roundedNumerator.partialValue / bitsPerFrameDenominator))
     }
 
-    public static func qualityReferenceFrameRate(numerator: Int, denominator: Int) throws -> (numerator: Int, denominator: Int) {
+    static func qualityReferenceFrameRate(numerator: Int, denominator: Int) throws -> (numerator: Int, denominator: Int) {
         guard numerator > 0, denominator > 0 else {
             throw PyrowaveError.invalidDimensions
         }

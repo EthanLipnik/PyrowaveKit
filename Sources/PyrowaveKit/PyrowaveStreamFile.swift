@@ -32,7 +32,7 @@ public struct PyrowaveStreamHeader: Codable, Equatable, Sendable {
         self.bitDepth = bitDepth
     }
 
-    public init(frame: YUVFrame, frameRateNumerator: Int = 60, frameRateDenominator: Int = 1, bitDepth: Int = 8) throws {
+    init(frame: YUVFrame, frameRateNumerator: Int = 60, frameRateDenominator: Int = 1, bitDepth: Int = 8) throws {
         try self.init(
             width: frame.width,
             height: frame.height,

@@ -105,12 +105,12 @@ public struct CodecConfiguration: Codable, Equatable, Sendable {
     }
 }
 
-public struct Plane8: Equatable, Sendable {
-    public var width: Int
-    public var height: Int
-    public var data: [UInt8]
+struct Plane8: Equatable, Sendable {
+    var width: Int
+    var height: Int
+    var data: [UInt8]
 
-    public init(width: Int, height: Int, data: [UInt8]) throws {
+    init(width: Int, height: Int, data: [UInt8]) throws {
         guard width > 0, height > 0, data.count == width * height else {
             throw PyrowaveError.invalidDimensions
         }
@@ -120,16 +120,16 @@ public struct Plane8: Equatable, Sendable {
     }
 }
 
-public struct YUVFrame: Equatable, Sendable {
-    public var width: Int
-    public var height: Int
-    public var chroma: ChromaSubsampling
-    public var y: Plane8
-    public var cb: Plane8
-    public var cr: Plane8
-    public var videoSignal: VideoSignalMetadata
+struct YUVFrame: Equatable, Sendable {
+    var width: Int
+    var height: Int
+    var chroma: ChromaSubsampling
+    var y: Plane8
+    var cb: Plane8
+    var cr: Plane8
+    var videoSignal: VideoSignalMetadata
 
-    public init(
+    init(
         width: Int,
         height: Int,
         chroma: ChromaSubsampling,
@@ -158,7 +158,7 @@ public struct YUVFrame: Equatable, Sendable {
         self.videoSignal = videoSignal
     }
 
-    public init(
+    init(
         width: Int,
         height: Int,
         nv12Y: [UInt8],
@@ -213,7 +213,7 @@ public struct YUVFrame: Equatable, Sendable {
         )
     }
 
-    public func nv12Planes(
+    func nv12Planes(
         yRowStride: Int? = nil,
         cbCrRowStride: Int? = nil
     ) throws -> (y: [UInt8], cbCr: [UInt8]) {
