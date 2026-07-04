@@ -182,7 +182,7 @@ func runPyrowave(loaded: LoadedFrames, configuration: CodecConfiguration, output
         encodeSeconds: encodeSeconds,
         decodeSeconds: decodeSeconds,
         metrics: metric,
-        note: "Hard-cutover v2 stream with Metal plane pad/crop, DWT/iDWT, block quantization, sparse decode apply, rate-control stats, 32x32 sparse packets, and optional frame-size cap"
+        note: "Hard-cutover v2 stream with Metal plane pad/crop, DWT/iDWT, block quantization, sparse packet byte-cost prefiltering, sparse decode apply, rate-control stats, 32x32 sparse packets, and optional frame-size cap"
     )
 }
 
