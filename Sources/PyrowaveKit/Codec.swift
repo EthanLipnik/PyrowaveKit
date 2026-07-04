@@ -1574,10 +1574,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
                     let statsStart = tileIndex * PyrowaveBlockStats.candidateCount
                     for candidate in 0..<PyrowaveBlockStats.candidateCount {
                         let stat = tileStats.stats[statsStart + candidate]
-                        distortions[candidate] += PyrowaveQuantStats(
-                            squareError: stat.squareError,
-                            encodeCostBits: Int(stat.encodeCostBits)
-                        ).squareError
+                        distortions[candidate] += PyrowaveQuantStats.quantizedSquareError(stat.squareError)
                     }
                 }
                 return distortions

@@ -13,6 +13,10 @@ struct PyrowaveQuantStats: Equatable {
     var squareError: Float {
         Float(Float16(bitPattern: squareErrorFP16))
     }
+
+    static func quantizedSquareError(_ squareError: Float) -> Float {
+        Float(Float16(min(max(squareError, 0), 60_000)))
+    }
 }
 
 struct PyrowaveBlockStats: Equatable {
