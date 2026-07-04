@@ -350,6 +350,36 @@ import Testing
     #expect(decoded.coefficients.contains { $0.offset == 16 && $0.qScaleCode == 8 })
 }
 
+@Test func pyrowaveCoefficientBlockQuantLevelDropsBitplanesAndAdjustsScale() throws {
+    let stride = 32
+    var coefficients = Array(repeating: Int16(0), count: stride * stride)
+    coefficients[0] = 7
+    coefficients[1] = -8
+    coefficients[9] = 3
+
+    let quantCode = try PyrowaveQuantization.encodeBlockScale(1.0 / 1024.0)
+    let payload = try #require(try PyrowaveCoefficientBlockCodec.encodeBlock(
+        blockIndex: 9,
+        coefficients: coefficients,
+        stride: stride,
+        originX: 0,
+        originY: 0,
+        validWidth: 32,
+        validHeight: 32,
+        threshold: 0,
+        quantLevel: 2,
+        quantCode: quantCode
+    ))
+
+    var reader = BinaryReader(payload)
+    let decoded = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
+    let decodedMap = Dictionary(uniqueKeysWithValues: decoded.coefficients.map { (Int($0.offset), $0.value) })
+    #expect(decoded.quantCode == PyrowaveQuantization.modifyQuantCode(quantCode, droppingBitplanes: 2))
+    #expect(decodedMap[0] == 1)
+    #expect(decodedMap[1] == -2)
+    #expect(decodedMap[9] == nil)
+}
+
 @Test func pyrowaveQuantizationHelpersMatchSpecFormulas() throws {
     let code = try PyrowaveQuantization.encodeBlockScale(1.0 / 1024.0)
     #expect(code == 112)
@@ -371,6 +401,8 @@ import Testing
     #expect(PyrowaveQuantization.encode8x8ScaleCode(maxScaledCoefficient: 1.75) == PyrowaveQuantization.identityQScaleCode)
     #expect(PyrowaveQuantization.encode8x8ScaleCode(maxScaledCoefficient: 2.0) == 8)
     #expect(abs(PyrowaveQuantization.quantScale(for8x8ScaleCode: 8) - (1.0 / 1.25)) < 0.000001)
+    #expect(PyrowaveQuantization.modifyQuantCode(code, droppingBitplanes: 2) == 96)
+    #expect(PyrowaveQuantization.modifyQuantCode(code, droppingBitplanes: 99) == 0)
 }
 
 @Test func pyrowaveBlockStatsUseOriginalPackedShape() throws {
@@ -410,7 +442,7 @@ import Testing
 
     #expect(block.eightByEightStats.count == 16)
     #expect(block.packetByteCosts[0] > block.packetByteCosts[14])
-    #expect(block.distortion(threshold: 14) > block.distortion(threshold: 0))
+    #expect(block.distortion(quantLevel: 14) > block.distortion(quantLevel: 0))
     for threshold in 1..<PyrowaveBlockStats.candidateCount {
         #expect(block.packetByteCosts[threshold] <= block.packetByteCosts[threshold - 1])
     }

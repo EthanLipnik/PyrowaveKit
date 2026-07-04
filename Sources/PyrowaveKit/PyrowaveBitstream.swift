@@ -68,6 +68,15 @@ enum PyrowaveQuantization {
         return value * decodeBlockScale(quantCode) * decode8x8Scale(qScaleCode)
     }
 
+    static func modifyQuantCode(_ quantCode: UInt8, droppingBitplanes quantLevel: Int) -> UInt8 {
+        guard quantLevel > 0 else {
+            return quantCode
+        }
+
+        let exponent = max(Int(quantCode >> 3) - quantLevel, 0)
+        return UInt8((exponent << 3) | Int(quantCode & 0x7))
+    }
+
     static func noisePowerNormalizedResolution(level: Int, component: Int, band: Int, precision: Int = 0) -> Float {
         var bits = precision >= 1 ? 8 : 6
         if band == 0 {
@@ -317,11 +326,15 @@ struct PyrowaveCoefficientBlockCodec {
         validWidth: Int,
         validHeight: Int,
         threshold: Int,
+        quantLevel: Int = 0,
         sequence: UInt8 = 0,
         quantCode: UInt8 = 0,
         qScaleCode: UInt8 = PyrowaveQuantization.identityQScaleCode,
         qScaleCodes: [UInt8]? = nil
     ) throws -> Data? {
+        guard quantLevel >= 0 else {
+            throw PyrowaveError.invalidBitstream("negative quant level")
+        }
         if let qScaleCodes, qScaleCodes.count != 16 {
             throw PyrowaveError.invalidBitstream("expected sixteen 8x8 quant scale codes")
         }
@@ -332,8 +345,9 @@ struct PyrowaveCoefficientBlockCodec {
         for y in 0..<validHeight {
             for x in 0..<validWidth {
                 let value = coefficients[(originY + y) * stride + originX + x]
-                if abs(Int(value)) > threshold {
-                    blockValues[y * PyrowaveBitstream.coefficientBlockSize + x] = value
+                let magnitude = abs(Int(value)) >> quantLevel
+                if magnitude > threshold {
+                    blockValues[y * PyrowaveBitstream.coefficientBlockSize + x] = value < 0 ? Int16(-magnitude) : Int16(magnitude)
                     let smallBlock = (y / PyrowaveBitstream.smallBlockSize) * 4 + (x / PyrowaveBitstream.smallBlockSize)
                     ballot |= UInt16(1) << UInt16(smallBlock)
                 }
@@ -420,7 +434,7 @@ struct PyrowaveCoefficientBlockCodec {
             payloadWords: payloadWords,
             sequence: sequence,
             extended: false,
-            quantCode: quantCode,
+            quantCode: PyrowaveQuantization.modifyQuantCode(quantCode, droppingBitplanes: quantLevel),
             blockIndex: blockIndex
         )
 

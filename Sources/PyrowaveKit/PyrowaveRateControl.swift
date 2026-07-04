@@ -46,15 +46,15 @@ struct PyrowaveRateControlBlock: Equatable {
     var eightByEightStats: [PyrowaveBlockStats]
     var packetByteCosts: [Int]
 
-    func distortion(threshold: Int) -> Float {
-        let index = min(max(threshold, 0), Self.candidateCount - 1)
+    func distortion(quantLevel: Int) -> Float {
+        let index = min(max(quantLevel, 0), Self.candidateCount - 1)
         return eightByEightStats.reduce(Float(0)) { partial, block in
             partial + block.stats[index].squareError
         }
     }
 
-    func packetByteCost(threshold: Int) -> Int {
-        packetByteCosts[min(max(threshold, 0), Self.candidateCount - 1)]
+    func packetByteCost(quantLevel: Int) -> Int {
+        packetByteCosts[min(max(quantLevel, 0), Self.candidateCount - 1)]
     }
 }
 
@@ -89,7 +89,7 @@ enum PyrowaveRateController {
 
         var packetByteCosts = [Int]()
         packetByteCosts.reserveCapacity(PyrowaveBlockStats.candidateCount)
-        for threshold in 0..<PyrowaveBlockStats.candidateCount {
+        for quantLevel in 0..<PyrowaveBlockStats.candidateCount {
             let packet = try PyrowaveCoefficientBlockCodec.encodeBlock(
                 blockIndex: blockIndex,
                 coefficients: coefficients,
@@ -98,7 +98,8 @@ enum PyrowaveRateController {
                 originY: originY,
                 validWidth: validWidth,
                 validHeight: validHeight,
-                threshold: threshold,
+                threshold: 0,
+                quantLevel: quantLevel,
                 quantCode: quantCode,
                 qScaleCode: qScaleCode,
                 qScaleCodes: qScaleCodes
@@ -139,17 +140,17 @@ enum PyrowaveRateController {
                         continue
                     }
 
-                    let currentCost = block.packetByteCost(threshold: currentThreshold)
+                    let currentCost = block.packetByteCost(quantLevel: currentThreshold)
                     var nextThreshold = currentThreshold + 1
                     while nextThreshold < PyrowaveRateControlBlock.candidateCount &&
-                        block.packetByteCost(threshold: nextThreshold) == currentCost {
+                        block.packetByteCost(quantLevel: nextThreshold) == currentCost {
                         nextThreshold += 1
                     }
                     guard nextThreshold < PyrowaveRateControlBlock.candidateCount else {
                         continue
                     }
 
-                    let nextCost = block.packetByteCost(threshold: nextThreshold)
+                    let nextCost = block.packetByteCost(quantLevel: nextThreshold)
                     let saving = currentCost - nextCost
                     guard saving > 0 else {
                         continue
@@ -157,7 +158,7 @@ enum PyrowaveRateController {
 
                     let distortionDelta = max(
                         0,
-                        block.distortion(threshold: nextThreshold) - block.distortion(threshold: currentThreshold)
+                        block.distortion(quantLevel: nextThreshold) - block.distortion(quantLevel: currentThreshold)
                     )
                     let score = distortionDelta / Float(saving)
                     if best == nil ||
@@ -189,7 +190,7 @@ enum PyrowaveRateController {
         var byteCount = fixedHeaderBytes
         for (blocks, thresholds) in zip(blocksByPlane, thresholdsByPlane) {
             for (block, threshold) in zip(blocks, thresholds) {
-                byteCount += block.packetByteCost(threshold: threshold)
+                byteCount += block.packetByteCost(quantLevel: threshold)
             }
         }
         return byteCount
@@ -222,7 +223,7 @@ enum PyrowaveRateController {
         var stats = [PyrowaveQuantStats]()
         stats.reserveCapacity(PyrowaveBlockStats.candidateCount)
 
-        for threshold in 0..<PyrowaveBlockStats.candidateCount {
+        for quantLevel in 0..<PyrowaveBlockStats.candidateCount {
             var squareError = Float(0)
             var encodeCostBits = 0
             var retainedValues = 0
@@ -231,9 +232,13 @@ enum PyrowaveRateController {
                 for x in 0..<validWidth {
                     let value = Int(coefficients[(originY + y) * stride + originX + x])
                     let magnitude = abs(value)
-                    if magnitude > threshold {
+                    let retainedMagnitude = magnitude >> quantLevel
+                    if retainedMagnitude != 0 {
                         retainedValues += 1
-                        encodeCostBits += significantBitCount(magnitude)
+                        encodeCostBits += significantBitCount(retainedMagnitude)
+                        let reconstructedMagnitude = retainedMagnitude << quantLevel
+                        let delta = magnitude - reconstructedMagnitude
+                        squareError += Float(delta * delta)
                     } else {
                         squareError += Float(magnitude * magnitude)
                     }

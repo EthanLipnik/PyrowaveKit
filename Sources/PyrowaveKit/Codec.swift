@@ -36,8 +36,8 @@ public final class PyrowaveCodec: Sendable {
             try sparseBlocks(
                 plane,
                 layout: layout,
-                sparseThresholds: rateControlPlan.thresholdsByPlane?[index],
-                defaultThreshold: rateControlPlan.defaultThreshold
+                quantLevels: rateControlPlan.quantLevelsByPlane?[index],
+                defaultQuantLevel: rateControlPlan.defaultQuantLevel
             )
         }
         let sortedBlocks = planeBlocks.sorted { $0.blockIndex < $1.blockIndex }
@@ -117,8 +117,8 @@ public final class PyrowaveCodec: Sendable {
     }
 
     private struct SparseRateControlPlan {
-        var defaultThreshold: Int
-        var thresholdsByPlane: [[Int]]?
+        var defaultQuantLevel: Int
+        var quantLevelsByPlane: [[Int]]?
     }
 
     private struct PlaneBlockDescriptor {
@@ -191,7 +191,7 @@ public final class PyrowaveCodec: Sendable {
         configuration: CodecConfiguration
     ) throws -> SparseRateControlPlan {
         guard let maximumEncodedBytes = configuration.maximumEncodedBytes else {
-            return SparseRateControlPlan(defaultThreshold: 0, thresholdsByPlane: nil)
+            return SparseRateControlPlan(defaultQuantLevel: 0, quantLevelsByPlane: nil)
         }
 
         let fixedHeaderBytes = frameHeaderSize
@@ -201,14 +201,14 @@ public final class PyrowaveCodec: Sendable {
             fixedHeaderBytes: fixedHeaderBytes,
             maximumEncodedBytes: maximumEncodedBytes
         ) {
-            return SparseRateControlPlan(defaultThreshold: 0, thresholdsByPlane: thresholdsByPlane)
+            return SparseRateControlPlan(defaultQuantLevel: 0, quantLevelsByPlane: thresholdsByPlane)
         }
 
         var low = 0
-        var high = Int(Int16.max)
+        var high = PyrowaveBlockStats.candidateCount - 1
         while low < high {
             let mid = (low + high) / 2
-            let size = try estimateFrameSize(planes: planes, layout: layout, sparseThreshold: mid)
+            let size = try estimateFrameSize(planes: planes, layout: layout, quantLevel: mid)
             if size <= maximumEncodedBytes {
                 high = mid
             } else {
@@ -216,17 +216,17 @@ public final class PyrowaveCodec: Sendable {
             }
         }
 
-        return SparseRateControlPlan(defaultThreshold: low, thresholdsByPlane: nil)
+        return SparseRateControlPlan(defaultQuantLevel: low, quantLevelsByPlane: nil)
     }
 
     private var frameHeaderSize: Int {
         8
     }
 
-    private func estimateFrameSize(planes: [EncodedPlane], layout: PyrowaveBlockLayout, sparseThreshold: Int) throws -> Int {
+    private func estimateFrameSize(planes: [EncodedPlane], layout: PyrowaveBlockLayout, quantLevel: Int) throws -> Int {
         var size = frameHeaderSize
         for plane in planes {
-            let blocks = try sparseBlocks(plane, layout: layout, defaultThreshold: sparseThreshold)
+            let blocks = try sparseBlocks(plane, layout: layout, defaultQuantLevel: quantLevel)
             size += blocks.reduce(0) { $0 + $1.data.count }
         }
         return size
@@ -235,19 +235,19 @@ public final class PyrowaveCodec: Sendable {
     private func sparseBlocks(
         _ plane: EncodedPlane,
         layout: PyrowaveBlockLayout,
-        sparseThresholds: [Int]? = nil,
-        defaultThreshold: Int
+        quantLevels: [Int]? = nil,
+        defaultQuantLevel: Int
     ) throws -> [SparseBlock] {
         let descriptors = planeBlockDescriptors(plane: plane, layout: layout)
-        if let sparseThresholds, sparseThresholds.count != descriptors.count {
-            throw PyrowaveError.processFailed("sparse threshold count \(sparseThresholds.count) does not match block count \(descriptors.count)")
+        if let quantLevels, quantLevels.count != descriptors.count {
+            throw PyrowaveError.processFailed("quant level count \(quantLevels.count) does not match block count \(descriptors.count)")
         }
 
         var blocks = [SparseBlock]()
         blocks.reserveCapacity(descriptors.count)
 
         for (index, descriptor) in descriptors.enumerated() {
-            let threshold = sparseThresholds?[index] ?? defaultThreshold
+            let quantLevel = quantLevels?[index] ?? defaultQuantLevel
             if let data = try PyrowaveCoefficientBlockCodec.encodeBlock(
                 blockIndex: descriptor.blockIndex,
                 coefficients: plane.coefficients,
@@ -256,7 +256,8 @@ public final class PyrowaveCodec: Sendable {
                 originY: descriptor.originY,
                 validWidth: descriptor.validWidth,
                 validHeight: descriptor.validHeight,
-                threshold: threshold,
+                threshold: 0,
+                quantLevel: quantLevel,
                 quantCode: try quantCode(for: descriptor, plane: plane),
                 qScaleCodes: try qScaleCodes(for: descriptor, plane: plane)
             ) {
