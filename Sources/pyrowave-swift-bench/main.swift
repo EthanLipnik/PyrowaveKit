@@ -151,7 +151,7 @@ func runPyrowave(loaded: LoadedFrames, configuration: CodecConfiguration, output
         }
     }
 
-    let metric = try Metrics.compare(frames[0], decodedFrames[0])
+    let metric = try Metrics.compare(frames, decodedFrames)
     return CodecBenchmarkResult(
         codec: "pyrowavekit-swift-metal-hybrid",
         encodedBytes: encodedBytes,

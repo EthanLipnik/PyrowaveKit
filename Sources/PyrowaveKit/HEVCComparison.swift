@@ -83,9 +83,10 @@ public enum HEVCComparison {
         let decodeSeconds = stopwatch.lapSeconds()
         let encodedBytes = (try FileManager.default.attributesOfItem(atPath: hevcURL.path)[.size] as? NSNumber)?.intValue ?? 0
         let comparedCount = min(referenceFrames.count, decodedFrames.count)
-        let metrics = try averageMetrics((0..<comparedCount).map { index in
-            try Metrics.compare(referenceFrames[index], decodedFrames[index])
-        })
+        let metrics = try Metrics.compare(
+            Array(referenceFrames.prefix(comparedCount)),
+            Array(decodedFrames.prefix(comparedCount))
+        )
 
         return CodecBenchmarkResult(
             codec: "hevc_avkit",
@@ -346,30 +347,6 @@ public enum HEVCComparison {
             throw PyrowaveError.truncatedInput
         }
         return first
-    }
-
-    private static func averageMetrics(_ metrics: [FrameMetrics]) throws -> FrameMetrics {
-        guard !metrics.isEmpty else {
-            throw PyrowaveError.truncatedInput
-        }
-        let count = Double(metrics.count)
-        let yMSE = metrics.reduce(0.0) { $0 + $1.y.mse } / count
-        let cbMSE = metrics.reduce(0.0) { $0 + $1.cb.mse } / count
-        let crMSE = metrics.reduce(0.0) { $0 + $1.cr.mse } / count
-        let weightedPSNR = metrics.reduce(0.0) { $0 + $1.weightedPSNR } / count
-        return FrameMetrics(
-            y: ComponentMetrics(mse: yMSE, psnr: psnr(mse: yMSE)),
-            cb: ComponentMetrics(mse: cbMSE, psnr: psnr(mse: cbMSE)),
-            cr: ComponentMetrics(mse: crMSE, psnr: psnr(mse: crMSE)),
-            weightedPSNR: weightedPSNR
-        )
-    }
-
-    private static func psnr(mse: Double) -> Double {
-        if mse == 0 {
-            return 999.0
-        }
-        return 10.0 * log10((255.0 * 255.0) / mse)
     }
 
     private final class AsyncResultBox<Value>: @unchecked Sendable {

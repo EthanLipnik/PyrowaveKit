@@ -58,6 +58,37 @@ import Testing
     #expect(metrics.weightedPSNR > 36.0)
 }
 
+@Test func sequenceMetricsIncludeEveryFrame() throws {
+    let black = try YUVFrame(
+        width: 2,
+        height: 2,
+        chroma: .yuv420,
+        y: Plane8(width: 2, height: 2, data: [0, 0, 0, 0]),
+        cb: Plane8(width: 1, height: 1, data: [0]),
+        cr: Plane8(width: 1, height: 1, data: [0])
+    )
+    let shifted = try YUVFrame(
+        width: 2,
+        height: 2,
+        chroma: .yuv420,
+        y: Plane8(width: 2, height: 2, data: [10, 10, 10, 10]),
+        cb: Plane8(width: 1, height: 1, data: [10]),
+        cr: Plane8(width: 1, height: 1, data: [10])
+    )
+
+    let firstFrameOnly = try Metrics.compare(black, black)
+    let sequence = try Metrics.compare([black, black], [black, shifted])
+
+    #expect(firstFrameOnly.weightedPSNR == 999.0)
+    #expect(sequence.y.mse == 50.0)
+    #expect(sequence.cb.mse == 50.0)
+    #expect(sequence.cr.mse == 50.0)
+    #expect(sequence.weightedPSNR < firstFrameOnly.weightedPSNR)
+    #expect(throws: PyrowaveError.invalidDimensions) {
+        _ = try Metrics.compare([black], [black, shifted])
+    }
+}
+
 @Test func yuv4mpegReadWrite() throws {
     let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
