@@ -11,6 +11,50 @@ enum PyrowaveBitstream {
     static let smallBlockSize = 8
 }
 
+enum PyrowaveQuantization {
+    static let maxScaleExp = 4
+    static let identityQScaleCode: UInt8 = 6
+
+    static func decodeBlockScale(_ quantCode: UInt8) -> Float {
+        let exponent = maxScaleExp - Int(quantCode >> 3)
+        let mantissa = Int(quantCode & 0x7)
+        return (1.0 / (8.0 * 1024.0 * 1024.0)) * Float((8 + mantissa) * (1 << (20 + exponent)))
+    }
+
+    static func encodeBlockScale(_ scale: Float) throws -> UInt8 {
+        guard scale > 0, scale.isFinite else {
+            throw PyrowaveError.invalidBitstream("bad quantization scale")
+        }
+
+        let bits = scale.bitPattern
+        var exponent = Int((bits >> 23) & 0xff) - 127 - maxScaleExp
+        let mantissa = Int((bits >> 20) & 0x7)
+        exponent = -exponent
+        guard exponent >= 0, exponent <= 20 else {
+            throw PyrowaveError.invalidBitstream("quantization scale out of representable range")
+        }
+        return UInt8((exponent << 3) | mantissa)
+    }
+
+    static func decode8x8Scale(_ code: UInt8) -> Float {
+        Float(code) / 8.0 + 0.25
+    }
+
+    static func encode8x8Scale(_ scale: Float) -> UInt8 {
+        UInt8(clamping: Int(ceil((scale - 0.25) * 8.0)))
+    }
+
+    static func dequantize(coefficient: Int16, quantCode: UInt8, qScaleCode: UInt8) -> Float {
+        var value = Float(coefficient)
+        if value > 0 {
+            value += 0.5
+        } else if value < 0 {
+            value -= 0.5
+        }
+        return value * decodeBlockScale(quantCode) * decode8x8Scale(qScaleCode)
+    }
+}
+
 struct PyrowavePacketHeader: Equatable, Sendable {
     var ballot: UInt16
     var payloadWords: UInt16
@@ -216,6 +260,8 @@ struct PyrowaveCoefficientBlockCodec {
 
     struct DecodedBlock {
         var blockIndex: Int
+        var quantCode: UInt8
+        var qScaleCodes: [UInt8]
         var coefficients: [(offset: UInt16, value: Int16)]
     }
 
@@ -229,7 +275,8 @@ struct PyrowaveCoefficientBlockCodec {
         validHeight: Int,
         threshold: Int,
         sequence: UInt8 = 0,
-        quantCode: UInt8 = 0
+        quantCode: UInt8 = 0,
+        qScaleCode: UInt8 = PyrowaveQuantization.identityQScaleCode
     ) throws -> Data? {
         var blockValues = Array(repeating: Int16(0), count: PyrowaveBitstream.coefficientBlockSize * PyrowaveBitstream.coefficientBlockSize)
         var ballot = UInt16(0)
@@ -297,7 +344,7 @@ struct PyrowaveCoefficientBlockCodec {
             }
 
             codeWords.append(codeWord)
-            qScales.append(UInt8(basePlanes & 0x0f))
+            qScales.append((qScaleCode << 4) | UInt8(basePlanes & 0x0f))
 
             for subblock in 0..<subblockCount {
                 for pixel in 0..<pixelsPerSubblock {
@@ -351,7 +398,7 @@ struct PyrowaveCoefficientBlockCodec {
             throw PyrowaveError.invalidBitstream("coefficient decoder received extended packet")
         }
         guard header.ballot != 0 else {
-            return DecodedBlock(blockIndex: header.blockIndex, coefficients: [])
+            return DecodedBlock(blockIndex: header.blockIndex, quantCode: header.quantCode, qScaleCodes: [], coefficients: [])
         }
 
         let payloadEnd = blockStart + Int(header.payloadWords) * 4
@@ -367,9 +414,13 @@ struct PyrowaveCoefficientBlockCodec {
         }
 
         var qScales = [UInt8]()
+        var qScaleCodes = [UInt8]()
         qScales.reserveCapacity(activeBlockCount)
+        qScaleCodes.reserveCapacity(activeBlockCount)
         for _ in 0..<activeBlockCount {
-            qScales.append(try reader.readUInt8())
+            let qScale = try reader.readUInt8()
+            qScales.append(qScale)
+            qScaleCodes.append(qScale >> 4)
         }
 
         var coefficients = Array(repeating: Int16(0), count: PyrowaveBitstream.coefficientBlockSize * PyrowaveBitstream.coefficientBlockSize)
@@ -431,7 +482,7 @@ struct PyrowaveCoefficientBlockCodec {
         let entries = coefficients.enumerated().compactMap { index, value -> (offset: UInt16, value: Int16)? in
             value == 0 ? nil : (UInt16(index), value)
         }
-        return DecodedBlock(blockIndex: header.blockIndex, coefficients: entries)
+        return DecodedBlock(blockIndex: header.blockIndex, quantCode: header.quantCode, qScaleCodes: qScaleCodes, coefficients: entries)
     }
 
     private static func coordinateIn8x8(subblock: Int, pixel: Int) -> (x: Int, y: Int) {

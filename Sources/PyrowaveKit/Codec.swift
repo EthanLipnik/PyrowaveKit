@@ -119,6 +119,8 @@ public final class PyrowaveCodec: Sendable {
         var paddedWidth: Int
         var paddedHeight: Int
         var levels: Int
+        var quantCode: UInt8
+        var qScaleCode: UInt8
         var coefficients: [Int16]
     }
 
@@ -169,6 +171,7 @@ public final class PyrowaveCodec: Sendable {
         padded.samples = try forwardWavelet(padded.samples, width: padded.width, height: padded.height, levels: levels)
 
         let coefficients = try quantize(padded.samples, quantizationStep: configuration.quantizationStep)
+        let quantCode = try PyrowaveQuantization.encodeBlockScale(configuration.quantizationStep)
 
         return EncodedPlane(
             component: component,
@@ -177,6 +180,8 @@ public final class PyrowaveCodec: Sendable {
             paddedWidth: padded.width,
             paddedHeight: padded.height,
             levels: levels,
+            quantCode: quantCode,
+            qScaleCode: PyrowaveQuantization.identityQScaleCode,
             coefficients: coefficients
         )
     }
@@ -340,7 +345,9 @@ public final class PyrowaveCodec: Sendable {
                 originY: descriptor.originY,
                 validWidth: descriptor.validWidth,
                 validHeight: descriptor.validHeight,
-                threshold: threshold
+                threshold: threshold,
+                quantCode: plane.quantCode,
+                qScaleCode: plane.qScaleCode
             ) {
                 blocks.append(SparseBlock(blockIndex: descriptor.blockIndex, data: data))
             }

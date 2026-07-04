@@ -222,6 +222,8 @@ import Testing
     let decodedMap = Dictionary(uniqueKeysWithValues: decoded.coefficients.map { (Int($0.offset), $0.value) })
 
     #expect(decoded.blockIndex == 42)
+    #expect(decoded.quantCode == 11)
+    #expect(decoded.qScaleCodes == [PyrowaveQuantization.identityQScaleCode, PyrowaveQuantization.identityQScaleCode, PyrowaveQuantization.identityQScaleCode])
     #expect(decodedMap[0] == 1)
     #expect(decodedMap[1] == -2)
     #expect(decodedMap[2] == 3)
@@ -229,4 +231,18 @@ import Testing
     #expect(decodedMap[31 * stride + 31] == 255)
     #expect(decoded.coefficients.count == 5)
     #expect(decodeReader.offset == payload.count)
+}
+
+@Test func pyrowaveQuantizationHelpersMatchSpecFormulas() throws {
+    let code = try PyrowaveQuantization.encodeBlockScale(1.0 / 1024.0)
+    #expect(code == 112)
+    #expect(abs(PyrowaveQuantization.decodeBlockScale(code) - (1.0 / 1024.0)) < 0.000001)
+    #expect(PyrowaveQuantization.identityQScaleCode == 6)
+    #expect(PyrowaveQuantization.decode8x8Scale(PyrowaveQuantization.identityQScaleCode) == 1.0)
+    #expect(PyrowaveQuantization.encode8x8Scale(1.0) == PyrowaveQuantization.identityQScaleCode)
+
+    let positive = PyrowaveQuantization.dequantize(coefficient: 2, quantCode: code, qScaleCode: PyrowaveQuantization.identityQScaleCode)
+    let negative = PyrowaveQuantization.dequantize(coefficient: -2, quantCode: code, qScaleCode: PyrowaveQuantization.identityQScaleCode)
+    #expect(abs(positive - 2.5 / 1024.0) < 0.000001)
+    #expect(abs(negative + 2.5 / 1024.0) < 0.000001)
 }
