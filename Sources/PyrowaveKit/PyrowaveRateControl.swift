@@ -107,6 +107,38 @@ enum PyrowaveRateController {
             }
         }
 
+        let packetByteCosts = try makePacketByteCosts(
+            blockIndex: blockIndex,
+            coefficients: coefficients,
+            stride: stride,
+            originX: originX,
+            originY: originY,
+            validWidth: validWidth,
+            validHeight: validHeight,
+            quantCode: quantCode,
+            qScaleCode: qScaleCode,
+            qScaleCodes: qScaleCodes
+        )
+
+        return PyrowaveRateControlBlock(
+            blockIndex: blockIndex,
+            eightByEightStats: stats,
+            packetByteCosts: packetByteCosts
+        )
+    }
+
+    static func makePacketByteCosts(
+        blockIndex: Int,
+        coefficients: [Int16],
+        stride: Int,
+        originX: Int,
+        originY: Int,
+        validWidth: Int,
+        validHeight: Int,
+        quantCode: UInt8,
+        qScaleCode: UInt8 = PyrowaveQuantization.identityQScaleCode,
+        qScaleCodes: [UInt8]? = nil
+    ) throws -> [Int] {
         var packetByteCosts = [Int]()
         packetByteCosts.reserveCapacity(PyrowaveBlockStats.candidateCount)
         for quantLevel in 0..<PyrowaveBlockStats.candidateCount {
@@ -126,12 +158,7 @@ enum PyrowaveRateController {
             )
             packetByteCosts.append(packet?.count ?? 0)
         }
-
-        return PyrowaveRateControlBlock(
-            blockIndex: blockIndex,
-            eightByEightStats: stats,
-            packetByteCosts: packetByteCosts
-        )
+        return packetByteCosts
     }
 
     static func selectThresholds(

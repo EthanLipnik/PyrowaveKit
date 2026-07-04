@@ -32,6 +32,26 @@ struct SparseApplyConstants {
     uint sampleCount;
 };
 
+struct RateControlStatsDescriptor {
+    uint originX;
+    uint originY;
+    uint validWidth;
+    uint validHeight;
+    uint stride;
+    uint quantCode;
+    uint qScaleCode;
+    float distortionScale;
+};
+
+struct RateControlQuantStats {
+    float squareError;
+    uint encodeCostBits;
+};
+
+struct RateControlStatsConstants {
+    uint descriptorCount;
+};
+
 struct DWTConstants {
     uint activeWidth;
     uint activeHeight;
@@ -106,11 +126,21 @@ static inline uchar pyrowave_encode_8x8_scale_code(float maxScaledCoefficient) {
 static inline float pyrowave_decode_block_scale(uint quantCode) {
     int exponent = 4 - int(quantCode >> 3u);
     uint mantissa = quantCode & 7u;
-    return (float(8u + mantissa) * exp2(float(20 + exponent))) / (8.0f * 1024.0f * 1024.0f);
+    uint scaleShift = uint(20 + exponent);
+    return float((8u + mantissa) * (1u << scaleShift)) / (8.0f * 1024.0f * 1024.0f);
 }
 
 static inline float pyrowave_decode_8x8_scale(uint code) {
     return float(code) / 8.0f + 0.25f;
+}
+
+static inline uint pyrowave_significant_bit_count(uint value) {
+    uint bits = 0u;
+    while (value != 0u) {
+        value >>= 1u;
+        bits += 1u;
+    }
+    return bits;
 }
 
 kernel void pyrowave_quantize_plane_tiles(
@@ -188,6 +218,75 @@ kernel void pyrowave_apply_sparse_coefficients(
     samples[entry.destinationOffset] = value
         * pyrowave_decode_block_scale(entry.quantCode)
         * pyrowave_decode_8x8_scale(entry.qScaleCode);
+}
+
+kernel void pyrowave_rate_control_tile_stats(
+    device const short *coefficients [[buffer(0)]],
+    device const RateControlStatsDescriptor *descriptors [[buffer(1)]],
+    device uint *numPlanes [[buffer(2)]],
+    device RateControlQuantStats *stats [[buffer(3)]],
+    constant RateControlStatsConstants &constants [[buffer(4)]],
+    uint descriptorIndex [[thread_position_in_grid]]
+) {
+    if (descriptorIndex >= constants.descriptorCount) {
+        return;
+    }
+
+    RateControlStatsDescriptor descriptor = descriptors[descriptorIndex];
+    uint statsOffset = descriptorIndex * 15u;
+    if (descriptor.validWidth == 0u || descriptor.validHeight == 0u) {
+        numPlanes[descriptorIndex] = 0u;
+        for (uint quantLevel = 0u; quantLevel < 15u; ++quantLevel) {
+            stats[statsOffset + quantLevel] = RateControlQuantStats{0.0f, 0u};
+        }
+        return;
+    }
+
+    uint maximumMagnitude = 0u;
+    for (uint y = 0u; y < descriptor.validHeight; ++y) {
+        uint row = (descriptor.originY + y) * descriptor.stride + descriptor.originX;
+        for (uint x = 0u; x < descriptor.validWidth; ++x) {
+            int coefficient = int(coefficients[row + x]);
+            uint magnitude = uint(abs(coefficient));
+            maximumMagnitude = max(maximumMagnitude, magnitude);
+        }
+    }
+
+    numPlanes[descriptorIndex] = maximumMagnitude == 0u ? 0u : min(14u, pyrowave_significant_bit_count(maximumMagnitude));
+    float coefficientToSampleScale = pyrowave_decode_block_scale(descriptor.quantCode)
+        * pyrowave_decode_8x8_scale(descriptor.qScaleCode);
+    float distortionWeight = coefficientToSampleScale * coefficientToSampleScale * descriptor.distortionScale;
+
+    for (uint quantLevel = 0u; quantLevel < 15u; ++quantLevel) {
+        float squareError = 0.0f;
+        uint encodeCostBits = 0u;
+        uint retainedValues = 0u;
+
+        for (uint y = 0u; y < descriptor.validHeight; ++y) {
+            uint row = (descriptor.originY + y) * descriptor.stride + descriptor.originX;
+            for (uint x = 0u; x < descriptor.validWidth; ++x) {
+                int coefficient = int(coefficients[row + x]);
+                uint magnitude = uint(abs(coefficient));
+                uint retainedMagnitude = magnitude >> quantLevel;
+                if (retainedMagnitude != 0u) {
+                    retainedValues += 1u;
+                    encodeCostBits += pyrowave_significant_bit_count(retainedMagnitude);
+                    if (quantLevel != 0u) {
+                        float reconstructedMagnitude = (float(retainedMagnitude) + 0.5f) * float(1u << quantLevel);
+                        float delta = float(magnitude) - reconstructedMagnitude;
+                        squareError += delta * delta * distortionWeight;
+                    }
+                } else {
+                    squareError += float(magnitude * magnitude) * distortionWeight;
+                }
+            }
+        }
+
+        if (retainedValues != 0u) {
+            encodeCostBits += retainedValues;
+        }
+        stats[statsOffset + quantLevel] = RateControlQuantStats{squareError, encodeCostBits};
+    }
 }
 
 kernel void pyrowave_dwt_lift_rows(

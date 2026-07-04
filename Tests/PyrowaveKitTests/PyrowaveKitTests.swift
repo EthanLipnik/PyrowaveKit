@@ -299,6 +299,7 @@ import Testing
         _ = try backend.makeFunction(named: "pyrowave_dequantize")
         _ = try backend.makeFunction(named: "pyrowave_quantize_plane_tiles")
         _ = try backend.makeFunction(named: "pyrowave_apply_sparse_coefficients")
+        _ = try backend.makeFunction(named: "pyrowave_rate_control_tile_stats")
     } catch PyrowaveError.externalToolUnavailable {
         return
     }
@@ -341,7 +342,9 @@ import Testing
     let entries = [
         MetalSparseCoefficientEntry(destinationOffset: 7, coefficient: -9, quantCode: UInt32(quantCode), qScaleCode: 3),
         MetalSparseCoefficientEntry(destinationOffset: 2, coefficient: 14, quantCode: UInt32(quantCode), qScaleCode: 6),
-        MetalSparseCoefficientEntry(destinationOffset: 11, coefficient: 1, quantCode: UInt32(quantCode), qScaleCode: 15)
+        MetalSparseCoefficientEntry(destinationOffset: 11, coefficient: 1, quantCode: UInt32(quantCode), qScaleCode: 15),
+        MetalSparseCoefficientEntry(destinationOffset: 13, coefficient: -3, quantCode: 0, qScaleCode: 6),
+        MetalSparseCoefficientEntry(destinationOffset: 14, coefficient: 5, quantCode: 96, qScaleCode: 9)
     ]
     let metal = try backend.applySparseCoefficients(sampleCount: 16, entries: entries)
     var cpu = Array(repeating: Float(0), count: 16)
@@ -356,6 +359,75 @@ import Testing
     let maxError = zip(metal, cpu).map { abs($0 - $1) }.max() ?? 0
     #expect(maxError < 0.000001)
     #expect(try backend.applySparseCoefficients(sampleCount: 5, entries: []) == Array(repeating: Float(0), count: 5))
+    #endif
+}
+
+@Test func metalRateControlStatsMatchCPUReferenceWhenDeviceExists() throws {
+    #if canImport(Metal)
+    let backend: MetalPyrowaveBackend
+    do {
+        backend = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let stride = PyrowaveBitstream.coefficientBlockSize
+    var coefficients = Array(repeating: Int16(0), count: stride * stride)
+    for y in 0..<stride {
+        for x in 0..<stride {
+            let raw = ((x * 37 + y * 19 + x * y) % 257) - 128
+            coefficients[y * stride + x] = Int16(raw)
+        }
+    }
+
+    let quantCode = try PyrowaveQuantization.encodeBlockScale(1.0 / 1024.0)
+    let qScaleCodes = (0..<16).map { UInt8(3 + ($0 % 9)) }
+    let validWidth = 29
+    let validHeight = 27
+    let distortionScale = Float(1.375)
+    let cpu = try PyrowaveRateController.makeBlock(
+        blockIndex: 0,
+        coefficients: coefficients,
+        stride: stride,
+        originX: 0,
+        originY: 0,
+        validWidth: validWidth,
+        validHeight: validHeight,
+        quantCode: quantCode,
+        qScaleCodes: qScaleCodes,
+        rdoDistortionScale: distortionScale
+    )
+
+    var descriptors = [MetalRateControlStatsDescriptor]()
+    for tileY in 0..<4 {
+        for tileX in 0..<4 {
+            let tileIndex = tileY * 4 + tileX
+            descriptors.append(MetalRateControlStatsDescriptor(
+                originX: UInt32(tileX * PyrowaveBitstream.smallBlockSize),
+                originY: UInt32(tileY * PyrowaveBitstream.smallBlockSize),
+                validWidth: UInt32(max(0, min(PyrowaveBitstream.smallBlockSize, validWidth - tileX * PyrowaveBitstream.smallBlockSize))),
+                validHeight: UInt32(max(0, min(PyrowaveBitstream.smallBlockSize, validHeight - tileY * PyrowaveBitstream.smallBlockSize))),
+                stride: UInt32(stride),
+                quantCode: UInt32(quantCode),
+                qScaleCode: UInt32(qScaleCodes[tileIndex]),
+                distortionScale: distortionScale
+            ))
+        }
+    }
+
+    let metal = try backend.rateControlTileStats(coefficients: coefficients, descriptors: descriptors)
+    #expect(metal.count == cpu.eightByEightStats.count)
+    for index in metal.indices {
+        #expect(metal[index].numPlanes == cpu.eightByEightStats[index].numPlanes)
+        #expect(metal[index].stats.count == PyrowaveBlockStats.candidateCount)
+        for quantLevel in 0..<PyrowaveBlockStats.candidateCount {
+            let metalStat = metal[index].stats[quantLevel]
+            let cpuStat = cpu.eightByEightStats[index].stats[quantLevel]
+            #expect(metalStat.encodeCostBits == UInt32(cpuStat.encodeCostBits))
+            let converted = PyrowaveQuantStats(squareError: metalStat.squareError, encodeCostBits: Int(metalStat.encodeCostBits))
+            #expect(abs(converted.squareError - cpuStat.squareError) < 0.0001)
+        }
+    }
     #endif
 }
 
@@ -383,6 +455,30 @@ import Testing
         let decodedMetal = try PyrowaveCodec(useMetalAcceleration: true).decode(metal)
         #expect(decodedMetal == decodedCPU)
     }
+    #endif
+}
+
+@Test func metalCappedRateControlMatchesCPUReferenceWhenDeviceExists() throws {
+    #if canImport(Metal)
+    do {
+        _ = try MetalPyrowaveBackend()
+    } catch PyrowaveError.externalToolUnavailable {
+        return
+    }
+
+    let frame = try TestFrames.synthetic420(width: 160, height: 96)
+    let baseline = try PyrowaveCodec(useMetalAcceleration: false).encode(
+        frame,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0)
+    )
+    let configuration = CodecConfiguration(
+        quantizationStep: 1.0 / 2048.0,
+        maximumEncodedBytes: baseline.data.count - 200
+    )
+    let cpu = try PyrowaveCodec(useMetalAcceleration: false).encode(frame, configuration: configuration)
+    let metal = try PyrowaveCodec(useMetalAcceleration: true).encode(frame, configuration: configuration)
+    #expect(cpu.data.count <= configuration.maximumEncodedBytes!)
+    #expect(metal.data == cpu.data)
     #endif
 }
 

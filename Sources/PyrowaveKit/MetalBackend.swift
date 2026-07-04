@@ -11,6 +11,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     private let dequantizePipeline: MTLComputePipelineState
     private let quantizePlaneTilesPipeline: MTLComputePipelineState
     private let sparseApplyPipeline: MTLComputePipelineState
+    private let rateControlStatsPipeline: MTLComputePipelineState
     private let dwtLiftRowsPipeline: MTLComputePipelineState
     private let dwtLiftColumnsPipeline: MTLComputePipelineState
     private let dwtPackRowsPipeline: MTLComputePipelineState
@@ -43,6 +44,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         dequantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dequantize", library: library))
         quantizePlaneTilesPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize_plane_tiles", library: library))
         sparseApplyPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_apply_sparse_coefficients", library: library))
+        rateControlStatsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_tile_stats", library: library))
         dwtLiftRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_rows", library: library))
         dwtLiftColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_columns", library: library))
         dwtPackRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_pack_rows", library: library))
@@ -191,6 +193,69 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
 
         let pointer = output.contents().bindMemory(to: Float.self, capacity: sampleCount)
         return Array(UnsafeBufferPointer(start: pointer, count: sampleCount))
+    }
+
+    func rateControlTileStats(
+        coefficients: [Int16],
+        descriptors: [MetalRateControlStatsDescriptor]
+    ) throws -> [MetalRateControlTileStats] {
+        guard !coefficients.isEmpty else {
+            throw PyrowaveError.invalidDimensions
+        }
+        guard !descriptors.isEmpty else {
+            return []
+        }
+        guard descriptors.count <= Int(UInt32.max) else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        let numPlanes = Array(repeating: UInt32(0), count: descriptors.count)
+        let stats = Array(
+            repeating: MetalRateControlQuantStats(squareError: 0, encodeCostBits: 0),
+            count: descriptors.count * PyrowaveBlockStats.candidateCount
+        )
+        guard let coefficientBuffer = device.makeBuffer(bytes: coefficients, length: coefficients.count * MemoryLayout<Int16>.stride, options: .storageModeShared),
+              let descriptorBuffer = device.makeBuffer(bytes: descriptors, length: descriptors.count * MemoryLayout<MetalRateControlStatsDescriptor>.stride, options: .storageModeShared),
+              let numPlanesBuffer = device.makeBuffer(bytes: numPlanes, length: numPlanes.count * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let statsBuffer = device.makeBuffer(bytes: stats, length: stats.count * MemoryLayout<MetalRateControlQuantStats>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal rate-control buffers")
+        }
+
+        var constants = RateControlStatsConstants(descriptorCount: UInt32(descriptors.count))
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal rate-control command encoder")
+        }
+
+        encoder.setComputePipelineState(rateControlStatsPipeline)
+        encoder.setBuffer(coefficientBuffer, offset: 0, index: 0)
+        encoder.setBuffer(descriptorBuffer, offset: 0, index: 1)
+        encoder.setBuffer(numPlanesBuffer, offset: 0, index: 2)
+        encoder.setBuffer(statsBuffer, offset: 0, index: 3)
+        encoder.setBytes(&constants, length: MemoryLayout<RateControlStatsConstants>.stride, index: 4)
+        let width = min(rateControlStatsPipeline.maxTotalThreadsPerThreadgroup, 256)
+        encoder.dispatchThreads(
+            MTLSize(width: descriptors.count, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal rate-control command failed: \(error)")
+        }
+
+        let numPlanesPointer = numPlanesBuffer.contents().bindMemory(to: UInt32.self, capacity: descriptors.count)
+        let statsPointer = statsBuffer.contents().bindMemory(to: MetalRateControlQuantStats.self, capacity: stats.count)
+        let metalNumPlanes = Array(UnsafeBufferPointer(start: numPlanesPointer, count: descriptors.count))
+        let metalStats = Array(UnsafeBufferPointer(start: statsPointer, count: stats.count))
+
+        return metalNumPlanes.indices.map { index in
+            let start = index * PyrowaveBlockStats.candidateCount
+            let end = start + PyrowaveBlockStats.candidateCount
+            return MetalRateControlTileStats(numPlanes: metalNumPlanes[index], stats: Array(metalStats[start..<end]))
+        }
     }
 
     public func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
@@ -591,6 +656,27 @@ struct MetalSparseCoefficientEntry {
     var qScaleCode: UInt32
 }
 
+struct MetalRateControlStatsDescriptor {
+    var originX: UInt32
+    var originY: UInt32
+    var validWidth: UInt32
+    var validHeight: UInt32
+    var stride: UInt32
+    var quantCode: UInt32
+    var qScaleCode: UInt32
+    var distortionScale: Float
+}
+
+struct MetalRateControlQuantStats {
+    var squareError: Float
+    var encodeCostBits: UInt32
+}
+
+struct MetalRateControlTileStats {
+    var numPlanes: UInt32
+    var stats: [MetalRateControlQuantStats]
+}
+
 private struct PlaneQuantizationConstants {
     var descriptorCount: UInt32
 }
@@ -598,6 +684,10 @@ private struct PlaneQuantizationConstants {
 private struct SparseApplyConstants {
     var entryCount: UInt32
     var sampleCount: UInt32
+}
+
+private struct RateControlStatsConstants {
+    var descriptorCount: UInt32
 }
 
 private struct DWTConstants {
@@ -632,6 +722,13 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         throw PyrowaveError.externalToolUnavailable("Metal")
     }
 
+    func rateControlTileStats(
+        coefficients: [Int16],
+        descriptors: [MetalRateControlStatsDescriptor]
+    ) throws -> [MetalRateControlTileStats] {
+        throw PyrowaveError.externalToolUnavailable("Metal")
+    }
+
     public func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {
         throw PyrowaveError.externalToolUnavailable("Metal")
     }
@@ -661,5 +758,26 @@ struct MetalSparseCoefficientEntry {
     var coefficient: Int32
     var quantCode: UInt32
     var qScaleCode: UInt32
+}
+
+struct MetalRateControlStatsDescriptor {
+    var originX: UInt32
+    var originY: UInt32
+    var validWidth: UInt32
+    var validHeight: UInt32
+    var stride: UInt32
+    var quantCode: UInt32
+    var qScaleCode: UInt32
+    var distortionScale: Float
+}
+
+struct MetalRateControlQuantStats {
+    var squareError: Float
+    var encodeCostBits: UInt32
+}
+
+struct MetalRateControlTileStats {
+    var numPlanes: UInt32
+    var stats: [MetalRateControlQuantStats]
 }
 #endif
