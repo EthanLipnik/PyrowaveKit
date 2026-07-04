@@ -9,6 +9,8 @@ public struct YUV4MPEGReader {
     public let height: Int
     public let chroma: ChromaSubsampling
     public let bitDepth: Int
+    public let frameRateNumerator: Int
+    public let frameRateDenominator: Int
     public let headerParameters: String
 
     public init(url: URL) throws {
@@ -21,6 +23,9 @@ public struct YUV4MPEGReader {
         width = try Self.parseRequiredInt(prefix: "W", parameters: headerParameters)
         height = try Self.parseRequiredInt(prefix: "H", parameters: headerParameters)
         let chromaToken = Self.parseChromaToken(parameters: headerParameters)
+        let frameRate = try Self.parseFrameRate(parameters: headerParameters)
+        frameRateNumerator = frameRate.numerator
+        frameRateDenominator = frameRate.denominator
 
         if chromaToken?.hasPrefix("C444") == true {
             chroma = .yuv444
@@ -80,6 +85,21 @@ public struct YUV4MPEGReader {
             return depth
         }
         return 8
+    }
+
+    private static func parseFrameRate(parameters: String) throws -> (numerator: Int, denominator: Int) {
+        for token in parameters.split(separator: " ") where token.hasPrefix("F") {
+            let values = token.dropFirst().split(separator: ":", maxSplits: 1)
+            guard values.count == 2,
+                  let numerator = Int(values[0]),
+                  let denominator = Int(values[1]),
+                  numerator > 0,
+                  denominator > 0 else {
+                throw PyrowaveError.unsupportedFormat("bad frame rate \(token)")
+            }
+            return (numerator, denominator)
+        }
+        return (60, 1)
     }
 
     private static func parseRequiredInt(prefix: String, parameters: String) throws -> Int {

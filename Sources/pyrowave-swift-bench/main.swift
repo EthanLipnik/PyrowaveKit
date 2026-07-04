@@ -89,7 +89,14 @@ struct Arguments {
     }
 }
 
-func loadFrames(arguments: Arguments) throws -> [YUVFrame] {
+struct LoadedFrames {
+    var frames: [YUVFrame]
+    var frameRateNumerator: Int
+    var frameRateDenominator: Int
+    var bitDepth: Int
+}
+
+func loadFrames(arguments: Arguments) throws -> LoadedFrames {
     if let input = arguments.input {
         var reader = try YUV4MPEGReader(url: input)
         var frames = [YUVFrame]()
@@ -97,14 +104,21 @@ func loadFrames(arguments: Arguments) throws -> [YUVFrame] {
             frames.append(frame)
         }
         guard !frames.isEmpty else { throw PyrowaveError.truncatedInput }
-        return frames
+        return LoadedFrames(
+            frames: frames,
+            frameRateNumerator: reader.frameRateNumerator,
+            frameRateDenominator: reader.frameRateDenominator,
+            bitDepth: reader.bitDepth
+        )
     }
 
-    return try (0..<arguments.frames).map { try TestFrames.synthetic420(width: arguments.width, height: arguments.height, frameIndex: $0) }
+    let frames = try (0..<arguments.frames).map { try TestFrames.synthetic420(width: arguments.width, height: arguments.height, frameIndex: $0) }
+    return LoadedFrames(frames: frames, frameRateNumerator: 60, frameRateDenominator: 1, bitDepth: 8)
 }
 
-func runPyrowave(frames: [YUVFrame], configuration: CodecConfiguration, outputDirectory: URL) throws -> CodecBenchmarkResult {
+func runPyrowave(loaded: LoadedFrames, configuration: CodecConfiguration, outputDirectory: URL) throws -> CodecBenchmarkResult {
     let codec = try PyrowaveCodec()
+    let frames = loaded.frames
     var encodedFrames = [EncodedFrame]()
     encodedFrames.reserveCapacity(frames.count)
 
@@ -125,7 +139,12 @@ func runPyrowave(frames: [YUVFrame], configuration: CodecConfiguration, outputDi
     if let firstFrame = frames.first {
         var stream = try PyrowaveStreamWriter(
             url: outputDirectory.appendingPathComponent("pyrowave-sample.pwks"),
-            header: PyrowaveStreamHeader(frame: firstFrame)
+            header: PyrowaveStreamHeader(
+                frame: firstFrame,
+                frameRateNumerator: loaded.frameRateNumerator,
+                frameRateDenominator: loaded.frameRateDenominator,
+                bitDepth: loaded.bitDepth
+            )
         )
         for frame in encodedFrames {
             try stream.writeFrame(frame)
@@ -146,13 +165,14 @@ func runPyrowave(frames: [YUVFrame], configuration: CodecConfiguration, outputDi
 do {
     let arguments = try Arguments()
     try FileManager.default.createDirectory(at: arguments.outputDirectory, withIntermediateDirectories: true)
-    let frames = try loadFrames(arguments: arguments)
+    let loaded = try loadFrames(arguments: arguments)
+    let frames = loaded.frames
     let pyrowaveBudget = arguments.maximumPyrowaveBytes ?? (arguments.matchHEVCFrameBudget ? max(1, arguments.bitrate / 8 / 60) : nil)
     let configuration = CodecConfiguration(
         quantizationStep: arguments.quantizationStep,
         maximumEncodedBytes: pyrowaveBudget
     )
-    let pyrowave = try runPyrowave(frames: frames, configuration: configuration, outputDirectory: arguments.outputDirectory)
+    let pyrowave = try runPyrowave(loaded: loaded, configuration: configuration, outputDirectory: arguments.outputDirectory)
     let hevc = try HEVCComparison.runFFmpegVideoToolboxComparison(
         reference: frames[0],
         workingDirectory: arguments.outputDirectory,

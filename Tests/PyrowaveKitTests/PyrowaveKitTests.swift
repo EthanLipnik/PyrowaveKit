@@ -68,6 +68,8 @@ import Testing
     try writer.writeFrame(frame)
 
     var reader = try YUV4MPEGReader(url: url)
+    #expect(reader.frameRateNumerator == 60)
+    #expect(reader.frameRateDenominator == 1)
     let decoded = try #require(try reader.readFrame())
     #expect(decoded == frame)
 }
@@ -96,7 +98,7 @@ import Testing
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     let url = directory.appendingPathComponent("sample10.y4m")
 
-    var data = Data("YUV4MPEG2 W2 H2 F60:1 Ip A1:1 C420p10 XCOLORRANGE=LIMITED\nFRAME\n".utf8)
+    var data = Data("YUV4MPEG2 W2 H2 F30000:1001 Ip A1:1 C420p10 XCOLORRANGE=LIMITED\nFRAME\n".utf8)
     for sample in [0, 512, 1023, 256, 128, 768] {
         data.append(UInt8(sample & 0xff))
         data.append(UInt8((sample >> 8) & 0xff))
@@ -106,6 +108,8 @@ import Testing
     var reader = try YUV4MPEGReader(url: url)
     #expect(reader.bitDepth == 10)
     #expect(reader.chroma == .yuv420)
+    #expect(reader.frameRateNumerator == 30000)
+    #expect(reader.frameRateDenominator == 1001)
     let frame = try #require(try reader.readFrame())
     #expect(frame.videoSignal.yCbCrRange == .limited)
     #expect(frame.y.data == [0, 128, 255, 64])
@@ -133,6 +137,17 @@ import Testing
     #expect(frame.y.data == [255])
     #expect(frame.cb.data == [128])
     #expect(frame.cr.data == [0])
+}
+
+@Test func yuv4mpegRejectsBadFrameRate() throws {
+    let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("bad-rate.y4m")
+    try Data("YUV4MPEG2 W2 H2 F60:0 Ip A1:1 C420jpeg\n".utf8).write(to: url)
+
+    #expect(throws: PyrowaveError.unsupportedFormat("bad frame rate F60:0")) {
+        _ = try YUV4MPEGReader(url: url)
+    }
 }
 
 @Test func metalBackendCompilesKernelsWhenDeviceExists() throws {
