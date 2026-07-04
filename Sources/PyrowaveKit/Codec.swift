@@ -733,7 +733,7 @@ public final class PyrowaveCodec: Sendable {
 
     private func finishDecodedPlane(_ plane: DecodedPlane) throws -> Plane8 {
         let reconstructed = try inverseWavelet(plane.samples, width: plane.paddedWidth, height: plane.paddedHeight, levels: plane.levels)
-        return try Wavelet.cropPlane(reconstructed, paddedWidth: plane.paddedWidth, width: plane.visibleWidth, height: plane.visibleHeight)
+        return try cropPlane(reconstructed, paddedWidth: plane.paddedWidth, width: plane.visibleWidth, height: plane.visibleHeight)
     }
 
     private func planeBlockDescriptors(plane: EncodedPlane, layout: PyrowaveBlockLayout) -> [PlaneBlockDescriptor] {
@@ -833,6 +833,14 @@ public final class PyrowaveCodec: Sendable {
         }
 
         return Wavelet.padPlane(plane, paddedWidth: paddedWidth, paddedHeight: paddedHeight).samples
+    }
+
+    private func cropPlane(_ samples: [Float], paddedWidth: Int, width: Int, height: Int) throws -> Plane8 {
+        if let metalBackend {
+            return try metalBackend.cropPlane(samples, paddedWidth: paddedWidth, width: width, height: height)
+        }
+
+        return try Wavelet.cropPlane(samples, paddedWidth: paddedWidth, width: width, height: height)
     }
 
     private func forwardWavelet(_ samples: [Float], width: Int, height: Int, levels: Int) throws -> [Float] {

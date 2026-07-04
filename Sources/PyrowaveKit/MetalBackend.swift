@@ -8,6 +8,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     public let commandQueue: MTLCommandQueue
     public let library: MTLLibrary
     private let padPlanePipeline: MTLComputePipelineState
+    private let cropPlanePipeline: MTLComputePipelineState
     private let quantizePipeline: MTLComputePipelineState
     private let dequantizePipeline: MTLComputePipelineState
     private let quantizePlaneTilesPipeline: MTLComputePipelineState
@@ -42,6 +43,7 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
         }
 
         padPlanePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_pad_plane", library: library))
+        cropPlanePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_crop_plane", library: library))
         quantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize", library: library))
         dequantizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dequantize", library: library))
         quantizePlaneTilesPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_quantize_plane_tiles", library: library))
@@ -111,6 +113,58 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
 
         let pointer = output.contents().bindMemory(to: Float.self, capacity: sampleCount)
         return Array(UnsafeBufferPointer(start: pointer, count: sampleCount))
+    }
+
+    func cropPlane(_ samples: [Float], paddedWidth: Int, width: Int, height: Int) throws -> Plane8 {
+        guard paddedWidth > 0,
+              width > 0,
+              height > 0,
+              paddedWidth <= Int(UInt32.max),
+              width <= Int(UInt32.max),
+              height <= Int(UInt32.max),
+              samples.count >= paddedWidth * height else {
+            throw PyrowaveError.invalidDimensions
+        }
+        let outputCount = width * height
+        guard outputCount > 0, outputCount <= Int(UInt32.max) else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        guard let input = device.makeBuffer(bytes: samples, length: samples.count * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let output = device.makeBuffer(length: outputCount * MemoryLayout<UInt8>.stride, options: .storageModeShared) else {
+            throw PyrowaveError.processFailed("failed to allocate Metal plane crop buffers")
+        }
+
+        var constants = CropPlaneConstants(
+            paddedWidth: UInt32(paddedWidth),
+            outputWidth: UInt32(width),
+            outputHeight: UInt32(height)
+        )
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal plane crop command encoder")
+        }
+
+        encoder.setComputePipelineState(cropPlanePipeline)
+        encoder.setBuffer(input, offset: 0, index: 0)
+        encoder.setBuffer(output, offset: 0, index: 1)
+        encoder.setBytes(&constants, length: MemoryLayout<CropPlaneConstants>.stride, index: 2)
+        let threadWidth = min(16, cropPlanePipeline.maxTotalThreadsPerThreadgroup)
+        let threadHeight = max(1, min(16, cropPlanePipeline.maxTotalThreadsPerThreadgroup / threadWidth))
+        encoder.dispatchThreads(
+            MTLSize(width: width, height: height, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threadWidth, height: threadHeight, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw PyrowaveError.processFailed("Metal plane crop command failed: \(error)")
+        }
+
+        let pointer = output.contents().bindMemory(to: UInt8.self, capacity: outputCount)
+        return try Plane8(width: width, height: height, data: Array(UnsafeBufferPointer(start: pointer, count: outputCount)))
     }
 
     public func quantize(_ samples: [Float], quantizationStep: Float) throws -> [Int16] {
@@ -738,6 +792,12 @@ private struct PadPlaneConstants {
     var paddedHeight: UInt32
 }
 
+private struct CropPlaneConstants {
+    var paddedWidth: UInt32
+    var outputWidth: UInt32
+    var outputHeight: UInt32
+}
+
 private struct PlaneQuantizationConstants {
     var descriptorCount: UInt32
 }
@@ -764,6 +824,10 @@ public final class MetalPyrowaveBackend: @unchecked Sendable {
     }
 
     func padPlane(_ plane: Plane8, paddedWidth: Int, paddedHeight: Int) throws -> [Float] {
+        throw PyrowaveError.externalToolUnavailable("Metal")
+    }
+
+    func cropPlane(_ samples: [Float], paddedWidth: Int, width: Int, height: Int) throws -> Plane8 {
         throw PyrowaveError.externalToolUnavailable("Metal")
     }
 

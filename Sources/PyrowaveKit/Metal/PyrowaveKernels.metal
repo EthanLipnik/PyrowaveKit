@@ -13,6 +13,12 @@ struct PadPlaneConstants {
     uint paddedHeight;
 };
 
+struct CropPlaneConstants {
+    uint paddedWidth;
+    uint outputWidth;
+    uint outputHeight;
+};
+
 struct PlaneQuantizationDescriptor {
     uint originX;
     uint originY;
@@ -111,6 +117,22 @@ kernel void pyrowave_pad_plane(
     uint sourceX = mirrorPadIndex(x, constants.sourceWidth);
     uint sourceY = mirrorPadIndex(y, constants.sourceHeight);
     output[y * constants.paddedWidth + x] = float(input[sourceY * constants.sourceWidth + sourceX]) / 255.0f - 0.5f;
+}
+
+kernel void pyrowave_crop_plane(
+    device const float *input [[buffer(0)]],
+    device uchar *output [[buffer(1)]],
+    constant CropPlaneConstants &constants [[buffer(2)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    uint x = position.x;
+    uint y = position.y;
+    if (x >= constants.outputWidth || y >= constants.outputHeight) {
+        return;
+    }
+
+    float normalized = clamp(input[y * constants.paddedWidth + x] + 0.5f, 0.0f, 1.0f);
+    output[y * constants.outputWidth + x] = uchar(round(normalized * 255.0f));
 }
 
 kernel void pyrowave_quantize(
