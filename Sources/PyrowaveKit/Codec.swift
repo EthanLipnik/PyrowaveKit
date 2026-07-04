@@ -48,7 +48,8 @@ public final class PyrowaveCodec: Sendable {
             height: frame.height,
             sequence: 0,
             totalBlocks: sortedBlocks.count,
-            chroma: frame.chroma
+            chroma: frame.chroma,
+            videoSignal: frame.videoSignal
         )
         sequence.write(to: &writer)
         for block in sortedBlocks {
@@ -98,7 +99,15 @@ public final class PyrowaveCodec: Sendable {
         let cb = try finishDecodedPlane(decodedPlanes[1])
         let cr = try finishDecodedPlane(decodedPlanes[2])
 
-        return try YUVFrame(width: sequence.width, height: sequence.height, chroma: sequence.chroma, y: y, cb: cb, cr: cr)
+        return try YUVFrame(
+            width: sequence.width,
+            height: sequence.height,
+            chroma: sequence.chroma,
+            y: y,
+            cb: cb,
+            cr: cr,
+            videoSignal: sequence.videoSignal
+        )
     }
 
     private struct EncodedPlane {

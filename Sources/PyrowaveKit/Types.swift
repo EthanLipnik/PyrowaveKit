@@ -40,6 +40,55 @@ public enum ChromaSubsampling: UInt8, Codable, Sendable {
     }
 }
 
+public enum ColorPrimaries: UInt8, Codable, Sendable {
+    case bt709 = 0
+    case bt2020 = 1
+}
+
+public enum TransferFunction: UInt8, Codable, Sendable {
+    case bt709 = 0
+    case pq = 1
+}
+
+public enum YCbCrTransform: UInt8, Codable, Sendable {
+    case bt709 = 0
+    case bt2020 = 1
+}
+
+public enum YCbCrRange: UInt8, Codable, Sendable {
+    case full = 0
+    case limited = 1
+}
+
+public enum ChromaSiting: UInt8, Codable, Sendable {
+    case center = 0
+    case left = 1
+}
+
+public struct VideoSignalMetadata: Codable, Equatable, Sendable {
+    public var colorPrimaries: ColorPrimaries
+    public var transferFunction: TransferFunction
+    public var yCbCrTransform: YCbCrTransform
+    public var yCbCrRange: YCbCrRange
+    public var chromaSiting: ChromaSiting
+
+    public static let `default` = VideoSignalMetadata()
+
+    public init(
+        colorPrimaries: ColorPrimaries = .bt709,
+        transferFunction: TransferFunction = .bt709,
+        yCbCrTransform: YCbCrTransform = .bt709,
+        yCbCrRange: YCbCrRange = .full,
+        chromaSiting: ChromaSiting = .center
+    ) {
+        self.colorPrimaries = colorPrimaries
+        self.transferFunction = transferFunction
+        self.yCbCrTransform = yCbCrTransform
+        self.yCbCrRange = yCbCrRange
+        self.chromaSiting = chromaSiting
+    }
+}
+
 public struct CodecConfiguration: Codable, Equatable, Sendable {
     public var decompositionLevels: Int
     public var quantizationStep: Float
@@ -78,8 +127,17 @@ public struct YUVFrame: Equatable, Sendable {
     public var y: Plane8
     public var cb: Plane8
     public var cr: Plane8
+    public var videoSignal: VideoSignalMetadata
 
-    public init(width: Int, height: Int, chroma: ChromaSubsampling, y: Plane8, cb: Plane8, cr: Plane8) throws {
+    public init(
+        width: Int,
+        height: Int,
+        chroma: ChromaSubsampling,
+        y: Plane8,
+        cb: Plane8,
+        cr: Plane8,
+        videoSignal: VideoSignalMetadata = .default
+    ) throws {
         guard width > 0, height > 0, y.width == width, y.height == height else {
             throw PyrowaveError.invalidDimensions
         }
@@ -97,6 +155,7 @@ public struct YUVFrame: Equatable, Sendable {
         self.y = y
         self.cb = cb
         self.cr = cr
+        self.videoSignal = videoSignal
     }
 }
 

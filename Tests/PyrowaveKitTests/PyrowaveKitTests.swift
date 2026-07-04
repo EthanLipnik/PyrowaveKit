@@ -160,6 +160,31 @@ import Testing
     }
 }
 
+@Test func codecPreservesSequenceVideoSignalMetadata() throws {
+    let source = try TestFrames.synthetic420(width: 64, height: 64)
+    let frame = try YUVFrame(
+        width: source.width,
+        height: source.height,
+        chroma: source.chroma,
+        y: source.y,
+        cb: source.cb,
+        cr: source.cr,
+        videoSignal: VideoSignalMetadata(
+            colorPrimaries: .bt2020,
+            transferFunction: .pq,
+            yCbCrTransform: .bt2020,
+            yCbCrRange: .limited,
+            chromaSiting: .left
+        )
+    )
+
+    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
+    let decoded = try codec.decode(encoded)
+
+    #expect(decoded.videoSignal == frame.videoSignal)
+}
+
 @Test func codecPacketsUseGlobalPyrowaveBlockOrder() throws {
     let frame = try TestFrames.synthetic420(width: 160, height: 96)
     let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
@@ -244,9 +269,30 @@ import Testing
     #expect(decoded == packet)
 
     var sequenceWriter = BinaryWriter()
-    let sequence = try PyrowaveSequenceHeader(width: 6144, height: 3456, sequence: 7, totalBlocks: 12345, chroma: .yuv420)
+    let sequence = try PyrowaveSequenceHeader(
+        width: 6144,
+        height: 3456,
+        sequence: 7,
+        totalBlocks: 12345,
+        chroma: .yuv444,
+        videoSignal: VideoSignalMetadata(
+            colorPrimaries: .bt2020,
+            transferFunction: .pq,
+            yCbCrTransform: .bt2020,
+            yCbCrRange: .limited,
+            chromaSiting: .left
+        )
+    )
     sequence.write(to: &sequenceWriter)
     #expect(sequenceWriter.data.count == 8)
+
+    let bytes = [UInt8](sequenceWriter.data)
+    let secondWord = UInt32(bytes[4]) |
+        (UInt32(bytes[5]) << 8) |
+        (UInt32(bytes[6]) << 16) |
+        (UInt32(bytes[7]) << 24)
+    let upperMetadataBits = secondWord >> 26
+    #expect(upperMetadataBits == 0b11_1111)
 
     var sequenceReader = BinaryReader(sequenceWriter.data)
     #expect(try PyrowaveSequenceHeader(reader: &sequenceReader) == sequence)

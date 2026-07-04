@@ -181,8 +181,16 @@ struct PyrowaveSequenceHeader: Equatable, Sendable {
     var sequence: UInt8
     var totalBlocks: Int
     var chroma: ChromaSubsampling
+    var videoSignal: VideoSignalMetadata
 
-    init(width: Int, height: Int, sequence: UInt8, totalBlocks: Int, chroma: ChromaSubsampling) throws {
+    init(
+        width: Int,
+        height: Int,
+        sequence: UInt8,
+        totalBlocks: Int,
+        chroma: ChromaSubsampling,
+        videoSignal: VideoSignalMetadata = .default
+    ) throws {
         guard width > 0, width <= (1 << 14),
               height > 0, height <= (1 << 14),
               sequence <= PyrowaveBitstream.sequenceCountMask,
@@ -195,6 +203,7 @@ struct PyrowaveSequenceHeader: Equatable, Sendable {
         self.sequence = sequence
         self.totalBlocks = totalBlocks
         self.chroma = chroma
+        self.videoSignal = videoSignal
     }
 
     init(reader: inout BinaryReader) throws {
@@ -213,11 +222,14 @@ struct PyrowaveSequenceHeader: Equatable, Sendable {
             throw PyrowaveError.invalidBitstream("unsupported extended header code \(code)")
         }
 
-        let chromaCode = UInt8((second >> 26) & 0x1)
-        guard let chroma = ChromaSubsampling(rawValue: chromaCode) else {
-            throw PyrowaveError.invalidBitstream("bad chroma code")
-        }
-        self.chroma = chroma
+        chroma = try Self.decodeOneBitField(ChromaSubsampling.self, value: second >> 26, name: "chroma resolution")
+        videoSignal = VideoSignalMetadata(
+            colorPrimaries: try Self.decodeOneBitField(ColorPrimaries.self, value: second >> 27, name: "color primaries"),
+            transferFunction: try Self.decodeOneBitField(TransferFunction.self, value: second >> 28, name: "transfer function"),
+            yCbCrTransform: try Self.decodeOneBitField(YCbCrTransform.self, value: second >> 29, name: "YCbCr transform"),
+            yCbCrRange: try Self.decodeOneBitField(YCbCrRange.self, value: second >> 30, name: "YCbCr range"),
+            chromaSiting: try Self.decodeOneBitField(ChromaSiting.self, value: second >> 31, name: "chroma siting")
+        )
     }
 
     func write(to writer: inout BinaryWriter) {
@@ -229,7 +241,24 @@ struct PyrowaveSequenceHeader: Equatable, Sendable {
 
         var second = UInt32(totalBlocks) & 0x00ff_ffff
         second |= UInt32(chroma.rawValue) << 26
+        second |= UInt32(videoSignal.colorPrimaries.rawValue) << 27
+        second |= UInt32(videoSignal.transferFunction.rawValue) << 28
+        second |= UInt32(videoSignal.yCbCrTransform.rawValue) << 29
+        second |= UInt32(videoSignal.yCbCrRange.rawValue) << 30
+        second |= UInt32(videoSignal.chromaSiting.rawValue) << 31
         writer.append(second)
+    }
+
+    private static func decodeOneBitField<T: RawRepresentable>(
+        _ type: T.Type,
+        value: UInt32,
+        name: String
+    ) throws -> T where T.RawValue == UInt8 {
+        let rawValue = UInt8(value & 0x1)
+        guard let decoded = T(rawValue: rawValue) else {
+            throw PyrowaveError.invalidBitstream("bad \(name) code")
+        }
+        return decoded
     }
 }
 
