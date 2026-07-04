@@ -1,5 +1,147 @@
 import Foundation
 
+public extension EncodedFrame {
+    func packetized(maximumPacketBytes: Int) throws -> [EncodedPacket] {
+        guard maximumPacketBytes >= 8 else {
+            throw PyrowaveError.invalidDimensions
+        }
+
+        var reader = BinaryReader(data)
+        _ = try PyrowaveSequenceHeader(reader: &reader)
+
+        var packets = [EncodedPacket]()
+        var packetStart = 0
+        var packetSize = reader.offset
+
+        while reader.offset < data.count {
+            let blockStart = reader.offset
+            _ = try PyrowaveCoefficientBlockCodec.decodeBlock(reader: &reader)
+            let blockSize = reader.offset - blockStart
+
+            if packetSize + blockSize > maximumPacketBytes, packetSize > 0 {
+                packets.append(EncodedPacket(data: Data(data[packetStart..<(packetStart + packetSize)])))
+                packetStart = blockStart
+                packetSize = 0
+            }
+
+            packetSize += blockSize
+        }
+
+        if packetSize > 0 {
+            packets.append(EncodedPacket(data: Data(data[packetStart..<(packetStart + packetSize)])))
+        }
+
+        return packets
+    }
+}
+
+public final class PyrowavePacketStreamDecoder {
+    private let codec: PyrowaveCodec
+    private var sequenceHeader: PyrowaveSequenceHeader?
+    private var blockPackets = [Int: Data]()
+    private var decodedFrameForCurrentSequence = false
+    private var lastSequence: UInt8?
+
+    public init(useMetalAcceleration: Bool = true) {
+        codec = PyrowaveCodec(useMetalAcceleration: useMetalAcceleration)
+    }
+
+    public func clear() {
+        sequenceHeader = nil
+        blockPackets.removeAll(keepingCapacity: true)
+        decodedFrameForCurrentSequence = false
+        lastSequence = nil
+    }
+
+    public func pushPacket(_ packet: EncodedPacket) throws {
+        try pushPacket(packet.data)
+    }
+
+    public func pushPacket(_ data: Data) throws {
+        var reader = BinaryReader(data)
+        while reader.offset < data.count {
+            let packetStart = reader.offset
+            let header = try PyrowavePacketHeader(reader: &reader)
+
+            if header.extended {
+                try reader.seek(to: packetStart)
+                let sequence = try PyrowaveSequenceHeader(reader: &reader)
+                if isStale(sequence.sequence) {
+                    return
+                }
+                if lastSequence != sequence.sequence {
+                    beginSequence(sequence)
+                } else {
+                    sequenceHeader = sequence
+                }
+                continue
+            }
+
+            let packetEnd = packetStart + Int(header.payloadWords) * 4
+            guard packetEnd <= data.count else {
+                throw PyrowaveError.truncatedInput
+            }
+            guard sequenceHeader != nil else {
+                throw PyrowaveError.invalidBitstream("coefficient packet before sequence header")
+            }
+            if isStale(header.sequence) {
+                return
+            }
+            if lastSequence != header.sequence {
+                throw PyrowaveError.invalidBitstream("coefficient packet sequence has no matching sequence header")
+            }
+
+            if blockPackets[header.blockIndex] == nil {
+                blockPackets[header.blockIndex] = Data(data[packetStart..<packetEnd])
+            }
+            try reader.seek(to: packetEnd)
+        }
+    }
+
+    public func decodeIsReady(allowPartialFrame: Bool = false) -> Bool {
+        guard let sequenceHeader, !decodedFrameForCurrentSequence else {
+            return false
+        }
+        if blockPackets.count < sequenceHeader.totalBlocks {
+            return allowPartialFrame && blockPackets.count > sequenceHeader.totalBlocks / 2
+        }
+        return true
+    }
+
+    public func decode(allowPartialFrame: Bool = false) throws -> YUVFrame {
+        guard decodeIsReady(allowPartialFrame: allowPartialFrame), let sequenceHeader else {
+            throw PyrowaveError.invalidBitstream("packet stream is not ready to decode")
+        }
+
+        var writer = BinaryWriter()
+        sequenceHeader.write(to: &writer)
+        for blockIndex in blockPackets.keys.sorted() {
+            if let packet = blockPackets[blockIndex] {
+                writer.append(data: packet)
+            }
+        }
+
+        let frame = try codec.decode(EncodedFrame(data: writer.data), allowPartialFrame: allowPartialFrame)
+        decodedFrameForCurrentSequence = true
+        return frame
+    }
+
+    private func beginSequence(_ sequence: PyrowaveSequenceHeader) {
+        sequenceHeader = sequence
+        blockPackets.removeAll(keepingCapacity: true)
+        decodedFrameForCurrentSequence = false
+        lastSequence = sequence.sequence
+    }
+
+    private func isStale(_ sequence: UInt8) -> Bool {
+        guard let lastSequence else {
+            return false
+        }
+        let diff = (Int(sequence) - Int(lastSequence)) & PyrowaveBitstream.sequenceCountMask
+        return diff > PyrowaveBitstream.sequenceCountMask / 2
+    }
+}
+
 public final class PyrowaveCodec: Sendable {
     private static let sparseBlockSize = 32
 
@@ -67,6 +209,10 @@ public final class PyrowaveCodec: Sendable {
     }
 
     public func decode(_ frame: EncodedFrame) throws -> YUVFrame {
+        try decode(frame, allowPartialFrame: false)
+    }
+
+    fileprivate func decode(_ frame: EncodedFrame, allowPartialFrame: Bool) throws -> YUVFrame {
         var reader = BinaryReader(frame.data)
         let sequence = try PyrowaveSequenceHeader(reader: &reader)
         let layout = try PyrowaveBlockLayout(width: sequence.width, height: sequence.height, chroma: sequence.chroma)
@@ -90,7 +236,11 @@ public final class PyrowaveCodec: Sendable {
             try applySparseBlock(block, descriptor: descriptor, decodedPlane: &decodedPlanes[target])
         }
 
-        guard seenBlocks.count == sequence.totalBlocks else {
+        if seenBlocks.count < sequence.totalBlocks {
+            guard allowPartialFrame, seenBlocks.count > sequence.totalBlocks / 2 else {
+                throw PyrowaveError.invalidBitstream("expected \(sequence.totalBlocks) blocks, decoded \(seenBlocks.count)")
+            }
+        } else if seenBlocks.count > sequence.totalBlocks {
             throw PyrowaveError.invalidBitstream("expected \(sequence.totalBlocks) blocks, decoded \(seenBlocks.count)")
         }
 

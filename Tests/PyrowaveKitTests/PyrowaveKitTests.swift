@@ -180,6 +180,69 @@ import Testing
     #expect(observedSequences == [1, 2, 3, 4, 5, 6, 7, 0, 1])
 }
 
+@Test func encodedFramePacketizesOnPyrowavePacketBoundaries() throws {
+    let frame = try TestFrames.synthetic420(width: 64, height: 64)
+    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+        frame,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
+    )
+    let packets = try encoded.packetized(maximumPacketBytes: 8)
+
+    var sequenceReader = BinaryReader(encoded.data)
+    let sequence = try PyrowaveSequenceHeader(reader: &sequenceReader)
+    #expect(packets.count == sequence.totalBlocks + 1)
+
+    var reassembled = Data()
+    for packet in packets {
+        reassembled.append(packet.data)
+    }
+    #expect(reassembled == encoded.data)
+}
+
+@Test func packetStreamDecoderReconstructsCompletePacketizedFrame() throws {
+    let frame = try TestFrames.synthetic420(width: 96, height: 64)
+    let codec = PyrowaveCodec(useMetalAcceleration: false)
+    let encoded = try codec.encode(frame, configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0))
+    let expected = try codec.decode(encoded)
+    let packets = try encoded.packetized(maximumPacketBytes: 8)
+    let stream = PyrowavePacketStreamDecoder(useMetalAcceleration: false)
+
+    for packet in packets.dropLast() {
+        try stream.pushPacket(packet)
+        #expect(!stream.decodeIsReady())
+    }
+    try stream.pushPacket(try #require(packets.last))
+    #expect(stream.decodeIsReady())
+    #expect(try stream.decode() == expected)
+    #expect(!stream.decodeIsReady())
+}
+
+@Test func packetStreamDecoderAllowsPartialFrameAfterHalfTheBlocks() throws {
+    let frame = try TestFrames.synthetic420(width: 96, height: 64)
+    let encoded = try PyrowaveCodec(useMetalAcceleration: false).encode(
+        frame,
+        configuration: CodecConfiguration(quantizationStep: 1.0 / 1024.0)
+    )
+    let packets = try encoded.packetized(maximumPacketBytes: 8)
+    let sequencePacket = try #require(packets.first)
+    var sequenceReader = BinaryReader(sequencePacket.data)
+    let sequence = try PyrowaveSequenceHeader(reader: &sequenceReader)
+    let stream = PyrowavePacketStreamDecoder(useMetalAcceleration: false)
+
+    try stream.pushPacket(sequencePacket)
+    for packet in packets.dropFirst().prefix(sequence.totalBlocks / 2) {
+        try stream.pushPacket(packet)
+    }
+    #expect(!stream.decodeIsReady(allowPartialFrame: true))
+
+    try stream.pushPacket(packets[1 + sequence.totalBlocks / 2])
+    #expect(stream.decodeIsReady(allowPartialFrame: true))
+    let decoded = try stream.decode(allowPartialFrame: true)
+    #expect(decoded.width == frame.width)
+    #expect(decoded.height == frame.height)
+    #expect(decoded.chroma == frame.chroma)
+}
+
 @Test func codecPreservesSequenceVideoSignalMetadata() throws {
     let source = try TestFrames.synthetic420(width: 64, height: 64)
     let frame = try YUVFrame(

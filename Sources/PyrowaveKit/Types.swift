@@ -167,6 +167,14 @@ public struct EncodedFrame: Equatable, Sendable {
     }
 }
 
+public struct EncodedPacket: Equatable, Sendable {
+    public var data: Data
+
+    public init(data: Data) {
+        self.data = data
+    }
+}
+
 public struct ComponentMetrics: Codable, Equatable, Sendable {
     public var mse: Double
     public var psnr: Double
