@@ -1,8 +1,8 @@
 # PyrowaveKit
 
-PyrowaveKit is an Apple-only Swift and Metal port of PyroWave. The project is intentionally a hard cutover from the original Vulkan/C++ codebase: the build root is Swift Package Manager, the GPU backend is Metal, and benchmark artifacts are written outside git.
+PyrowaveKit is an Apple-only Swift and Metal port of PyroWave for low-latency local video transport.
 
-The codec remains intra-only and wavelet based. It targets low-latency local video transport where high throughput and predictable frame budgets matter more than broad platform compatibility.
+The port is intentionally native: Swift Package Manager, Metal compute, CoreVideo pixel buffers, VideoToolbox HEVC benchmarks, and no CPU fallback path.
 
 ## Requirements
 
@@ -24,22 +24,23 @@ swift test
 swift test -c release
 ```
 
-The test suite covers the Swift packet format, packet stream decoding, edge-extended source padding plus mirrored wavelet filtering, 4:2:0 and 4:4:4 round trips, rate-control decisions, and Metal parity against internal reference routines when a Metal device is available. Normal codec entry points are Metal texture and CoreVideo pixel-buffer based.
+Coverage includes packet decoding, wavelet padding/filtering, 4:2:0 and 4:4:4 round trips, rate control, and Metal parity checks when a Metal device is available.
 
-## Benchmark
+## Benchmarks
 
-The benchmark compares the Metal GPU-frame Pyrowave path with a Mirage-style realtime HEVC path built directly on VideoToolbox.
+Pyrowave is compared against a Mirage-style realtime HEVC path built on VideoToolbox.
 
 ```shell
 swift run -c release pyrowave-swift-bench --frames 60 --preset 6k --output-dir .pyrowave-results
 ```
 
-Benchmark outputs are written to `.pyrowave-results/`, which is git ignored. Timed encode/decode excludes input loading, pixel-buffer setup, planar conversion for metrics, artifact writes, report serialization, and PSNR calculation.
+Reports are written to `.pyrowave-results/`, which is git ignored.
 
-Policy:
-- Pyrowave is not byte capped.
+Rules:
+- Pyrowave has no byte cap.
 - HEVC quality is capped at `0.8`.
 - HEVC uses realtime VideoToolbox settings: no frame reordering, low delay, Mirage-style QP bounds, `AverageBitRate`, and `DataRateLimits`.
+- Timings exclude loading, pixel-buffer setup, metric conversions, artifact writes, report serialization, and PSNR calculation.
 
 Latest 60-frame results from July 4, 2026:
 
@@ -49,7 +50,7 @@ swift run -c release pyrowave-swift-bench --preset 4k --frames 60 --output-dir .
 swift run -c release pyrowave-swift-bench --preset 6k --frames 60 --output-dir .pyrowave-results/2026-07-04-second-pass-final-hevc-6k-60
 ```
 
-Performance:
+### Performance
 
 | Size | Py encode | Py decode | HEVC encode | HEVC decode | Py encode speedup | Py decode speedup |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -57,7 +58,7 @@ Performance:
 | 4K | 5.017 ms | 1.533 ms | 19.602 ms | 1.388 ms | 3.907x | 0.905x |
 | 6K | 8.211 ms | 3.019 ms | 44.543 ms | 4.107 ms | 5.425x | 1.360x |
 
-Size and quality:
+### Size and Quality
 
 | Size | Py bytes/frame | HEVC bytes/frame | Byte ratio | PSNR delta |
 | --- | ---: | ---: | ---: | ---: |
@@ -65,4 +66,4 @@ Size and quality:
 | 4K | 450,154.7 | 111,520.8 | 4.037x | +0.237 dB |
 | 6K | 1,144,178.2 | 164,876.0 | 6.940x | +6.263 dB |
 
-Pyrowave currently encodes faster at every tested size. Decode is still behind HEVC at 1080p and slightly behind at 4K, but is faster at 6K. Speedups above `1.0x` mean Pyrowave is faster than HEVC.
+Speedups above `1.0x` mean Pyrowave is faster than HEVC. Current results: faster encode at every size, faster decode at 6K, slower decode at 1080p and 4K.
