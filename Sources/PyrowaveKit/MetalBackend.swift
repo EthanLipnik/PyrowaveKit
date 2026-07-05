@@ -64,6 +64,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     private let dwtLiftColumnsPipeline: MTLComputePipelineState
     private let dwtPackRowsPipeline: MTLComputePipelineState
     private let dwtPackColumnsPipeline: MTLComputePipelineState
+    private let dwtCopyActiveRectPipeline: MTLComputePipelineState
     private let dwtTiledLevel0Pipeline: MTLComputePipelineState
     private let dwtUnpackRowsPipeline: MTLComputePipelineState
     private let dwtUnpackColumnsPipeline: MTLComputePipelineState
@@ -121,6 +122,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         dwtLiftColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_lift_columns", library: library))
         dwtPackRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_pack_rows", library: library))
         dwtPackColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_pack_columns", library: library))
+        dwtCopyActiveRectPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_copy_active_rect", library: library))
         dwtTiledLevel0Pipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_tiled_level0", library: library))
         dwtUnpackRowsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_unpack_rows", library: library))
         dwtUnpackColumnsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_dwt_unpack_columns", library: library))
@@ -374,7 +376,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 continue
             }
 
-            if useTiledLevelZero && level == 0 {
+            if useTiledLevelZero {
                 let tiled = active.filter { canUseTiledLevelZero(activeWidth: $0.activeWidth, activeHeight: $0.activeHeight) }
                 if !tiled.isEmpty {
                     try encodeDWTTiledLevelZeroBatch(
@@ -400,6 +402,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 try encodeDWTInPlaceBatch(
                     commandBuffer: commandBuffer,
                     pipeline: dwtLiftRowsPipeline,
+                    axis: .rows,
+                    allSamplesPhase: 4,
                     dispatches: active.map {
                         (buffer: $0.primary, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: phase)
                     }
@@ -417,6 +421,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 try encodeDWTInPlaceBatch(
                     commandBuffer: commandBuffer,
                     pipeline: dwtLiftColumnsPipeline,
+                    axis: .columns,
+                    allSamplesPhase: 4,
                     dispatches: active.map {
                         (buffer: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: phase)
                     }
@@ -2672,7 +2678,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 continue
             }
 
-            if useTiledLevelZero && level == 0 {
+            if useTiledLevelZero {
                 let tiled = active.filter { canUseTiledLevelZero(activeWidth: $0.activeWidth, activeHeight: $0.activeHeight) }
                 if !tiled.isEmpty {
                     try encodeDWTTiledLevelZeroBatch(
@@ -2698,6 +2704,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 try encodeDWTInPlaceBatch(
                     commandBuffer: commandBuffer,
                     pipeline: dwtLiftRowsPipeline,
+                    axis: .rows,
+                    allSamplesPhase: 4,
                     dispatches: active.map {
                         (buffer: $0.primary, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: phase)
                     }
@@ -2715,6 +2723,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 try encodeDWTInPlaceBatch(
                     commandBuffer: commandBuffer,
                     pipeline: dwtLiftColumnsPipeline,
+                    axis: .columns,
+                    allSamplesPhase: 4,
                     dispatches: active.map {
                         (buffer: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: phase)
                     }
@@ -2839,7 +2849,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 continue
             }
 
-            if useTiledLevelZero && level == 0 {
+            if useTiledLevelZero {
                 let tiled = active.filter { canUseTiledLevelZero(activeWidth: $0.activeWidth, activeHeight: $0.activeHeight) }
                 if !tiled.isEmpty {
                     try encodeIDWTTiledLevelZeroBatch(
@@ -2848,8 +2858,17 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                             (input: $0.primary, output: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride)
                         }
                     )
-                    for dispatch in tiled {
-                        currentBuffers[dispatch.planeIndex] = dispatch.scratch
+                    if level == 0 {
+                        for dispatch in tiled {
+                            currentBuffers[dispatch.planeIndex] = dispatch.scratch
+                        }
+                    } else {
+                        try encodeDWTTiledCopyBackBatch(
+                            commandBuffer: commandBuffer,
+                            copies: tiled.map {
+                                (input: $0.scratch, output: $0.primary, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride)
+                            }
+                        )
                     }
                     active.removeAll { canUseTiledLevelZero(activeWidth: $0.activeWidth, activeHeight: $0.activeHeight) }
                     guard !active.isEmpty else {
@@ -2869,6 +2888,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 try encodeDWTInPlaceBatch(
                     commandBuffer: commandBuffer,
                     pipeline: idwtLiftColumnsPipeline,
+                    axis: .columns,
+                    allSamplesPhase: 0,
                     dispatches: active.map {
                         (buffer: $0.scratch, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: phase)
                     }
@@ -2886,6 +2907,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 try encodeDWTInPlaceBatch(
                     commandBuffer: commandBuffer,
                     pipeline: idwtLiftRowsPipeline,
+                    axis: .rows,
+                    allSamplesPhase: 0,
                     dispatches: active.map {
                         (buffer: $0.primary, activeWidth: $0.activeWidth, activeHeight: $0.activeHeight, stride: $0.stride, phase: phase)
                     }
@@ -2999,6 +3022,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     private func encodeDWTInPlaceBatch(
         commandBuffer: MTLCommandBuffer,
         pipeline: MTLComputePipelineState,
+        axis: DWTLiftAxis,
+        allSamplesPhase: Int,
         dispatches: [(buffer: MTLBuffer, activeWidth: Int, activeHeight: Int, stride: Int, phase: Int)]
     ) throws {
         guard !dispatches.isEmpty else {
@@ -3021,12 +3046,35 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             )
             encoder.setBuffer(dispatch.buffer, offset: 0, index: 0)
             encoder.setBytes(&constants, length: MemoryLayout<DWTConstants>.stride, index: 1)
+            let dispatchSize = dwtLiftDispatchSize(
+                activeWidth: dispatch.activeWidth,
+                activeHeight: dispatch.activeHeight,
+                axis: axis,
+                updatesAllSamples: dispatch.phase == allSamplesPhase
+            )
             encoder.dispatchThreads(
-                MTLSize(width: dispatch.activeWidth, height: dispatch.activeHeight, depth: 1),
+                MTLSize(width: dispatchSize.width, height: dispatchSize.height, depth: 1),
                 threadsPerThreadgroup: threadsPerThreadgroup
             )
         }
         encoder.endEncoding()
+    }
+
+    private func dwtLiftDispatchSize(
+        activeWidth: Int,
+        activeHeight: Int,
+        axis: DWTLiftAxis,
+        updatesAllSamples: Bool
+    ) -> (width: Int, height: Int) {
+        guard !updatesAllSamples else {
+            return (activeWidth, activeHeight)
+        }
+        switch axis {
+        case .rows:
+            return ((activeWidth + 1) / 2, activeHeight)
+        case .columns:
+            return (activeWidth, (activeHeight + 1) / 2)
+        }
     }
 
     private func dispatchDWTCopy(
@@ -3168,6 +3216,48 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             encoder.setBytes(&constants, length: MemoryLayout<DWTConstants>.stride, index: 2)
             encoder.dispatchThreadgroups(
                 MTLSize(width: dispatch.activeWidth / 32, height: dispatch.activeHeight / 32, depth: 1),
+                threadsPerThreadgroup: threadsPerThreadgroup
+            )
+        }
+        encoder.endEncoding()
+    }
+
+    private func encodeDWTTiledCopyBackBatch(
+        commandBuffer: MTLCommandBuffer,
+        copies: [(input: MTLBuffer, output: MTLBuffer, activeWidth: Int, activeHeight: Int, stride: Int)]
+    ) throws {
+        let linearCopies = copies.filter { $0.activeWidth == $0.stride }
+        try encodeDWTBufferCopies(
+            commandBuffer: commandBuffer,
+            copies: linearCopies.map {
+                (input: $0.input, output: $0.output, byteLength: $0.stride * $0.activeHeight * MemoryLayout<Float>.stride)
+            }
+        )
+
+        let rectCopies = copies.filter { $0.activeWidth != $0.stride }
+        guard !rectCopies.isEmpty else {
+            return
+        }
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw PyrowaveError.processFailed("failed to create Metal DWT active-rectangle copy encoder")
+        }
+
+        encoder.setComputePipelineState(dwtCopyActiveRectPipeline)
+        let width = min(16, dwtCopyActiveRectPipeline.maxTotalThreadsPerThreadgroup)
+        let height = max(1, min(16, dwtCopyActiveRectPipeline.maxTotalThreadsPerThreadgroup / width))
+        let threadsPerThreadgroup = MTLSize(width: width, height: height, depth: 1)
+        for copy in rectCopies {
+            var constants = DWTConstants(
+                activeWidth: UInt32(copy.activeWidth),
+                activeHeight: UInt32(copy.activeHeight),
+                stride: UInt32(copy.stride),
+                phase: 0
+            )
+            encoder.setBuffer(copy.input, offset: 0, index: 0)
+            encoder.setBuffer(copy.output, offset: 0, index: 1)
+            encoder.setBytes(&constants, length: MemoryLayout<DWTConstants>.stride, index: 2)
+            encoder.dispatchThreads(
+                MTLSize(width: copy.activeWidth, height: copy.activeHeight, depth: 1),
                 threadsPerThreadgroup: threadsPerThreadgroup
             )
         }
@@ -3436,6 +3526,11 @@ private struct DWTBatchDispatch {
     var activeWidth: Int
     var activeHeight: Int
     var stride: Int
+}
+
+private enum DWTLiftAxis {
+    case rows
+    case columns
 }
 
 private struct RateControlBucketConstants {

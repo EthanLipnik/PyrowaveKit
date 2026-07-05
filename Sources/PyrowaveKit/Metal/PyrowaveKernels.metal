@@ -1534,6 +1534,10 @@ kernel void pyrowave_dwt_lift_rows(
 ) {
     uint x = position.x;
     uint y = position.y;
+    if (constants.phase < 4u) {
+        uint parity = (constants.phase == 0u || constants.phase == 2u) ? 1u : 0u;
+        x = x * 2u + parity;
+    }
     if (x >= constants.activeWidth || y >= constants.activeHeight) {
         return;
     }
@@ -1569,6 +1573,10 @@ kernel void pyrowave_dwt_lift_columns(
 ) {
     uint x = position.x;
     uint y = position.y;
+    if (constants.phase < 4u) {
+        uint parity = (constants.phase == 0u || constants.phase == 2u) ? 1u : 0u;
+        y = y * 2u + parity;
+    }
     if (x >= constants.activeWidth || y >= constants.activeHeight) {
         return;
     }
@@ -1629,6 +1637,21 @@ kernel void pyrowave_dwt_pack_columns(
     uint lowCount = (constants.activeHeight + 1u) >> 1u;
     uint packedY = ((y & 1u) == 0u) ? (y >> 1u) : (lowCount + (y >> 1u));
     output[packedY * constants.stride + x] = input[y * constants.stride + x];
+}
+
+kernel void pyrowave_dwt_copy_active_rect(
+    device const float *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant DWTConstants &constants [[buffer(2)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    uint x = position.x;
+    uint y = position.y;
+    if (x >= constants.activeWidth || y >= constants.activeHeight) {
+        return;
+    }
+    uint index = y * constants.stride + x;
+    output[index] = input[index];
 }
 
 kernel void pyrowave_dwt_tiled_level0(
@@ -1884,6 +1907,10 @@ kernel void pyrowave_idwt_lift_rows(
 ) {
     uint x = position.x;
     uint y = position.y;
+    if (constants.phase != 0u) {
+        uint parity = (constants.phase == 2u || constants.phase == 4u) ? 1u : 0u;
+        x = x * 2u + parity;
+    }
     if (x >= constants.activeWidth || y >= constants.activeHeight) {
         return;
     }
@@ -1920,6 +1947,10 @@ kernel void pyrowave_idwt_lift_columns(
 ) {
     uint x = position.x;
     uint y = position.y;
+    if (constants.phase != 0u) {
+        uint parity = (constants.phase == 2u || constants.phase == 4u) ? 1u : 0u;
+        y = y * 2u + parity;
+    }
     if (x >= constants.activeWidth || y >= constants.activeHeight) {
         return;
     }

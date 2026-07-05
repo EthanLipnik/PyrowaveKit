@@ -487,6 +487,7 @@ private extension String {
     )
     #expect(gpuFramePlane.contains("decodeDescriptorCount: Int"))
     #expect(gpuFramePlane.contains("decodeDescriptorBuffer: MTLBuffer"))
+    #expect(!gpuFramePlane.contains("decodeDescriptorsCoverFullPlane"))
     #expect(!gpuFramePlane.contains("decodeDescriptors: [MetalSparsePacketDecodeDescriptor]"))
 
     let gpuDecodeBody = try codecSource.requiredSlice(
@@ -495,7 +496,8 @@ private extension String {
     )
     #expect(gpuDecodeBody.contains("descriptorCount: $0.decodeDescriptorCount"))
     #expect(gpuDecodeBody.contains("descriptorBuffer: $0.decodeDescriptorBuffer"))
-    #expect(!gpuDecodeBody.contains("decodeDescriptors"))
+    #expect(!gpuDecodeBody.contains("zeroOutputFromDescriptors"))
+    #expect(!gpuDecodeBody.contains("decodeDescriptors: [MetalSparsePacketDecodeDescriptor]"))
 
     let gpuFramePlaneBody = try codecSource.requiredSlice(
         from: "private func makeGPUFramePlanes(",
@@ -504,7 +506,14 @@ private extension String {
     #expect(gpuFramePlaneBody.contains("decodeDescriptorCountsByPlane"))
     #expect(gpuFramePlaneBody.contains("makeStaticSharedBuffer(bytes: decodeDescriptors)"))
     #expect(gpuFramePlaneBody.contains("cached.decodeDescriptorBuffer"))
+    #expect(!gpuFramePlaneBody.contains("decodeDescriptorsCoverFullPlane"))
     #expect(!gpuFramePlaneBody.contains("decodeDescriptorsByPlane"))
+
+    let importBody = try codecSource.requiredSlice(
+        from: "public func importGPUFrame(",
+        to: "    private func encodeFrame("
+    )
+    #expect(!importBody.contains("decodeDescriptorsCoverFullPlane"))
 
     let metalSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/MetalBackend.swift"), encoding: .utf8)
     let gpuDecodeBackend = try metalSource.requiredSlice(
@@ -514,7 +523,15 @@ private extension String {
     #expect(gpuDecodeBackend.contains("descriptorCount: Int"))
     #expect(gpuDecodeBackend.contains("descriptorBuffer: MTLBuffer"))
     #expect(gpuDecodeBackend.contains("outputStorageMode: .private"))
+    #expect(!gpuDecodeBackend.contains("zeroOutputFromDescriptors"))
     #expect(!gpuDecodeBackend.contains("descriptors: [MetalSparsePacketDecodeDescriptor]"))
+
+    let kernelsSource = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/Metal/PyrowaveKernels.metal"), encoding: .utf8)
+    let sparsePacketDecodeKernel = try kernelsSource.requiredSlice(
+        from: "kernel void pyrowave_decode_sparse_packets_threadgroup(",
+        to: "kernel void pyrowave_rate_control_bucket_indices("
+    )
+    #expect(!sparsePacketDecodeKernel.contains("constants.zeroOutputFromDescriptors"))
 
     let sparseOutputKey = try metalSource.requiredSlice(
         from: "private struct SparseCoefficientOutputKey",
@@ -1020,18 +1037,34 @@ private extension String {
     }
 }
 
-@Test func hevcComparisonUsesEightyPercentQualityCap() throws {
+@Test func hevcComparisonUsesMirageRealtimeVideoToolboxPolicy() throws {
     #expect(HEVCComparison.defaultQuality == 0.8)
     let packageRoot = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()
         .deletingLastPathComponent()
         .deletingLastPathComponent()
     let source = try String(contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/HEVCComparison.swift"), encoding: .utf8)
-    let writerBody = try source.requiredSlice(
-        from: "private static func writeHEVCMovie(",
-        to: "        let outputSettings:"
+    let encodeBody = try source.requiredSlice(
+        from: "private static func encodeMirageHEVC(",
+        to: "    private static func decodeMirageHEVC("
     )
-    #expect(writerBody.contains("AVVideoQualityKey: quality"))
+    let configurationBody = try source.requiredSlice(
+        from: "private static func configureMirageCompressionSession(",
+        to: "    private static func qualitySettings("
+    )
+    #expect(encodeBody.contains("VTCompressionSessionEncodeFrame"))
+    #expect(!source.contains("AVAssetWriter"))
+    #expect(configurationBody.contains("kVTCompressionPropertyKey_RealTime"))
+    #expect(configurationBody.contains("kVTCompressionPropertyKey_AllowFrameReordering"))
+    #expect(configurationBody.contains("kVTCompressionPropertyKey_MaxFrameDelayCount"))
+    #expect(configurationBody.contains("kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality"))
+    #expect(configurationBody.contains("kVTCompressionPropertyKey_Quality"))
+    #expect(configurationBody.contains("kVTCompressionPropertyKey_MinAllowedFrameQP"))
+    #expect(configurationBody.contains("kVTCompressionPropertyKey_MaxAllowedFrameQP"))
+    #expect(configurationBody.contains("kVTCompressionPropertyKey_AverageBitRate"))
+    #expect(configurationBody.contains("kVTCompressionPropertyKey_DataRateLimits"))
+    #expect(HEVCComparison.mirageTimingNote.contains("Quality capped at 0.8"))
+    #expect(HEVCComparison.mirageTimingNote.contains("AverageBitRate plus DataRateLimits"))
 }
 
 @Test func hevcComparisonRejectsInvalidInputsBeforeEncoding() throws {
@@ -1041,28 +1074,28 @@ private extension String {
     let yuv444 = try TestFrames.synthetic444(width: 64, height: 64)
 
     #expect(throws: PyrowaveError.truncatedInput) {
-        _ = try HEVCComparison.runAVKitHEVCComparison(
+        _ = try HEVCComparison.runMirageHEVCComparison(
             referenceFrames: [],
             workingDirectory: directory,
             bitrate: 1
         )
     }
     #expect(throws: PyrowaveError.invalidDimensions) {
-        _ = try HEVCComparison.runAVKitHEVCComparison(
+        _ = try HEVCComparison.runMirageHEVCComparison(
             referenceFrames: [frame],
             workingDirectory: directory,
             bitrate: 0
         )
     }
     #expect(throws: PyrowaveError.invalidDimensions) {
-        _ = try HEVCComparison.runAVKitHEVCComparison(
+        _ = try HEVCComparison.runMirageHEVCComparison(
             referenceFrames: [frame, mismatched],
             workingDirectory: directory,
             bitrate: 1
         )
     }
     #expect(throws: PyrowaveError.unsupportedFormat("HEVC comparison expects yuv420 frames")) {
-        _ = try HEVCComparison.runAVKitHEVCComparison(
+        _ = try HEVCComparison.runMirageHEVCComparison(
             referenceFrames: [yuv444],
             workingDirectory: directory,
             bitrate: 1
@@ -1222,7 +1255,7 @@ private extension String {
         note: nil
     )
     let hevc = CodecBenchmarkResult(
-        codec: "hevc_avkit",
+        codec: "hevc_videotoolbox_mirage",
         frameCount: 60,
         encodedBytes: 80,
         encodeSeconds: 2.0,
@@ -1247,13 +1280,14 @@ private extension String {
     #expect(report.artifacts.referenceY4M == PyrowaveBenchmarkArtifactNames.referenceY4M)
     #expect(report.artifacts.pyrowaveStream == PyrowaveBenchmarkArtifactNames.pyrowaveStream)
     #expect(report.artifacts.pyrowaveDecodedY4M == PyrowaveBenchmarkArtifactNames.pyrowaveDecodedY4M)
-    #expect(report.artifacts.hevcMovie == PyrowaveBenchmarkArtifactNames.hevcMovie)
+    #expect(report.artifacts.hevcStream == PyrowaveBenchmarkArtifactNames.hevcStream)
     #expect(report.artifacts.hevcDecodedY4M == PyrowaveBenchmarkArtifactNames.hevcDecodedY4M)
+    #expect(PyrowaveBenchmarkArtifactNames.hevcStream == "hevc-videotoolbox.mirage-hevc")
     #expect(PyrowaveBenchmarkArtifactNames.report == "benchmark-report.json")
     #expect(report.hevcQuality == 0.8)
     #expect(PyrowaveBenchmarkRunner.timedBenchmarkScopeNote.contains("artifact writes"))
-    #expect(HEVCComparison.avKitTimingNote.contains("AVVideoQualityKey 0.8"))
-    #expect(HEVCComparison.avKitTimingNote.contains("planar conversion"))
+    #expect(HEVCComparison.mirageTimingNote.contains("direct VideoToolbox realtime path"))
+    #expect(HEVCComparison.mirageTimingNote.contains("planar conversion"))
     #expect(report.comparison.pyrowaveBytesPerFrame == 4)
     #expect(report.comparison.hevcBytesPerFrame == 80.0 / 60.0)
     #expect(report.comparison.pyrowaveToHEVCBytesPerFrameRatio == 3)
@@ -1278,7 +1312,7 @@ private extension String {
         note: nil
     )
     let hevc = CodecBenchmarkResult(
-        codec: "hevc_avkit",
+        codec: "hevc_videotoolbox_mirage",
         frameCount: 60,
         encodedBytes: 80,
         encodeSeconds: 2.0,
@@ -1476,6 +1510,7 @@ private extension String {
         _ = try backend.makeFunction(named: "pyrowave_apply_sparse_coefficients")
         _ = try backend.makeFunction(named: "pyrowave_decode_sparse_packets")
         _ = try backend.makeFunction(named: "pyrowave_decode_sparse_packets_threadgroup")
+        _ = try backend.makeFunction(named: "pyrowave_dwt_copy_active_rect")
         _ = try backend.makeFunction(named: "pyrowave_dwt_tiled_level0")
         _ = try backend.makeFunction(named: "pyrowave_idwt_tiled_level0")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_tile_stats")
@@ -2491,8 +2526,8 @@ private func makeYUVFrame(
         return
     }
 
-    let width = 128
-    let height = 128
+    let width = 512
+    let height = 256
     let levels = 3
     var samples = Array(repeating: Float(0), count: width * height)
     for y in 0..<height {

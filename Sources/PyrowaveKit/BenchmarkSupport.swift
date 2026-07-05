@@ -6,7 +6,7 @@ public enum PyrowaveBenchmarkArtifactNames {
     public static let referenceY4M = "reference.y4m"
     public static let pyrowaveStream = "pyrowave-sample.pwks"
     public static let pyrowaveDecodedY4M = "pyrowave-decoded.y4m"
-    public static let hevcMovie = "hevc-avkit.mov"
+    public static let hevcStream = "hevc-videotoolbox.mirage-hevc"
     public static let hevcDecodedY4M = "hevc-decoded.y4m"
     public static let report = "benchmark-report.json"
 }
@@ -40,20 +40,20 @@ public struct PyrowaveBenchmarkArtifacts: Codable, Equatable, Sendable {
     public var referenceY4M: String
     public var pyrowaveStream: String
     public var pyrowaveDecodedY4M: String
-    public var hevcMovie: String
+    public var hevcStream: String
     public var hevcDecodedY4M: String
 
     public init(
         referenceY4M: String = PyrowaveBenchmarkArtifactNames.referenceY4M,
         pyrowaveStream: String = PyrowaveBenchmarkArtifactNames.pyrowaveStream,
         pyrowaveDecodedY4M: String = PyrowaveBenchmarkArtifactNames.pyrowaveDecodedY4M,
-        hevcMovie: String = PyrowaveBenchmarkArtifactNames.hevcMovie,
+        hevcStream: String = PyrowaveBenchmarkArtifactNames.hevcStream,
         hevcDecodedY4M: String = PyrowaveBenchmarkArtifactNames.hevcDecodedY4M
     ) {
         self.referenceY4M = referenceY4M
         self.pyrowaveStream = pyrowaveStream
         self.pyrowaveDecodedY4M = pyrowaveDecodedY4M
-        self.hevcMovie = hevcMovie
+        self.hevcStream = hevcStream
         self.hevcDecodedY4M = hevcDecodedY4M
     }
 }
@@ -260,7 +260,7 @@ public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
 enum PyrowaveBenchmarkRunner {
     static let pyrowaveCodecName = "pyrowavekit-swift-metal"
     static let timedBenchmarkScopeNote = "Timed encode/decode excludes input loading, pixel-buffer preparation, reusable output allocation, artifact writes, report serialization, and quality metric generation; encode starts from reusable CoreVideo-backed Metal texture views and decode writes into reusable CVPixelBuffer-backed Metal texture views."
-    static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane, texture, and NV12 texture-channel pad, crop, DWT/iDWT, block quantization, sparse packet emission, and sparse decode apply, 32x32 sparse packets. Benchmark policy leaves Pyrowave uncapped and compares against HEVC with AVVideoQualityKey defaulting to 0.8. \(timedBenchmarkScopeNote)"
+    static let pyrowaveImplementationNote = "Hard-cutover v2 stream with Metal plane, texture, and NV12 texture-channel pad, crop, DWT/iDWT, block quantization, sparse packet emission, and sparse decode apply, 32x32 sparse packets. Benchmark policy leaves Pyrowave uncapped and compares against Mirage-style realtime VideoToolbox HEVC with quality capped at 0.8. \(timedBenchmarkScopeNote)"
 
     private struct DecodeTarget {
         var pixelBuffer: CVPixelBuffer
@@ -578,7 +578,7 @@ public enum PyrowaveBenchmarkCLI {
         let hevc: CodecBenchmarkResult
         if arguments.pyrowaveOnly {
             hevc = CodecBenchmarkResult(
-                codec: "hevc_avkit_skipped",
+                codec: "hevc_videotoolbox_mirage_skipped",
                 frameCount: frames.count,
                 encodedBytes: 0,
                 encodeSeconds: 0,
@@ -587,7 +587,7 @@ public enum PyrowaveBenchmarkCLI {
                 note: "Skipped by --pyrowave-only to profile the Pyrowave timed path without HEVC, metrics, or artifact writes."
             )
         } else {
-            hevc = try HEVCComparison.runAVKitHEVCComparison(
+            hevc = try HEVCComparison.runMirageHEVCComparison(
                 referenceFrames: frames,
                 workingDirectory: arguments.outputDirectory,
                 bitrate: arguments.bitrate,
