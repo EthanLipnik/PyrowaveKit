@@ -6,17 +6,92 @@ struct PyrowaveQuantStats: Equatable {
 
     init(squareError: Float, encodeCostBits: Int) {
         let clampedError = min(max(squareError, 0), 60_000)
-        self.squareErrorFP16 = Float16(clampedError).bitPattern
+        self.squareErrorFP16 = PyrowaveHalfFloat.bitPattern(clampedError)
         self.encodeCostBits = UInt16(clamping: encodeCostBits)
     }
 
     var squareError: Float {
-        Float(Float16(bitPattern: squareErrorFP16))
+        PyrowaveHalfFloat.float(squareErrorFP16)
     }
 
     static func quantizedSquareError(_ squareError: Float) -> Float {
-        Float(Float16(min(max(squareError, 0), 60_000)))
+        PyrowaveHalfFloat.float(PyrowaveHalfFloat.bitPattern(min(max(squareError, 0), 60_000)))
     }
+}
+
+private enum PyrowaveHalfFloat {
+    static func bitPattern(_ value: Float) -> UInt16 {
+        #if arch(x86_64)
+        positiveFiniteBitPattern(value)
+        #else
+        Float16(value).bitPattern
+        #endif
+    }
+
+    static func float(_ bitPattern: UInt16) -> Float {
+        #if arch(x86_64)
+        positiveFiniteFloat(bitPattern)
+        #else
+        Float(Float16(bitPattern: bitPattern))
+        #endif
+    }
+
+    #if arch(x86_64)
+    private static func positiveFiniteBitPattern(_ value: Float) -> UInt16 {
+        let bits = value.bitPattern
+        let exponent = Int((bits >> 23) & 0xff) - 127 + 15
+        let mantissa = bits & 0x7f_ffff
+
+        if exponent <= 0 {
+            if exponent < -10 {
+                return 0
+            }
+
+            let significand = mantissa | 0x80_0000
+            let shift = UInt32(14 - exponent)
+            var halfMantissa = significand >> shift
+            let remainderMask = (UInt32(1) << shift) - 1
+            let remainder = significand & remainderMask
+            let halfway = UInt32(1) << (shift - 1)
+            if remainder > halfway || (remainder == halfway && (halfMantissa & 1) == 1) {
+                halfMantissa += 1
+            }
+            return UInt16(halfMantissa)
+        }
+
+        var half = UInt32(exponent << 10) | (mantissa >> 13)
+        let remainder = mantissa & 0x1fff
+        if remainder > 0x1000 || (remainder == 0x1000 && (half & 1) == 1) {
+            half += 1
+        }
+
+        return UInt16(min(half, 0x7bff))
+    }
+
+    private static func positiveFiniteFloat(_ bitPattern: UInt16) -> Float {
+        let exponent = UInt32((bitPattern >> 10) & 0x1f)
+        var mantissa = UInt32(bitPattern & 0x03ff)
+
+        if exponent == 0 {
+            if mantissa == 0 {
+                return 0
+            }
+
+            var adjustedExponent = -14
+            while (mantissa & 0x0400) == 0 {
+                mantissa <<= 1
+                adjustedExponent -= 1
+            }
+            mantissa &= 0x03ff
+
+            let floatExponent = UInt32(adjustedExponent + 127) << 23
+            return Float(bitPattern: floatExponent | (mantissa << 13))
+        }
+
+        let floatExponent = (exponent - 15 + 127) << 23
+        return Float(bitPattern: floatExponent | (mantissa << 13))
+    }
+    #endif
 }
 
 struct PyrowaveBlockStats: Equatable {
