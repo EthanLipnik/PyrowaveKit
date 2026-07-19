@@ -145,7 +145,7 @@ private extension String {
 
     let gpuDecodeReusableBody = try source.requiredSlice(
         from: "public func decodeGPUFrame(\n        _ frame: PyrowaveGPUFrame",
-        to: "    }\n}"
+        to: "    func decodeContiguousFrame("
     )
     #expect(gpuDecodeReusableBody.contains("makeMetalTexture("))
     #expect(gpuDecodeReusableBody.contains("try decodeGPUFrameToNV12Textures("))
@@ -153,6 +153,38 @@ private extension String {
     #expect(!gpuDecodeReusableBody.contains("decodeToNV12Textures("))
     #expect(!gpuDecodeReusableBody.contains("YUVFrame("))
     #expect(!gpuDecodeReusableBody.contains("CVPixelBufferLockBaseAddress"))
+
+    let contiguousDecodeBody = try source.requiredSlice(
+        from: "func decodeContiguousFrame(",
+        to: "    }\n}"
+    )
+    #expect(contiguousDecodeBody.contains("try await decodeToNV12Textures("))
+    #expect(!contiguousDecodeBody.contains("importGPUFrame"))
+
+    let sessionsSource = try String(
+        contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/PyrowaveSessions.swift"),
+        encoding: .utf8
+    )
+    let productionDecodeBody = try sessionsSource.requiredSlice(
+        from: "public func decode(_ frame: EncodedFrame) async throws",
+        to: "    private static func applyVideoSignalAttachments("
+    )
+    #expect(productionDecodeBody.contains("try await codec.decodeContiguousFrame("))
+    #expect(productionDecodeBody.contains("guard !isDecodingFrame"))
+    #expect(!productionDecodeBody.contains("importGPUFrame"))
+    #expect(!productionDecodeBody.contains("decodeToCVPixelBuffer"))
+
+    let metalSource = try String(
+        contentsOf: packageRoot.appendingPathComponent("Sources/PyrowaveKit/MetalBackend.swift"),
+        encoding: .utf8
+    )
+    let asynchronousCompletionBody = try metalSource.requiredSlice(
+        from: "private func finishAsync(",
+        to: "    private func validateWaveletInput("
+    )
+    #expect(asynchronousCompletionBody.contains("commandBuffer.addCompletedHandler"))
+    #expect(asynchronousCompletionBody.contains("commandBuffer.commit()"))
+    #expect(!asynchronousCompletionBody.contains("waitUntilCompleted"))
 }
 
 @Test func nv12TextureEncodedFrameAPIExportsGPUFrame() throws {
@@ -296,6 +328,9 @@ private extension String {
     )
     #expect(residentPacketBody.contains("qScaleBuffer: MTLBuffer"))
     #expect(!residentPacketBody.contains("flatQScaleCodes"))
+    #expect(residentPacketBody.contains("encoder.setComputePipelineState(sparsePacketEncodeThreadgroupPipeline)"))
+    #expect(!residentPacketBody.contains("threadgroupDescriptorLimit"))
+    #expect(!residentPacketBody.contains("sparsePacketEncodeSerialPipeline"))
 }
 
 @Test func gpuFrameQuantizationSkipsInterstageWaitWhenQScaleReadbackIsDisabled() throws {
@@ -401,7 +436,7 @@ private extension String {
     #expect(gpuFramePlaneBody.contains("descriptorCount: packetDescriptorCountsByPlane[index]"))
     #expect(gpuFramePlaneBody.contains("descriptors: packetDescriptorBuffersByPlane[index] == nil ? packetDescriptorsByPlane[index] : nil"))
     #expect(gpuFramePlaneBody.contains("descriptorBuffer: packetDescriptorBuffersByPlane[index]"))
-    #expect(gpuFramePlaneBody.contains("outputStorageMode: .private"))
+    #expect(gpuFramePlaneBody.contains("outputStorageMode: packetOutputStorageMode"))
 
     let exportBody = try codecSource.requiredSlice(
         from: "public func exportGPUFrame(",
@@ -742,6 +777,98 @@ private extension String {
     let streamedPixelBuffer = try stream.decodeToCVPixelBuffer()
     let streamed = try YUVFrame(cvPixelBuffer: streamedPixelBuffer)
     #expect(try Metrics.compare(source, streamed).weightedPSNR > 44.0)
+}
+
+@Test func codecOwnedQualityMappingUsesNearLosslessHighestPreset() {
+    #expect(PyrowaveQuality(normalized: 1).codecConfiguration.quantizationStep == 1.0 / 2048.0)
+    #expect(PyrowaveQuality(normalized: 0).codecConfiguration.quantizationStep == 1.0 / 64.0)
+    #expect(PyrowaveQuality(configuration: CodecConfiguration(quantizationStep: 1.0 / 2048.0)) == .highest)
+    #expect(PyrowaveQuality(normalized: -1).normalized == 0)
+    #expect(PyrowaveQuality(normalized: 2).normalized == 1)
+    #expect(PyrowaveQuality(normalized: .nan).normalized == 1)
+}
+
+@Test func productionDecoderRestoresVideoSignalAttachments() async throws {
+    let source = try TestFrames.synthetic420(width: 64, height: 64)
+    let signal = VideoSignalMetadata(
+        colorPrimaries: .bt709,
+        transferFunction: .sRGB,
+        yCbCrTransform: .bt709,
+        yCbCrRange: .full,
+        chromaSiting: .center
+    )
+    let descriptor = try PyrowaveSessionDescriptor(width: 64, height: 64, videoSignal: signal)
+    let encoder = try PyrowaveEncoderSession(descriptor: descriptor)
+    let decoder = try PyrowaveDecoderSession(descriptor: descriptor)
+    let encoded = try await encoder.encode(source.makeCVPixelBuffer())
+    let decoded = try await decoder.decode(encoded.frame)
+
+    #expect(
+        CVBufferCopyAttachment(
+            decoded.pixelBuffer,
+            kCVImageBufferColorPrimariesKey,
+            nil
+        ) as? String == kCVImageBufferColorPrimaries_ITU_R_709_2 as String
+    )
+    #expect(
+        CVBufferCopyAttachment(
+            decoded.pixelBuffer,
+            kCVImageBufferTransferFunctionKey,
+            nil
+        ) as? String == kCVImageBufferTransferFunction_sRGB as String
+    )
+    #expect(
+        CVBufferCopyAttachment(
+            decoded.pixelBuffer,
+            kCVImageBufferYCbCrMatrixKey,
+            nil
+        ) as? String == kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String
+    )
+    #expect(CVBufferCopyAttachment(decoded.pixelBuffer, kCVImageBufferCGColorSpaceKey, nil) != nil)
+}
+
+@Test func serialSessionsRoundTripExistingBitstreamWithPooledOutput() async throws {
+    let source = try TestFrames.synthetic420(width: 64, height: 64)
+    let sourcePixelBuffer = try source.makeCVPixelBuffer()
+    let descriptor = try PyrowaveSessionDescriptor(
+        width: source.width,
+        height: source.height,
+        pixelFormat: YUVFrame.cvPixelFormat(for: source.videoSignal),
+        videoSignal: source.videoSignal
+    )
+    let encoder = try PyrowaveEncoderSession(descriptor: descriptor)
+    let decoder = try PyrowaveDecoderSession(descriptor: descriptor)
+
+    let encoded = try await encoder.encode(sourcePixelBuffer, quality: PyrowaveQuality(normalized: 0.75))
+    let oldDecoderOutput = try PyrowaveCodec().decodeToCVPixelBuffer(encoded.frame)
+    let sessionDecoded = try await decoder.decode(encoded.frame)
+
+    #expect(encoded.metrics.encodedBytes == encoded.frame.data.count)
+    #expect(encoded.metrics.payloadBytesCopied + 8 == encoded.metrics.encodedBytes)
+    #expect(encoded.metrics.payloadBytesCopied < encoded.metrics.packetSlotCapacityBytes)
+    #expect(encoded.metrics.totalMilliseconds >= encoded.metrics.encodeMilliseconds)
+    #expect(encoded.metrics.totalMilliseconds >= encoded.metrics.exportMilliseconds)
+    #expect(sessionDecoded.metrics.encodedBytes == encoded.frame.data.count)
+    #expect(sessionDecoded.metrics.totalMilliseconds >= sessionDecoded.metrics.contiguousDecodeMilliseconds)
+    #expect(CVPixelBufferGetWidth(sessionDecoded.pixelBuffer) == source.width)
+    #expect(CVPixelBufferGetHeight(sessionDecoded.pixelBuffer) == source.height)
+
+    let oldDecoded = try YUVFrame(cvPixelBuffer: oldDecoderOutput)
+    let newDecoded = try YUVFrame(cvPixelBuffer: sessionDecoded.pixelBuffer)
+    #expect(oldDecoded == newDecoded)
+    #expect(try Metrics.compare(source, newDecoded).weightedPSNR > 30)
+}
+
+@Test func decoderSessionClassifiesCorruptFramesAsRecoverable() async throws {
+    let descriptor = try PyrowaveSessionDescriptor(width: 64, height: 64)
+    let decoder = try PyrowaveDecoderSession(descriptor: descriptor)
+
+    do {
+        _ = try await decoder.decode(EncodedFrame(data: Data([0, 1, 2])))
+        Issue.record("Corrupt frame unexpectedly decoded")
+    } catch let error as PyrowaveSessionError {
+        #expect(error.isRecoverable)
+    }
 }
 
 @Test func roundTripSynthetic420() throws {
@@ -1517,7 +1644,6 @@ private extension String {
         _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs")
         _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs_smallblocks")
         _ = try backend.makeFunction(named: "pyrowave_packet_byte_costs_finalize")
-        _ = try backend.makeFunction(named: "pyrowave_encode_sparse_packets_serial")
         _ = try backend.makeFunction(named: "pyrowave_encode_sparse_packets")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_indices")
         _ = try backend.makeFunction(named: "pyrowave_rate_control_bucket_savings")

@@ -41,6 +41,7 @@ Rules:
 - HEVC quality is capped at `0.8`.
 - HEVC uses realtime VideoToolbox settings: no frame reordering, low delay, Mirage-style QP bounds, `AverageBitRate`, and `DataRateLimits`.
 - Timings exclude loading, pixel-buffer setup, metric conversions, artifact writes, report serialization, and PSNR calculation.
+- Every report also includes `productionPath` timings for serial CoreVideo encode, actual-payload export, contiguous bitstream decode, and pooled output-buffer acquisition. `packetSlotCapacityBytes` is reported separately from bytes actually exported.
 
 Latest 60-frame results from July 4, 2026:
 

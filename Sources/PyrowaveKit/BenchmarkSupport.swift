@@ -71,6 +71,7 @@ public struct PyrowaveBenchmarkReport: Codable, Equatable, Sendable {
     public var pyrowave: CodecBenchmarkResult
     public var hevc: CodecBenchmarkResult
     public var comparison: CodecBenchmarkComparison
+    public var productionPath: PyrowaveProductionPathBenchmarkResult?
 
     public init(
         generatedAt: String,
@@ -84,7 +85,8 @@ public struct PyrowaveBenchmarkReport: Codable, Equatable, Sendable {
         artifacts: PyrowaveBenchmarkArtifacts = PyrowaveBenchmarkArtifacts(),
         pyrowave: CodecBenchmarkResult,
         hevc: CodecBenchmarkResult,
-        comparison: CodecBenchmarkComparison
+        comparison: CodecBenchmarkComparison,
+        productionPath: PyrowaveProductionPathBenchmarkResult? = nil
     ) {
         self.generatedAt = generatedAt
         self.width = width
@@ -98,7 +100,22 @@ public struct PyrowaveBenchmarkReport: Codable, Equatable, Sendable {
         self.pyrowave = pyrowave
         self.hevc = hevc
         self.comparison = comparison
+        self.productionPath = productionPath
     }
+}
+
+public struct PyrowaveProductionPathBenchmarkResult: Codable, Equatable, Sendable {
+    public let frameCount: Int
+    public let encodedBytes: Int
+    public let packetSlotCapacityBytes: Int
+    public let encodeMilliseconds: Double
+    public let exportMilliseconds: Double
+    public let outputAcquisitionMilliseconds: Double
+    public let textureCreationMilliseconds: Double
+    public let packetParseMilliseconds: Double
+    public let metalDecodeMilliseconds: Double
+    public let contiguousDecodeMilliseconds: Double
+    public let totalMilliseconds: Double
 }
 
 public struct PyrowaveBenchmarkArguments: Equatable, Sendable {
@@ -547,7 +564,7 @@ enum PyrowaveBenchmarkRunner {
 }
 
 public enum PyrowaveBenchmarkCLI {
-    public static func run(_ rawArguments: [String] = Array(CommandLine.arguments.dropFirst())) throws -> URL? {
+    public static func run(_ rawArguments: [String] = Array(CommandLine.arguments.dropFirst())) async throws -> URL? {
         let arguments = try PyrowaveBenchmarkArguments(rawArguments)
         if arguments.shouldShowHelp {
             print(PyrowaveBenchmarkArguments.usage)
@@ -566,14 +583,16 @@ public enum PyrowaveBenchmarkCLI {
             )
         }
 
-        let configuration = CodecConfiguration(
-            quantizationStep: arguments.quantizationStep
-        )
+        let configuration = CodecConfiguration(quantizationStep: arguments.quantizationStep)
         let pyrowave = try PyrowaveBenchmarkRunner.runPyrowave(
             loaded: loaded,
             configuration: configuration,
             outputDirectory: arguments.outputDirectory,
             writesArtifactsAndMetrics: !arguments.pyrowaveOnly
+        )
+        let productionPath = try await runProductionPath(
+            frames: frames,
+            configuration: configuration
         )
         let hevc: CodecBenchmarkResult
         if arguments.pyrowaveOnly {
@@ -609,7 +628,8 @@ public enum PyrowaveBenchmarkCLI {
             artifacts: PyrowaveBenchmarkArtifacts(),
             pyrowave: pyrowave,
             hevc: hevc,
-            comparison: CodecBenchmarkComparison(pyrowave: pyrowave, hevc: hevc)
+            comparison: CodecBenchmarkComparison(pyrowave: pyrowave, hevc: hevc),
+            productionPath: productionPath
         )
 
         let encoder = JSONEncoder()
@@ -621,5 +641,65 @@ public enum PyrowaveBenchmarkCLI {
             try arguments.validate(report: report)
         }
         return reportURL
+    }
+
+    private static func runProductionPath(
+        frames: [YUVFrame],
+        configuration: CodecConfiguration
+    ) async throws -> PyrowaveProductionPathBenchmarkResult {
+        guard let first = frames.first else {
+            throw PyrowaveError.invalidDimensions
+        }
+        let descriptor = try PyrowaveSessionDescriptor(
+            width: first.width,
+            height: first.height,
+            pixelFormat: YUVFrame.cvPixelFormat(for: first.videoSignal),
+            videoSignal: first.videoSignal
+        )
+        let encoder = try PyrowaveEncoderSession(descriptor: descriptor)
+        let decoder = try PyrowaveDecoderSession(descriptor: descriptor)
+        let quality = PyrowaveQuality(configuration: configuration)
+        var encodedBytes = 0
+        var packetSlotCapacityBytes = 0
+        var encodeMilliseconds = 0.0
+        var exportMilliseconds = 0.0
+        var outputAcquisitionMilliseconds = 0.0
+        var textureCreationMilliseconds = 0.0
+        var packetParseMilliseconds = 0.0
+        var metalDecodeMilliseconds = 0.0
+        var contiguousDecodeMilliseconds = 0.0
+        var totalMilliseconds = 0.0
+        for frame in frames {
+            let pixelBuffer = try frame.makeCVPixelBuffer(pixelFormat: descriptor.pixelFormat)
+            let encoded = try await encoder.encode(
+                PyrowavePixelBufferInput(pixelBuffer),
+                quality: quality
+            )
+            let decoded = try await decoder.decode(encoded.frame)
+            encodedBytes += encoded.metrics.encodedBytes
+            packetSlotCapacityBytes += encoded.metrics.packetSlotCapacityBytes
+            encodeMilliseconds += encoded.metrics.encodeMilliseconds
+            exportMilliseconds += encoded.metrics.exportMilliseconds
+            outputAcquisitionMilliseconds += decoded.metrics.outputAcquisitionMilliseconds
+            textureCreationMilliseconds += decoded.metrics.textureCreationMilliseconds
+            packetParseMilliseconds += decoded.metrics.packetParseMilliseconds
+            metalDecodeMilliseconds += decoded.metrics.metalDecodeMilliseconds
+            contiguousDecodeMilliseconds += decoded.metrics.contiguousDecodeMilliseconds
+            totalMilliseconds += encoded.metrics.totalMilliseconds + decoded.metrics.totalMilliseconds
+            withExtendedLifetime(decoded) {}
+        }
+        return PyrowaveProductionPathBenchmarkResult(
+            frameCount: frames.count,
+            encodedBytes: encodedBytes,
+            packetSlotCapacityBytes: packetSlotCapacityBytes,
+            encodeMilliseconds: encodeMilliseconds,
+            exportMilliseconds: exportMilliseconds,
+            outputAcquisitionMilliseconds: outputAcquisitionMilliseconds,
+            textureCreationMilliseconds: textureCreationMilliseconds,
+            packetParseMilliseconds: packetParseMilliseconds,
+            metalDecodeMilliseconds: metalDecodeMilliseconds,
+            contiguousDecodeMilliseconds: contiguousDecodeMilliseconds,
+            totalMilliseconds: totalMilliseconds
+        )
     }
 }

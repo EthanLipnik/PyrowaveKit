@@ -2,6 +2,12 @@ import Foundation
 import CoreVideo
 import Metal
 
+struct PyrowaveContiguousDecodeStageMetrics: Equatable, Sendable {
+    let textureCreationMilliseconds: Double
+    let packetParseMilliseconds: Double
+    let metalDecodeMilliseconds: Double
+}
+
 extension YUVFrame {
     init(
         cvPixelBuffer: CVPixelBuffer,
@@ -124,6 +130,22 @@ extension YUVFrame {
 }
 
 extension PyrowaveCodec {
+    func encodeGPUFrameForSession(
+        _ cvPixelBuffer: CVPixelBuffer,
+        configuration: CodecConfiguration,
+        videoSignal: VideoSignalMetadata
+    ) throws -> PyrowaveGPUFrame {
+        let textures = try makeNV12MetalTexturesAndSignal(from: cvPixelBuffer, videoSignal: videoSignal)
+        return try encodeGPUFrame(
+            yTexture: textures.yTexture,
+            cbCrTexture: textures.cbCrTexture,
+            configuration: configuration,
+            videoSignal: textures.videoSignal,
+            reusesPacketBuffers: true,
+            packetOutputStorageMode: .shared
+        )
+    }
+
     public func encodeGPUFrame(
         _ cvPixelBuffer: CVPixelBuffer,
         configuration: CodecConfiguration = CodecConfiguration(),
@@ -309,6 +331,46 @@ extension PyrowaveCodec {
             frame,
             yTexture: yTexture.texture,
             cbCrTexture: cbCrTexture.texture
+        )
+    }
+
+    func decodeContiguousFrame(
+        _ frame: EncodedFrame,
+        to output: PyrowavePixelBufferInput
+    ) async throws -> PyrowaveContiguousDecodeStageMetrics {
+        let cvPixelBuffer = output.pixelBuffer
+        let width = CVPixelBufferGetWidthOfPlane(cvPixelBuffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(cvPixelBuffer, 0)
+        guard CVPixelBufferGetPlaneCount(cvPixelBuffer) >= 2,
+              CVPixelBufferGetWidthOfPlane(cvPixelBuffer, 1) == width / 2,
+              CVPixelBufferGetHeightOfPlane(cvPixelBuffer, 1) == height / 2 else {
+            throw PyrowaveError.invalidDimensions
+        }
+        let textureStart = ContinuousClock.now
+        let yTexture = try makeMetalTexture(
+            from: cvPixelBuffer,
+            pixelFormat: .r8Unorm,
+            width: width,
+            height: height,
+            planeIndex: 0
+        )
+        let cbCrTexture = try makeMetalTexture(
+            from: cvPixelBuffer,
+            pixelFormat: .rg8Unorm,
+            width: width / 2,
+            height: height / 2,
+            planeIndex: 1
+        )
+        let textureEnd = ContinuousClock.now
+        let decodeMetrics = try await decodeToNV12Textures(
+            frame,
+            yTexture: yTexture.texture,
+            cbCrTexture: cbCrTexture.texture
+        )
+        return PyrowaveContiguousDecodeStageMetrics(
+            textureCreationMilliseconds: textureStart.milliseconds(to: textureEnd),
+            packetParseMilliseconds: decodeMetrics.packetParseMilliseconds,
+            metalDecodeMilliseconds: decodeMetrics.metalDecodeMilliseconds
         )
     }
 }

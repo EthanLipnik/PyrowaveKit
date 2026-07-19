@@ -689,138 +689,6 @@ static inline short pyrowave_quantized_packet_value(
     return raw < 0 ? short(-int(magnitude)) : short(magnitude);
 }
 
-kernel void pyrowave_encode_sparse_packets_serial(
-    device const short *coefficients [[buffer(0)]],
-    device const SparsePacketEncodeDescriptor *descriptors [[buffer(1)]],
-    device const uchar *qScaleCodes [[buffer(2)]],
-    device uchar *output [[buffer(3)]],
-    device uint *outputSizes [[buffer(4)]],
-    constant SparsePacketEncodeConstants &constants [[buffer(5)]],
-    uint descriptorIndex [[thread_position_in_grid]]
-) {
-    if (descriptorIndex >= constants.descriptorCount) {
-        return;
-    }
-
-    SparsePacketEncodeDescriptor descriptor = descriptors[descriptorIndex];
-    device uchar *packet = output + descriptorIndex * constants.maxPacketBytes;
-    outputSizes[descriptorIndex] = 0u;
-    pyrowave_write_u16_le(packet, 0u, 0u);
-
-    uint ballot = 0u;
-    for (uint y = 0u; y < descriptor.validHeight; ++y) {
-        for (uint x = 0u; x < descriptor.validWidth; ++x) {
-            short value = pyrowave_quantized_packet_value(coefficients, descriptor, x, y);
-            if (value != 0) {
-                uint smallBlock = (y / 8u) * 4u + (x / 8u);
-                ballot |= 1u << smallBlock;
-            }
-        }
-    }
-    if (ballot == 0u) {
-        return;
-    }
-
-    uint activeBlockCount = popcount(ballot);
-    uint codeWordStart = 8u;
-    uint qScaleStart = codeWordStart + activeBlockCount * 2u;
-    uint magnitudeStart = qScaleStart + activeBlockCount;
-    uint magnitudeOffset = 0u;
-    uchar signPayload[128];
-    for (uint i = 0u; i < 128u; ++i) {
-        signPayload[i] = 0;
-    }
-    uint signCount = 0u;
-    uint compactIndex = 0u;
-    device const uchar *descriptorQScaleCodes = qScaleCodes + descriptorIndex * 16u;
-
-    for (uint smallBlock = 0u; smallBlock < 16u; ++smallBlock) {
-        if ((ballot & (1u << smallBlock)) == 0u) {
-            continue;
-        }
-
-        uint smallOriginX = (smallBlock % 4u) * 8u;
-        uint smallOriginY = (smallBlock / 4u) * 8u;
-        uint bitWidths[8];
-        uint maxBitWidth = 0u;
-
-        for (uint subblock = 0u; subblock < 8u; ++subblock) {
-            uint maxMagnitude = 0u;
-            for (uint pixel = 0u; pixel < 8u; ++pixel) {
-                uint2 coord = pyrowave_coordinate_in_8x8(subblock, pixel);
-                short value = pyrowave_quantized_packet_value(coefficients, descriptor, smallOriginX + coord.x, smallOriginY + coord.y);
-                int raw = int(value);
-                uint magnitude = raw < 0 ? uint(-raw) : uint(raw);
-                maxMagnitude = max(maxMagnitude, magnitude);
-            }
-            bitWidths[subblock] = pyrowave_significant_bit_count(maxMagnitude);
-            maxBitWidth = max(maxBitWidth, bitWidths[subblock]);
-        }
-
-        uint basePlanes = maxBitWidth > 3u ? maxBitWidth - 3u : 0u;
-        uint codeWord = 0u;
-        for (uint subblock = 0u; subblock < 8u; ++subblock) {
-            uint encodedPlanes = max(bitWidths[subblock], basePlanes);
-            uint twoBitCode = min(3u, encodedPlanes > basePlanes ? encodedPlanes - basePlanes : 0u);
-            codeWord |= twoBitCode << (2u * subblock);
-
-            for (uint plane = 0u; plane < encodedPlanes; ++plane) {
-                uint bit = encodedPlanes - plane - 1u;
-                uchar byte = 0;
-                for (uint pixel = 0u; pixel < 8u; ++pixel) {
-                    uint2 coord = pyrowave_coordinate_in_8x8(subblock, pixel);
-                    short value = pyrowave_quantized_packet_value(coefficients, descriptor, smallOriginX + coord.x, smallOriginY + coord.y);
-                    int raw = int(value);
-                    uint magnitude = raw < 0 ? uint(-raw) : uint(raw);
-                    if (((magnitude >> bit) & 1u) != 0u) {
-                        byte |= uchar(1u << pixel);
-                    }
-                }
-                packet[magnitudeStart + magnitudeOffset] = byte;
-                magnitudeOffset += 1u;
-            }
-        }
-
-        pyrowave_write_u16_le(packet, codeWordStart + compactIndex * 2u, codeWord);
-        packet[qScaleStart + compactIndex] = uchar((uint(descriptorQScaleCodes[smallBlock]) << 4u) | (basePlanes & 0x0fu));
-
-        for (uint subblock = 0u; subblock < 8u; ++subblock) {
-            for (uint pixel = 0u; pixel < 8u; ++pixel) {
-                uint2 coord = pyrowave_coordinate_in_8x8(subblock, pixel);
-                short value = pyrowave_quantized_packet_value(coefficients, descriptor, smallOriginX + coord.x, smallOriginY + coord.y);
-                if (value != 0) {
-                    if (value < 0) {
-                        signPayload[signCount / 8u] |= uchar(1u << (signCount & 7u));
-                    }
-                    signCount += 1u;
-                }
-            }
-        }
-
-        compactIndex += 1u;
-    }
-
-    uint signByteCount = (signCount + 7u) / 8u;
-    uint signStart = magnitudeStart + magnitudeOffset;
-    for (uint i = 0u; i < signByteCount; ++i) {
-        packet[signStart + i] = signPayload[i];
-    }
-
-    uint unpaddedSize = signStart + signByteCount;
-    uint payloadWords = (unpaddedSize + 3u) / 4u;
-    uint packetSize = payloadWords * 4u;
-    if (packetSize > constants.maxPacketBytes) {
-        return;
-    }
-
-    pyrowave_write_u16_le(packet, 0u, ballot);
-    uint packedPayload = (payloadWords & 0x0fffu) | ((constants.sequence & 7u) << 12u);
-    pyrowave_write_u16_le(packet, 2u, packedPayload);
-    uint packedBlock = (descriptor.blockIndex << 8u) | pyrowave_modify_quant_code(descriptor.quantCode, descriptor.quantLevel);
-    pyrowave_write_u32_le(packet, 4u, packedBlock);
-    outputSizes[descriptorIndex] = packetSize;
-}
-
 kernel void pyrowave_encode_sparse_packets(
     device const short *coefficients [[buffer(0)]],
     device const SparsePacketEncodeDescriptor *descriptors [[buffer(1)]],
@@ -855,6 +723,7 @@ kernel void pyrowave_encode_sparse_packets(
     threadgroup uint tgActiveBlockCount;
     threadgroup uint tgMagnitudeByteCount;
     threadgroup uint tgSignCount;
+    threadgroup uint tgUnpaddedSize;
     threadgroup uint tgPacketSize;
     threadgroup uint tgCanWrite;
 
@@ -866,6 +735,7 @@ kernel void pyrowave_encode_sparse_packets(
         tgActiveBlockCount = 0u;
         tgMagnitudeByteCount = 0u;
         tgSignCount = 0u;
+        tgUnpaddedSize = 0u;
         tgPacketSize = 0u;
         tgCanWrite = 0u;
         outputSizes[descriptorIndex] = 0u;
@@ -951,6 +821,7 @@ kernel void pyrowave_encode_sparse_packets(
         uint signByteCount = (signBase + 7u) / 8u;
         uint unpaddedSize = 8u + compactIndex * 2u + compactIndex + magnitudeOffset + signByteCount;
         uint payloadWords = (unpaddedSize + 3u) / 4u;
+        tgUnpaddedSize = unpaddedSize;
         tgPacketSize = payloadWords * 4u;
         tgCanWrite = ballot != 0u && tgPacketSize <= constants.maxPacketBytes ? 1u : 0u;
     }
@@ -958,6 +829,10 @@ kernel void pyrowave_encode_sparse_packets(
 
     if (tgCanWrite == 0u) {
         return;
+    }
+
+    for (uint offset = tgUnpaddedSize + lane; offset < tgPacketSize; offset += threadCount) {
+        packet[offset] = 0;
     }
 
     uint codeWordStart = 8u;

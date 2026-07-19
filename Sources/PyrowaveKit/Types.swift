@@ -1,6 +1,6 @@
 import Foundation
 
-public enum PyrowaveError: Error, Equatable, CustomStringConvertible {
+public enum PyrowaveError: Error, Equatable, Sendable, CustomStringConvertible {
     case invalidDimensions
     case unsupportedFormat(String)
     case truncatedInput
@@ -48,6 +48,7 @@ public enum ColorPrimaries: UInt8, Codable, Sendable {
 public enum TransferFunction: UInt8, Codable, Sendable {
     case bt709 = 0
     case pq = 1
+    case sRGB = 2
 }
 
 public enum YCbCrTransform: UInt8, Codable, Sendable {
@@ -99,6 +100,33 @@ public struct CodecConfiguration: Codable, Equatable, Sendable {
     ) {
         self.decompositionLevels = decompositionLevels
         self.quantizationStep = quantizationStep
+    }
+}
+
+/// A codec-native visual quality value. Higher values preserve more detail.
+///
+/// Pyrowave deliberately does not interpret this value as a byte-rate target.
+public struct PyrowaveQuality: Codable, Equatable, Sendable {
+    public static let highest = PyrowaveQuality(normalized: 1)
+
+    public let normalized: Float
+
+    public init(normalized: Float) {
+        if normalized.isFinite {
+            self.normalized = min(max(normalized, 0), 1)
+        } else {
+            self.normalized = 1
+        }
+    }
+
+    public init(configuration: CodecConfiguration) {
+        let scaledStep = max(configuration.quantizationStep * 2048, .leastNonzeroMagnitude)
+        self.init(normalized: 1 - log2(scaledStep) / 5)
+    }
+
+    public var codecConfiguration: CodecConfiguration {
+        let quantizationStep = (1.0 / 2048.0) * pow(2.0, 5.0 * (1.0 - normalized))
+        return CodecConfiguration(quantizationStep: quantizationStep)
     }
 }
 
@@ -253,6 +281,25 @@ public struct EncodedFrame: Equatable, Sendable {
 
     public init(data: Data) {
         self.data = data
+    }
+}
+
+public struct PyrowaveEncodedFrameDescriptor: Equatable, Sendable {
+    public let width: Int
+    public let height: Int
+    public let chroma: ChromaSubsampling
+    public let videoSignal: VideoSignalMetadata
+
+    public init(
+        width: Int,
+        height: Int,
+        chroma: ChromaSubsampling,
+        videoSignal: VideoSignalMetadata
+    ) {
+        self.width = width
+        self.height = height
+        self.chroma = chroma
+        self.videoSignal = videoSignal
     }
 }
 

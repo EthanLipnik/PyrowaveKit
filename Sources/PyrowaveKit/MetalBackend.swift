@@ -53,7 +53,6 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
     private let packetByteCostsPipeline: MTLComputePipelineState
     private let packetByteCostsSmallblocksPipeline: MTLComputePipelineState
     private let packetByteCostsFinalizePipeline: MTLComputePipelineState
-    private let sparsePacketEncodeSerialPipeline: MTLComputePipelineState
     private let sparsePacketEncodeThreadgroupPipeline: MTLComputePipelineState
     private let rateControlBucketPipeline: MTLComputePipelineState
     private let rateControlTileStatsBucketPipeline: MTLComputePipelineState
@@ -111,7 +110,6 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         packetByteCostsPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_packet_byte_costs", library: library))
         packetByteCostsSmallblocksPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_packet_byte_costs_smallblocks", library: library))
         packetByteCostsFinalizePipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_packet_byte_costs_finalize", library: library))
-        sparsePacketEncodeSerialPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_encode_sparse_packets_serial", library: library))
         sparsePacketEncodeThreadgroupPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_encode_sparse_packets", library: library))
         rateControlBucketPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_bucket_indices", library: library))
         rateControlTileStatsBucketPipeline = try device.makeComputePipelineState(function: try Self.makeFunction(named: "pyrowave_rate_control_tile_stats_bucket_indices", library: library))
@@ -690,7 +688,26 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
         height: Int,
         yTexture: MTLTexture,
         cbCrTexture: MTLTexture
-    ) throws {
+    ) async throws {
+        let commandBuffer = try makeSparsePacketsInverseAndCropToNV12CommandBuffer(
+            packetData: packetData,
+            planes: planes,
+            width: width,
+            height: height,
+            yTexture: yTexture,
+            cbCrTexture: cbCrTexture
+        )
+        try await finishAsync(commandBuffer: commandBuffer, context: "Metal combined NV12 decode")
+    }
+
+    private func makeSparsePacketsInverseAndCropToNV12CommandBuffer(
+        packetData: Data,
+        planes: [(sampleCount: Int, paddedWidth: Int, paddedHeight: Int, levels: Int, descriptors: [MetalSparsePacketDecodeDescriptor])],
+        width: Int,
+        height: Int,
+        yTexture: MTLTexture,
+        cbCrTexture: MTLTexture
+    ) throws -> MTLCommandBuffer {
         guard planes.count == 3 else {
             throw PyrowaveError.invalidDimensions
         }
@@ -703,7 +720,8 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             packetData: packetData,
             planes: planes.map {
                 (sampleCount: $0.sampleCount, descriptors: $0.descriptors)
-            }
+            },
+            outputStorageMode: .private
         )
         guard sparseBuffers.count == planes.count else {
             throw PyrowaveError.processFailed("Metal sparse packet decode returned \(sparseBuffers.count) buffers for \(planes.count) planes")
@@ -741,7 +759,7 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             yTexture: yTexture,
             cbCrTexture: cbCrTexture
         )
-        try finish(commandBuffer: commandBuffer, context: "Metal combined NV12 decode")
+        return commandBuffer
     }
 
     func decodeSparsePacketBuffersInverseAndCropToNV12Textures(
@@ -1877,9 +1895,6 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
             throw PyrowaveError.processFailed("failed to create Metal sparse packet encode command encoder")
         }
 
-        let threadgroupDescriptorLimit = 4_096
-        let serialWidth = min(sparsePacketEncodeSerialPipeline.maxTotalThreadsPerThreadgroup, 256)
-        let serialThreads = MTLSize(width: serialWidth, height: 1, depth: 1)
         let threadgroupWidth = 128
         guard sparsePacketEncodeThreadgroupPipeline.maxTotalThreadsPerThreadgroup >= threadgroupWidth else {
             throw PyrowaveError.processFailed("Metal sparse packet threadgroup encoder requires 128 threads per threadgroup")
@@ -1891,25 +1906,17 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
                 maxPacketBytes: UInt32(maxPacketBytes),
                 sequence: UInt32(sequence)
             )
-            let useThreadgroupEncoder = item.descriptorCount <= threadgroupDescriptorLimit
-            encoder.setComputePipelineState(useThreadgroupEncoder ? sparsePacketEncodeThreadgroupPipeline : sparsePacketEncodeSerialPipeline)
+            encoder.setComputePipelineState(sparsePacketEncodeThreadgroupPipeline)
             encoder.setBuffer(item.coefficientBuffer, offset: 0, index: 0)
             encoder.setBuffer(item.descriptorBuffer, offset: 0, index: 1)
             encoder.setBuffer(item.qScaleBuffer, offset: 0, index: 2)
             encoder.setBuffer(item.outputBuffer, offset: 0, index: 3)
             encoder.setBuffer(item.sizeBuffer, offset: 0, index: 4)
             encoder.setBytes(&constants, length: MemoryLayout<SparsePacketEncodeConstants>.stride, index: 5)
-            if useThreadgroupEncoder {
-                encoder.dispatchThreadgroups(
-                    MTLSize(width: item.descriptorCount, height: 1, depth: 1),
-                    threadsPerThreadgroup: threadgroupThreads
-                )
-            } else {
-                encoder.dispatchThreads(
-                    MTLSize(width: item.descriptorCount, height: 1, depth: 1),
-                    threadsPerThreadgroup: serialThreads
-                )
-            }
+            encoder.dispatchThreadgroups(
+                MTLSize(width: item.descriptorCount, height: 1, depth: 1),
+                threadsPerThreadgroup: threadgroupThreads
+            )
         }
         encoder.endEncoding()
         commandBuffer.commit()
@@ -3342,6 +3349,21 @@ final class MetalPyrowaveBackend: @unchecked Sendable {
 
         if let error = commandBuffer.error {
             throw PyrowaveError.processFailed("\(context) command failed: \(error)")
+        }
+    }
+
+    private func finishAsync(commandBuffer: MTLCommandBuffer, context: String) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            commandBuffer.addCompletedHandler { completedBuffer in
+                if let error = completedBuffer.error {
+                    continuation.resume(
+                        throwing: PyrowaveError.processFailed("\(context) command failed: \(error)")
+                    )
+                } else {
+                    continuation.resume(returning: ())
+                }
+            }
+            commandBuffer.commit()
         }
     }
 

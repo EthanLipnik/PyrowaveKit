@@ -21,6 +21,13 @@ struct BinaryWriter {
         data.append(payload)
     }
 
+    mutating func append(unsafeBytes: UnsafeRawPointer, count: Int) {
+        guard count > 0 else {
+            return
+        }
+        data.append(unsafeBytes.assumingMemoryBound(to: UInt8.self), count: count)
+    }
+
     mutating func append(_ value: UInt16) {
         var little = value.littleEndian
         withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
@@ -63,20 +70,20 @@ struct BinaryReader {
 
     mutating func readUInt16() throws -> UInt16 {
         guard offset + 2 <= data.count else { throw PyrowaveError.truncatedInput }
-        let value = data[offset..<offset + 2].enumerated().reduce(UInt16(0)) { result, element in
-            result | (UInt16(element.element) << UInt16(element.offset * 8))
+        let value = data.withUnsafeBytes { bytes in
+            bytes.loadUnaligned(fromByteOffset: offset, as: UInt16.self)
         }
         offset += 2
-        return value
+        return UInt16(littleEndian: value)
     }
 
     mutating func readUInt32() throws -> UInt32 {
         guard offset + 4 <= data.count else { throw PyrowaveError.truncatedInput }
-        let value = data[offset..<offset + 4].enumerated().reduce(UInt32(0)) { result, element in
-            result | (UInt32(element.element) << UInt32(element.offset * 8))
+        let value = data.withUnsafeBytes { bytes in
+            bytes.loadUnaligned(fromByteOffset: offset, as: UInt32.self)
         }
         offset += 4
-        return value
+        return UInt32(littleEndian: value)
     }
 
     mutating func readInt16() throws -> Int16 {

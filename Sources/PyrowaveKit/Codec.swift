@@ -3,6 +3,19 @@ import CoreVideo
 import Metal
 
 public extension EncodedFrame {
+    var descriptor: PyrowaveEncodedFrameDescriptor {
+        get throws {
+            var reader = BinaryReader(data)
+            let header = try PyrowaveSequenceHeader(reader: &reader)
+            return PyrowaveEncodedFrameDescriptor(
+                width: header.width,
+                height: header.height,
+                chroma: header.chroma,
+                videoSignal: header.videoSignal
+            )
+        }
+    }
+
     func packetized(maximumPacketBytes: Int) throws -> [EncodedPacket] {
         guard maximumPacketBytes >= 8 else {
             throw PyrowaveError.invalidDimensions
@@ -302,6 +315,11 @@ struct PyrowaveGPUFramePlane {
     }
 }
 
+struct PyrowaveContiguousNV12DecodeMetrics: Equatable, Sendable {
+    let packetParseMilliseconds: Double
+    let metalDecodeMilliseconds: Double
+}
+
 public final class PyrowaveCodec: @unchecked Sendable {
     private static let sparseBlockSize = 32
 
@@ -448,7 +466,8 @@ public final class PyrowaveCodec: @unchecked Sendable {
         cbCrTexture: MTLTexture,
         configuration: CodecConfiguration = CodecConfiguration(),
         videoSignal: VideoSignalMetadata = .default,
-        reusesPacketBuffers: Bool
+        reusesPacketBuffers: Bool,
+        packetOutputStorageMode: MTLStorageMode = .private
     ) throws -> PyrowaveGPUFrame {
         guard configuration.decompositionLevels == PyrowaveBitstream.decompositionLevels,
               configuration.quantizationStep > 0 else {
@@ -486,7 +505,8 @@ public final class PyrowaveCodec: @unchecked Sendable {
             quantLevelsByPlane: nil,
             packetByteCostsByPlane: nil,
             defaultQuantLevel: 0,
-            reusesPacketBuffers: reusesPacketBuffers
+            reusesPacketBuffers: reusesPacketBuffers,
+            packetOutputStorageMode: packetOutputStorageMode
         )
         return PyrowaveGPUFrame(
             width: yTexture.width,
@@ -533,7 +553,10 @@ public final class PyrowaveCodec: @unchecked Sendable {
 
     public func exportGPUFrame(_ frame: PyrowaveGPUFrame) throws -> EncodedFrame {
         let layout = try cachedLayout(width: frame.width, height: frame.height, chroma: frame.chroma)
-        let blocks = try frame.planes.flatMap { plane -> [SparseBlock] in
+        var packets = [(blockIndex: Int, buffer: MTLBuffer, offset: Int, size: Int)]()
+        packets.reserveCapacity(frame.planes.reduce(0) { $0 + $1.encoded.descriptorCount })
+        var payloadBytes = 0
+        for plane in frame.planes {
             guard plane.encoded.descriptorCount == plane.blockIndexCount else {
                 throw PyrowaveError.processFailed("GPU frame packet metadata does not match packet buffers")
             }
@@ -552,14 +575,8 @@ public final class PyrowaveCodec: @unchecked Sendable {
                 from: plane.encoded.outputBuffer,
                 byteLength: packetByteLength
             )
-            let bytes = packetBuffer.contents().bindMemory(
-                to: UInt8.self,
-                capacity: packetByteLength
-            )
             let sizes = plane.encoded.sizeBuffer.contents().bindMemory(to: UInt32.self, capacity: plane.encoded.descriptorCount)
             let blockIndices = plane.blockIndicesForInspection()
-            var blocks = [SparseBlock]()
-            blocks.reserveCapacity(plane.encoded.descriptorCount)
             for index in 0..<plane.encoded.descriptorCount {
                 let size = Int(sizes[index])
                 guard size >= 0, size <= plane.encoded.maxPacketBytes else {
@@ -568,23 +585,48 @@ public final class PyrowaveCodec: @unchecked Sendable {
                 guard size > 0 else {
                     continue
                 }
-                let packetStart = index * plane.encoded.maxPacketBytes
-                blocks.append(SparseBlock(
+                packets.append((
                     blockIndex: blockIndices[index],
-                    data: Data(bytes: bytes.advanced(by: packetStart), count: size)
+                    buffer: packetBuffer,
+                    offset: index * plane.encoded.maxPacketBytes,
+                    size: size
                 ))
+                payloadBytes += size
             }
-            return blocks
         }
-        return try assembleEncodedFrame(
+
+        packets.sort { $0.blockIndex < $1.blockIndex }
+        var previousBlockIndex: Int?
+        for packet in packets {
+            guard packet.blockIndex >= 0, packet.blockIndex < layout.descriptors.count else {
+                throw PyrowaveError.processFailed("sparse block index \(packet.blockIndex) is outside layout block count \(layout.descriptors.count)")
+            }
+            guard packet.blockIndex != previousBlockIndex else {
+                throw PyrowaveError.processFailed("duplicate sparse block index \(packet.blockIndex)")
+            }
+            previousBlockIndex = packet.blockIndex
+        }
+
+        // Compact fixed GPU packet slots directly into one contiguous pyrw
+        // payload. This copies only actual packet bytes and avoids constructing
+        // thousands of temporary Data values on the production export path.
+        var writer = BinaryWriter(capacity: frameHeaderSize + payloadBytes)
+        let sequence = try PyrowaveSequenceHeader(
             width: frame.width,
             height: frame.height,
+            sequence: frame.sequenceNumber,
+            totalBlocks: packets.count,
             chroma: frame.chroma,
-            videoSignal: frame.videoSignal,
-            sequenceNumber: frame.sequenceNumber,
-            totalLayoutBlocks: layout.descriptors.count,
-            blocks: blocks
+            videoSignal: frame.videoSignal
         )
+        sequence.write(to: &writer)
+        for packet in packets {
+            writer.append(
+                unsafeBytes: packet.buffer.contents().advanced(by: packet.offset),
+                count: packet.size
+            )
+        }
+        return EncodedFrame(data: writer.data)
     }
 
     public func importGPUFrame(_ frame: EncodedFrame) throws -> PyrowaveGPUFrame {
@@ -855,8 +897,14 @@ public final class PyrowaveCodec: @unchecked Sendable {
         return (yTexture, cbTexture, crTexture)
     }
 
-    func decodeToNV12Textures(_ frame: EncodedFrame, yTexture: MTLTexture, cbCrTexture: MTLTexture) throws {
-        let decoded = try decodeGPUPlanes(frame, allowPartialFrame: false, appliesSparsePackets: false)
+    func decodeToNV12Textures(
+        _ frame: EncodedFrame,
+        yTexture: MTLTexture,
+        cbCrTexture: MTLTexture
+    ) async throws -> PyrowaveContiguousNV12DecodeMetrics {
+        let packetParseStart = ContinuousClock.now
+        let decoded = try decodeContiguousGPUPlanes(frame)
+        let packetParseEnd = ContinuousClock.now
         guard decoded.sequence.chroma == .yuv420,
               yTexture.width == decoded.sequence.width,
               yTexture.height == decoded.sequence.height,
@@ -865,8 +913,9 @@ public final class PyrowaveCodec: @unchecked Sendable {
             throw PyrowaveError.invalidDimensions
         }
 
+        let metalDecodeStart = ContinuousClock.now
         if shouldUseCombinedNV12Decode(width: decoded.sequence.width, height: decoded.sequence.height) {
-            try metalBackend.decodeSparsePacketsInverseAndCropToNV12Textures(
+            try await metalBackend.decodeSparsePacketsInverseAndCropToNV12Textures(
                 packetData: frame.data,
                 planes: decoded.planes.indices.map { index in
                     (
@@ -901,6 +950,125 @@ public final class PyrowaveCodec: @unchecked Sendable {
                 cbCrTexture: cbCrTexture
             )
         }
+        let metalDecodeEnd = ContinuousClock.now
+        return PyrowaveContiguousNV12DecodeMetrics(
+            packetParseMilliseconds: packetParseStart.milliseconds(to: packetParseEnd),
+            metalDecodeMilliseconds: metalDecodeStart.milliseconds(to: metalDecodeEnd)
+        )
+    }
+
+    private func decodeContiguousGPUPlanes(_ frame: EncodedFrame) throws -> GPUDecodedFramePlanes {
+        var headerReader = BinaryReader(frame.data)
+        let sequence = try PyrowaveSequenceHeader(reader: &headerReader)
+        let layout = try cachedLayout(width: sequence.width, height: sequence.height, chroma: sequence.chroma)
+        let decodedPlanes = try (0..<PyrowaveBitstream.componentCount).map { component in
+            try makeGPUDecodedPlane(
+                component: component,
+                width: sequence.width,
+                height: sequence.height,
+                chroma: sequence.chroma,
+                layout: layout
+            )
+        }
+        let blockTargets = try cachedSparseBlockTargets(layout: layout)
+        var packetDescriptorsByPlane = decodedPlanes.map { plane in
+            var descriptors = [MetalSparsePacketDecodeDescriptor]()
+            descriptors.reserveCapacity(plane.descriptorsByBlockIndex.count)
+            return descriptors
+        }
+        var seenBlocks = [UInt8](repeating: 0, count: layout.descriptors.count)
+        var parsedBlockCount = 0
+
+        try frame.data.withUnsafeBytes { bytes in
+            var offset = headerReader.offset
+            while offset < bytes.count {
+                let blockStart = offset
+                guard blockStart + 8 <= bytes.count else {
+                    throw PyrowaveError.truncatedInput
+                }
+
+                let ballot = UInt16(littleEndian: bytes.loadUnaligned(fromByteOffset: blockStart, as: UInt16.self))
+                let packedPayload = UInt16(littleEndian: bytes.loadUnaligned(fromByteOffset: blockStart + 2, as: UInt16.self))
+                let packedBlock = UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: blockStart + 4, as: UInt32.self))
+                let payloadWords = Int(packedPayload & 0x0fff)
+                let packetSequence = UInt8((packedPayload >> 12) & 0x7)
+                let isExtended = ((packedPayload >> 15) & 0x1) != 0
+                let blockIndex = Int(packedBlock >> 8)
+                let payloadEnd = blockStart + payloadWords * 4
+
+                guard !isExtended else {
+                    throw PyrowaveError.invalidBitstream("coefficient decoder received extended packet")
+                }
+                guard packetSequence == sequence.sequence else {
+                    throw PyrowaveError.invalidBitstream("coefficient packet sequence mismatch")
+                }
+                guard payloadEnd >= blockStart + 8 else {
+                    throw PyrowaveError.invalidBitstream("payload_words is not large enough")
+                }
+                guard payloadEnd <= bytes.count else {
+                    throw PyrowaveError.truncatedInput
+                }
+                guard blockIndex >= 0,
+                      blockIndex < blockTargets.count,
+                      seenBlocks[blockIndex] == 0 else {
+                    throw PyrowaveError.invalidBitstream("bad sparse block index")
+                }
+                seenBlocks[blockIndex] = 1
+                guard let target = blockTargets[blockIndex] else {
+                    throw PyrowaveError.invalidBitstream("sparse block index has no plane mapping")
+                }
+
+                if ballot == 0 {
+                    var paddingOffset = blockStart + 8
+                    while paddingOffset < payloadEnd {
+                        guard bytes[paddingOffset] == 0 else {
+                            throw PyrowaveError.invalidBitstream("non-zero coefficient packet padding")
+                        }
+                        paddingOffset += 1
+                    }
+                } else {
+                    let decodedPlane = decodedPlanes[target.planeIndex]
+                    guard blockStart <= Int(UInt32.max),
+                          payloadEnd <= Int(UInt32.max),
+                          target.descriptor.originX <= Int(UInt32.max),
+                          target.descriptor.originY <= Int(UInt32.max),
+                          target.descriptor.validWidth <= Int(UInt32.max),
+                          target.descriptor.validHeight <= Int(UInt32.max),
+                          decodedPlane.paddedWidth <= Int(UInt32.max) else {
+                        throw PyrowaveError.invalidDimensions
+                    }
+                    packetDescriptorsByPlane[target.planeIndex].append(
+                        MetalSparsePacketDecodeDescriptor(
+                            packetOffset: UInt32(blockStart),
+                            payloadEnd: UInt32(payloadEnd),
+                            originX: UInt32(target.descriptor.originX),
+                            originY: UInt32(target.descriptor.originY),
+                            validWidth: UInt32(target.descriptor.validWidth),
+                            validHeight: UInt32(target.descriptor.validHeight),
+                            stride: UInt32(decodedPlane.paddedWidth)
+                        )
+                    )
+                }
+
+                parsedBlockCount += 1
+                offset = payloadEnd
+            }
+            guard offset == bytes.count else {
+                throw PyrowaveError.invalidBitstream("trailing bytes")
+            }
+        }
+
+        guard parsedBlockCount == sequence.totalBlocks else {
+            throw PyrowaveError.invalidBitstream(
+                "expected \(sequence.totalBlocks) blocks, decoded \(parsedBlockCount)"
+            )
+        }
+        return GPUDecodedFramePlanes(
+            sequence: sequence,
+            planes: decodedPlanes,
+            packetDescriptorsByPlane: packetDescriptorsByPlane,
+            blockIndicesByPlane: Array(repeating: [], count: PyrowaveBitstream.componentCount)
+        )
     }
 
     private func decodePlanes(_ frame: EncodedFrame, allowPartialFrame: Bool) throws -> DecodedFramePlanes {
@@ -1750,7 +1918,8 @@ public final class PyrowaveCodec: @unchecked Sendable {
         quantLevelsByPlane: [[Int]]?,
         packetByteCostsByPlane: [[[Int]]]?,
         defaultQuantLevel: Int,
-        reusesPacketBuffers: Bool = false
+        reusesPacketBuffers: Bool = false,
+        packetOutputStorageMode: MTLStorageMode = .private
     ) throws -> [PyrowaveGPUFramePlane] {
         if let packetByteCostsByPlane, packetByteCostsByPlane.count != planes.count {
             throw PyrowaveError.processFailed("packet byte-cost plane count \(packetByteCostsByPlane.count) does not match plane count \(planes.count)")
@@ -1894,7 +2063,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
                     qScaleBuffer: qScaleBuffer,
                     qScaleDescriptorCount: planes[index].qScaleDescriptorCount
                 )
-            }, sequence: sequence, outputStorageMode: .private, reusesOutputBuffers: reusesPacketBuffers)
+            }, sequence: sequence, outputStorageMode: packetOutputStorageMode, reusesOutputBuffers: reusesPacketBuffers)
         } else {
             encodedPacketPlanes = try metalBackend.encodeSparsePacketBuffersBatch(planes.indices.map { index in
                 guard let coefficientBuffer = planes[index].coefficientBuffer else {
@@ -1906,7 +2075,7 @@ public final class PyrowaveCodec: @unchecked Sendable {
                     descriptors: packetDescriptorsByPlane[index],
                     qScaleCodes: packetQScaleCodesByPlane[index]
                 )
-            }, sequence: sequence, reusesOutputBuffers: reusesPacketBuffers)
+            }, sequence: sequence, outputStorageMode: packetOutputStorageMode, reusesOutputBuffers: reusesPacketBuffers)
         }
         guard encodedPacketPlanes.count == planes.count else {
             throw PyrowaveError.processFailed("Metal sparse packet encode returned \(encodedPacketPlanes.count) planes for \(planes.count) inputs")
